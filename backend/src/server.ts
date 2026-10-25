@@ -1,5 +1,4 @@
 ﻿import http from 'node:http';
-import { parse as parseUrl } from 'node:url';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -147,7 +146,18 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const parsed = parseUrl(req.url || '', true);
+  let requestUrl: URL;
+  try {
+    requestUrl = new URL(req.url || '/', `http://${req.headers.host ?? 'localhost'}`);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid request URL' }));
+    return;
+  }
+  const parsed = {
+    pathname: requestUrl.pathname,
+    query: Object.fromEntries(requestUrl.searchParams.entries()) as Record<string, string>
+  };
 
   if (req.method === 'POST' && parsed.pathname === '/api/agents/analyze') {
     const origin = req.headers.origin;
