@@ -453,9 +453,12 @@ const server = http.createServer(async (req, res) => {
   // In production, serve the built Vite app from this same service so its API
   // and WebSocket connections share the Render hostname and service hours.
   if ((req.method === 'GET' || req.method === 'HEAD') && !parsed.pathname?.startsWith('/api/')) {
-    const frontendDirectory = resolve(process.cwd(), 'frontend', 'dist');
-    const indexFile = resolve(frontendDirectory, 'index.html');
-    if (existsSync(indexFile)) {
+    const frontendDirectory = [
+      resolve(process.cwd(), 'frontend', 'dist'),
+      resolve(process.cwd(), '..', 'frontend', 'dist')
+    ].find((directory) => existsSync(resolve(directory, 'index.html')));
+    if (frontendDirectory) {
+      const indexFile = resolve(frontendDirectory, 'index.html');
       let requestedPath = '/';
       try { requestedPath = decodeURIComponent(parsed.pathname || '/'); } catch { /* use the app root for malformed paths */ }
       const candidate = resolve(frontendDirectory, `.${requestedPath}`);
