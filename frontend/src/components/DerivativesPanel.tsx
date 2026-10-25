@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { apiUrl } from '../lib/api.js';
 import { createChart, type IChartApi, type Time, type UTCTimestamp } from 'lightweight-charts';
 
 export interface OpenInterestPoint { openInterest: string; timestamp: string; }
@@ -22,7 +23,7 @@ export default function DerivativesPanel({ symbol, onSnapshot }: { symbol: strin
     setPayload(null);
     const load = async () => {
       try {
-        const response = await fetch(`http://localhost:4000/api/derivatives?symbol=${encodeURIComponent(symbol)}`);
+        const response = await fetch(apiUrl(`/api/derivatives?symbol=${encodeURIComponent(symbol)}`));
         if (!response.ok) throw new Error('Derivatives data unavailable');
         const result = await response.json() as DerivativesPayload;
         if (!cancelled) { setPayload(result); setError(false); }

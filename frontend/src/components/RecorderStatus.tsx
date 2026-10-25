@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiUrl } from '../lib/api.js';
 
 interface RecorderSnapshot {
   trades: { trades: number; symbols: string[]; oldestTime: number | null; newestTime: number | null };
@@ -12,7 +13,7 @@ export default function RecorderStatus() {
     let cancelled = false;
     const refresh = async () => {
       try {
-        const response = await fetch('http://localhost:4000/api/recorder/status');
+        const response = await fetch(apiUrl('/api/recorder/status'));
         if (!response.ok) return;
         const snapshot = await response.json() as RecorderSnapshot;
         if (!cancelled) setStatus(snapshot);

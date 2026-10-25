@@ -247,12 +247,14 @@ async function generateWithFallback<T>(providers: ProviderConfig[], role: AgentR
 
 function parseGeminiCredentials(raw: string | undefined, model: string): ProviderConfig[] {
   if (!raw?.trim()) return [];
-  return raw.split(',').map((part) => part.trim()).filter(Boolean).map((part) => {
+  const credentials: ProviderConfig[] = [];
+  for (const part of raw.split(',').map((value) => value.trim()).filter(Boolean)) {
     const separator = part.indexOf('|');
     const project = separator >= 0 ? part.slice(0, separator).trim() : '';
     const key = separator >= 0 ? part.slice(separator + 1).trim() : part;
-    return key ? { provider: 'gemini' as const, key, model, quotaScope: project || undefined } : null;
-  }).filter((item): item is ProviderConfig => item !== null);
+    if (key) credentials.push({ provider: 'gemini', key, model, quotaScope: project || undefined });
+  }
+  return credentials;
 }
 
 function getProviderConfigs(role: AgentRole): ProviderConfig[] {

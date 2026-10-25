@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { apiUrl } from '../lib/api.js';
 import type { Trade, SerializedFootprintBar } from '../types/market.js';
 import type { BookLevel } from './DOMLadder.js';
 import type { SignalCandle } from './EntryExitSignalEngine.js';
@@ -70,7 +71,7 @@ export default function AgentCouncilPanel({ symbol, timeframe, feedStatus, lastT
       bids: bids.slice(0, 10), asks: asks.slice(0, 10)
     };
     try {
-      const response = await fetch('http://localhost:4000/api/agents/analyze', {
+      const response = await fetch(apiUrl('/api/agents/analyze'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(snapshot)
       });
       const data = await response.json() as CouncilResult | { error?: string };

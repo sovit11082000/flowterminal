@@ -45,8 +45,8 @@ export class MongoHistoryStore {
       this.collection('trades').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('trades').createIndex({ symbol: 1, timestamp: 1 }),
       this.collection('trades').createIndex({ symbol: 1, tradeId: 1 }, { unique: true }),
-      this.collection('order_books').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
-      this.collection('order_books').createIndex({ symbol: 1, time: 1 }),
+      this.collection('orderBooks').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.collection('orderBooks').createIndex({ symbol: 1, time: 1 }),
       this.collection('liquidations').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('liquidations').createIndex({ symbol: 1, timestamp: 1 }),
       this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
@@ -82,10 +82,10 @@ export class MongoHistoryStore {
 
   async saveOrderBook(sample: OrderBookSample): Promise<void> {
     if (!this.db) return;
-    await this.collection('order_books').insertOne({
+    await this.collection('orderBooks').insertOne({
       ...sample, expiresAt: new Date(sample.time + 30 * 24 * 60 * 60_000)
     });
-    await this.enforceCap('order_books', 120_000);
+    await this.enforceCap('orderBooks', 120_000);
   }
 
   async saveLiquidations(events: NormalizedLiquidation[]): Promise<void> {
@@ -119,7 +119,7 @@ export class MongoHistoryStore {
 
   async getOrderBooks(options: { symbol: string; startTimeMs?: number; endTimeMs?: number; limit: number }): Promise<OrderBookSample[]> {
     const query = this.timeQuery(options.symbol, 'time', options.startTimeMs, options.endTimeMs);
-    const docs = await this.collection('order_books').find(query).sort({ time: -1 }).limit(options.limit).toArray();
+    const docs = await this.collection('orderBooks').find(query).sort({ time: -1 }).limit(options.limit).toArray();
     return docs.map((doc) => this.clean<OrderBookSample>(doc)).reverse();
   }
 
@@ -132,7 +132,7 @@ export class MongoHistoryStore {
   async getCounts(): Promise<{ footprints: number; trades: number; orderBooks: number; liquidations: number }> {
     const [footprints, trades, orderBooks, liquidations] = await Promise.all([
       this.collection('footprints').countDocuments(), this.collection('trades').countDocuments(),
-      this.collection('order_books').countDocuments(), this.collection('liquidations').countDocuments()
+      this.collection('orderBooks').countDocuments(), this.collection('liquidations').countDocuments()
     ]);
     return { footprints, trades, orderBooks, liquidations };
   }

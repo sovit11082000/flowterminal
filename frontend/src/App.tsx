@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { apiUrl, gatewayWebSocketUrl } from './lib/api.js';
 import {
   createChart,
   IChartApi,
@@ -861,7 +862,7 @@ export default function App() {
         // Load captured trade-derived footprints independently of Bybit's candle service.
         try {
           const profileFootprintTimeframe = timeframe === '5m' ? '5m' : '1m';
-          const footprintResponse = await fetch(`http://localhost:4000/api/footprint/history?symbol=${symbol}&timeframe=${profileFootprintTimeframe}`);
+          const footprintResponse = await fetch(apiUrl(`/api/footprint/history?symbol=${symbol}&timeframe=${profileFootprintTimeframe}`));
           if (footprintResponse?.ok) {
             const footprintPayload = await footprintResponse.json();
             if (Array.isArray(footprintPayload.bars)) {
@@ -901,7 +902,7 @@ export default function App() {
             end: String((range.endSec + TIMEFRAME_SECONDS[timeframe]) * 1000 - 1)
           });
           try {
-            const response = await fetch(`http://localhost:4000/api/history?${query.toString()}`);
+            const response = await fetch(apiUrl(`/api/history?${query.toString()}`));
             if (!response.ok) throw new Error(`HTTP error ${response.status}`);
             const payload = await response.json();
             if (isCancelled) return;
@@ -969,7 +970,7 @@ export default function App() {
 
   // 6. Live WebSocket Client Ingestion
   useEffect(() => {
-    const ws = new WebSocket('ws://localhost:4000');
+    const ws = new WebSocket(gatewayWebSocketUrl());
     gatewaySocketRef.current = ws;
 
     ws.onopen = () => {
@@ -1250,7 +1251,7 @@ export default function App() {
     const load = async () => {
       setHistoricalOIStatus('loading');
       try {
-        const response = await fetch(`http://localhost:4000/api/derivatives/history?symbol=${encodeURIComponent(selectedSymbol)}`);
+            const response = await fetch(apiUrl(`/api/derivatives/history?symbol=${encodeURIComponent(selectedSymbol)}`));
         if (!response.ok) throw new Error('Historical OI unavailable');
         const payload = await response.json() as { symbol: string; openInterest?: OIHistoryPoint[] };
         if (!cancelled && payload.symbol === selectedSymbol && Array.isArray(payload.openInterest)) {

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { apiUrl } from '../lib/api.js';
 import type { BookLevel } from './DOMLadder.js';
 
 export interface BookSample { symbol: string; time: number; bids: BookLevel[]; asks: BookLevel[]; }
@@ -22,8 +23,8 @@ export default function OrderBookHeatmap({ symbol, enabled = true, onSnapshot }:
       try {
         const start = Date.now() - 30 * 60_000;
         const [bookResponse, tradeResponse] = await Promise.all([
-          fetch(`http://localhost:4000/api/orderbook/history?symbol=${encodeURIComponent(symbol)}&start=${start}&limit=1800`),
-          fetch(`http://localhost:4000/api/trades/history?symbol=${encodeURIComponent(symbol)}&start=${start}&limit=3000`)
+          fetch(apiUrl(`/api/orderbook/history?symbol=${encodeURIComponent(symbol)}&start=${start}&limit=1800`)),
+          fetch(apiUrl(`/api/trades/history?symbol=${encodeURIComponent(symbol)}&start=${start}&limit=3000`))
         ]);
         if (bookResponse.ok) {
           const result = await bookResponse.json() as HeatmapPayload;

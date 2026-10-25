@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { apiUrl } from '../lib/api.js';
 
 interface OptionRow {
   symbol: string;
@@ -61,7 +62,7 @@ export default function GammaLevelsPanel({ symbol, onSnapshot }: { symbol: strin
       controller = new AbortController();
       setLoading(true);
       try {
-        const response = await fetch(`http://localhost:4000/api/options-gamma?baseCoin=${baseCoin}&source=${source}`, { signal: controller.signal, cache: 'no-store' });
+        const response = await fetch(apiUrl(`/api/options-gamma?baseCoin=${baseCoin}&source=${source}`), { signal: controller.signal, cache: 'no-store' });
         const body = await response.json();
         if (!response.ok) throw new Error(typeof body.error === 'string' ? body.error : `Options request failed (${response.status}).`);
         if (!cancelled) {

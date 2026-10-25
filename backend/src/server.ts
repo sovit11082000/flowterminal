@@ -1,7 +1,7 @@
 ﻿import http from 'node:http';
 import { parse as parseUrl } from 'node:url';
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { extname, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { LOCAL_GATEWAY_PORT, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS } from './config/constants.js';
 import {
@@ -151,7 +151,11 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && parsed.pathname === '/api/agents/analyze') {
     const origin = req.headers.origin;
-    if (origin && origin !== 'http://localhost:3000' && origin !== 'http://127.0.0.1:3000') {
+    const forwardedProtocol = req.headers['x-forwarded-proto'];
+    const requestProtocol = (Array.isArray(forwardedProtocol) ? forwardedProtocol[0] : forwardedProtocol)?.split(',')[0] ?? 'http';
+    const requestHost = req.headers.host;
+    const sameOrigin = Boolean(requestHost && origin === `${requestProtocol}://${requestHost}`);
+    if (origin && !sameOrigin && origin !== 'http://localhost:3000' && origin !== 'http://127.0.0.1:3000') {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Agent analysis accepts requests only from the local FlowTerminal UI.' }));
       return;
@@ -436,6 +440,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // In production, serve the built Vite app from this same service so its API
+  // and WebSocket connections share the Render hostname and service hours.
+  if ((req.method === 'GET' || req.method === 'HEAD') && !parsed.pathname?.startsWith('/api/')) {
+    const frontendDirectory = resolve(process.cwd(), 'frontend', 'dist');
+    const indexFile = resolve(frontendDirectory, 'index.html');
+    if (existsSync(indexFile)) {
+      let requestedPath = '/';
+      try { requestedPath = decodeURIComponent(parsed.pathname || '/'); } catch { /* use the app root for malformed paths */ }
+      const candidate = resolve(frontendDirectory, `.${requestedPath}`);
+      const isInsideFrontend = candidate.startsWith(`${frontendDirectory}${sep}`) || candidate === indexFile;
+      const requestedFile = isInsideFrontend && existsSync(candidate) && statSync(candidate).isFile() ? candidate : indexFile;
+      const contentTypes: Record<string, string> = {
+        '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.ico': 'image/x-icon',
+        '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
+        '.png': 'image/png', '.svg': 'image/svg+xml', '.webp': 'image/webp', '.woff': 'font/woff',
+        '.woff2': 'font/woff2'
+      };
+      res.writeHead(200, { 'Content-Type': contentTypes[extname(requestedFile)] ?? 'application/octet-stream' });
+      res.end(req.method === 'HEAD' ? undefined : readFileSync(requestedFile));
+      return;
+    }
+  }
+
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
@@ -443,7 +470,8 @@ const server = http.createServer(async (req, res) => {
 // Bind WebSocket Server to existing HTTP server
 const wss = new WebSocketServer({ server });
 const selectedSymbolByClient = new WeakMap<WebSocket, string>();
-console.log(`[FlowTerminal Engine] HTTP & WebSocket Gateway listening on http://localhost:${LOCAL_GATEWAY_PORT}`);
+const gatewayPort = Number(process.env.PORT) || LOCAL_GATEWAY_PORT;
+console.log(`[FlowTerminal Engine] HTTP & WebSocket Gateway listening on port ${gatewayPort}`);
 
 function messageSymbol(msg: GatewayMessage): string | null {
   const topLevelSymbol = (msg as { symbol?: unknown }).symbol;
@@ -815,4 +843,4 @@ function gracefulShutdown(): void {
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
-server.listen(LOCAL_GATEWAY_PORT);
+server.listen(gatewayPort, '0.0.0.0');
