@@ -24,9 +24,11 @@ export class BybitWebSocketClient {
   private pingTimer: NodeJS.Timeout | null = null;
   private pongTimeout: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private marketDataWatchdog: NodeJS.Timeout | null = null;
   private reconnectDelay: number = INITIAL_RECONNECT_DELAY_MS;
   private isExplicitShutdown: boolean = false;
   private hasReceivedMarketData: boolean = false;
+  private lastMarketDataAt = 0;
   private readonly symbols: string[];
   private readonly callbacks: BybitClientCallbacks;
   private readonly orderBookResubscribeTimers = new Map<string, NodeJS.Timeout>();
@@ -44,6 +46,7 @@ export class BybitWebSocketClient {
     this.clearReconnectTimer();
     this.isExplicitShutdown = false;
     this.hasReceivedMarketData = false;
+    this.lastMarketDataAt = Date.now();
     this.callbacks.onStatusChange('CONNECTING', 'Connecting to Bybit V5 Public WebSocket...');
 
     try {
@@ -57,7 +60,9 @@ export class BybitWebSocketClient {
 
     this.ws.on('open', () => {
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+      this.lastMarketDataAt = Date.now();
       this.startHeartbeat();
+      this.startMarketDataWatchdog();
       this.subscribeTopics();
     });
 
@@ -144,6 +149,7 @@ export class BybitWebSocketClient {
 
     // Route topic messages
     if (typeof msg.topic === 'string') {
+      this.lastMarketDataAt = Date.now();
       if (!this.hasReceivedMarketData) {
         this.hasReceivedMarketData = true;
         this.callbacks.onStatusChange('LIVE', 'Market data streaming verified');
@@ -182,6 +188,18 @@ export class BybitWebSocketClient {
     }
   }
 
+  /** Ping/pong can stay healthy while subscriptions stop delivering market data. */
+  private startMarketDataWatchdog(): void {
+    if (this.marketDataWatchdog) clearInterval(this.marketDataWatchdog);
+    this.marketDataWatchdog = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      const silentForMs = Date.now() - this.lastMarketDataAt;
+      if (silentForMs < 60_000) return;
+      this.callbacks.onStatusChange('STALE', `No Bybit market-data messages for ${Math.floor(silentForMs / 1000)}s; reconnecting`);
+      this.ws.terminate();
+    }, 15_000);
+  }
+
   private scheduleReconnect(): void {
     if (this.isExplicitShutdown || this.reconnectTimer) return;
 
@@ -212,6 +230,10 @@ export class BybitWebSocketClient {
 
   private cleanupTimers(): void {
     this.clearHeartbeatTimers();
+    if (this.marketDataWatchdog) {
+      clearInterval(this.marketDataWatchdog);
+      this.marketDataWatchdog = null;
+    }
     this.clearReconnectTimer();
     for (const timer of this.orderBookResubscribeTimers.values()) clearTimeout(timer);
     this.orderBookResubscribeTimers.clear();

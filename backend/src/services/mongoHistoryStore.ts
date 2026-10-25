@@ -129,12 +129,17 @@ export class MongoHistoryStore {
     return docs.map((doc) => this.clean<NormalizedLiquidation>(doc)).reverse();
   }
 
-  async getCounts(): Promise<{ footprints: number; trades: number; orderBooks: number; liquidations: number }> {
-    const [footprints, trades, orderBooks, liquidations] = await Promise.all([
-      this.collection('footprints').estimatedDocumentCount(), this.collection('trades').estimatedDocumentCount(),
-      this.collection('orderBooks').estimatedDocumentCount(), this.collection('liquidations').estimatedDocumentCount()
+  async getCounts(): Promise<{ footprints: number; footprints1m: number; footprints5m: number; latestFootprintTime: number | null; trades: number; orderBooks: number; liquidations: number }> {
+    const [footprints, footprints1m, footprints5m, latestFootprint, trades, orderBooks, liquidations] = await Promise.all([
+      this.collection('footprints').estimatedDocumentCount(),
+      this.collection('footprints').countDocuments({ timeframe: '1m' }),
+      this.collection('footprints').countDocuments({ timeframe: '5m' }),
+      this.collection('footprints').find({}, { projection: { time: 1 } }).sort({ time: -1 }).limit(1).next(),
+      this.collection('trades').estimatedDocumentCount(),
+      this.collection('orderBooks').estimatedDocumentCount(),
+      this.collection('liquidations').estimatedDocumentCount()
     ]);
-    return { footprints, trades, orderBooks, liquidations };
+    return { footprints, footprints1m, footprints5m, latestFootprintTime: latestFootprint?.time ?? null, trades, orderBooks, liquidations };
   }
 
   async saveAgentDecision(snapshot: AgentSnapshot, result: CouncilResult): Promise<boolean> {

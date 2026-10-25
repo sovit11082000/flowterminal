@@ -852,7 +852,7 @@ export default function App() {
 
           const startStr = new Date(sorted[0].time * 1000).toLocaleDateString();
           const endStr = new Date(sorted[sorted.length - 1].time * 1000).toLocaleDateString();
-          setHistoryRangeText(`${startStr} → ${endStr} (${sorted.length} cached bars)`);
+          setHistoryRangeText(`${startStr} → ${endStr} (${sorted.length.toLocaleString()} cached price candles)`);
           scheduleOverlayRedraw();
         }
       }

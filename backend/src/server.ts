@@ -44,6 +44,7 @@ function loadProjectEnv(): void {
 loadProjectEnv();
 
 let currentMarketStatus: ConnectionStatus = 'DISCONNECTED';
+let lastTradeReceivedAt: number | null = null;
 let lastCouncilRequestAt = 0;
 interface MarketPipeline {
   orderBook: OrderBookState;
@@ -446,7 +447,14 @@ const server = http.createServer(async (req, res) => {
     const mongoCounts = await readMongoOrLocal('recorder counts',
       () => mongoHistory.getCounts(), () => null);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(), storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts } }));
+    const memory = process.memoryUsage();
+    res.end(JSON.stringify({
+      marketStatus: currentMarketStatus,
+      lastTradeReceivedAt,
+      memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
+      trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
+      storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
+    }));
     return;
   }
 
@@ -588,6 +596,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
     } else if (topic.startsWith('publicTrade.')) {
       const trades = parsePublicTradePayload(payload);
       if (trades.length > 0) {
+        lastTradeReceivedAt = Date.now();
         tradeHistory.save(trades);
         persistToMongo('trades', mongoHistory.saveTrades(trades));
         // 1. Broadcast Raw Normalized Trades
