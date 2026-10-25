@@ -148,7 +148,7 @@ export default function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [heatmapEnabled, setHeatmapEnabled] = useState(false);
   const [smcMenuOpen, setSmcMenuOpen] = useState(false);
-  const [smcFeatures, setSmcFeatures] = useState<SmartMoneyFeatures>({ structure: true, liquidity: true, zones: true });
+  const [smcFeatures, setSmcFeatures] = useState<SmartMoneyFeatures>({ structure: false, liquidity: false, zones: false });
   const smcFeaturesRef = useRef(smcFeatures);
   smcFeaturesRef.current = smcFeatures;
   const smcAnalysisRef = useRef<SmartMoneyAnalysis | null>(null);

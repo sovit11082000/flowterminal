@@ -131,8 +131,8 @@ export class MongoHistoryStore {
 
   async getCounts(): Promise<{ footprints: number; trades: number; orderBooks: number; liquidations: number }> {
     const [footprints, trades, orderBooks, liquidations] = await Promise.all([
-      this.collection('footprints').countDocuments(), this.collection('trades').countDocuments(),
-      this.collection('orderBooks').countDocuments(), this.collection('liquidations').countDocuments()
+      this.collection('footprints').estimatedDocumentCount(), this.collection('trades').estimatedDocumentCount(),
+      this.collection('orderBooks').estimatedDocumentCount(), this.collection('liquidations').estimatedDocumentCount()
     ]);
     return { footprints, trades, orderBooks, liquidations };
   }

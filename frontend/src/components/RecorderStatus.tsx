@@ -5,6 +5,7 @@ interface RecorderSnapshot {
   trades: { trades: number; symbols: string[]; oldestTime: number | null; newestTime: number | null };
   orderBook: { samples: number; symbols: string[]; oldestTime: number | null; newestTime: number | null; sampleIntervalMs: number };
   footprints: { bars: number; oneMinuteBars: number; fiveMinuteBars: number; symbols: string[]; oldestTime: number | null; newestTime: number | null };
+  storage?: { provider: 'mongodb' | 'local'; mongoCounts: { footprints: number; trades: number; orderBooks: number; liquidations: number } | null };
 }
 
 export default function RecorderStatus() {
@@ -33,6 +34,11 @@ export default function RecorderStatus() {
       <span>{(status?.trades.trades ?? 0).toLocaleString()} trades stored</span>
       <span>{(status?.footprints?.bars ?? 0).toLocaleString()} footprint bars · 1m {(status?.footprints?.oneMinuteBars ?? 0).toLocaleString()} / 5m {(status?.footprints?.fiveMinuteBars ?? 0).toLocaleString()}</span>
       <span>{(status?.orderBook.samples ?? 0).toLocaleString()} order-book samples</span>
+      <span style={{ color: status?.storage?.provider === 'mongodb' ? '#34d399' : '#fbbf24' }}>
+        {status?.storage?.provider === 'mongodb' && status.storage.mongoCounts
+          ? `MongoDB · ${status.storage.mongoCounts.trades.toLocaleString()} trades · ${status.storage.mongoCounts.orderBooks.toLocaleString()} book samples · ${status.storage.mongoCounts.footprints.toLocaleString()} footprints`
+          : 'MongoDB not connected'}
+      </span>
       <span>Book sample interval: {status?.orderBook.sampleIntervalMs ?? 500} ms</span>
       <span style={{ color: '#64748b' }}>{status?.footprints?.newestTime ? `Latest footprint ${new Date(status.footprints.newestTime * 1000).toLocaleString('en-IN')}` : 'Waiting for first closed footprint bar'} · Rolling local history.</span>
     </div>
