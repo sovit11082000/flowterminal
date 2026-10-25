@@ -2,10 +2,14 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, resolve } from 'node:path';
 import type { NormalizedLiquidation } from '../types/market.js';
 
+// MongoDB is the durable history when configured, so this process keeps only a
+// small fallback window instead of duplicating a large event history in RAM.
+const maxEvents = process.env.MONGODB_URI?.trim() ? 5_000 : 100_000;
+
 export class LiquidationHistoryStore {
   private readonly filePath: string;
   private readonly events: NormalizedLiquidation[] = [];
-  private readonly maxEvents = 100_000;
+  private readonly maxEvents = maxEvents;
   private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
   private lastPruneAt = 0;
 

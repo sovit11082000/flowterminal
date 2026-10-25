@@ -9,13 +9,18 @@ export interface OrderBookSample {
   asks: OrderBookEntry[];
 }
 
+// MongoDB is the durable 30-day store on hosted deployments. Keep only a small
+// process-local fallback there; retaining 120k full depth snapshots needlessly
+// duplicates the same records in the Node heap.
+const maxSamples = process.env.MONGODB_URI?.trim() ? 5_000 : 120_000;
+
 /** Rolling local order-book recorder. Samples the synchronized top 20 levels twice a second. */
 export class OrderBookHistoryStore {
   private readonly filePath: string;
   private readonly samples: OrderBookSample[] = [];
   private readonly lastSavedBySymbol = new Map<string, number>();
   private readonly sampleIntervalMs = 500;
-  private readonly maxSamples = 120_000;
+  private readonly maxSamples = maxSamples;
   private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
   private lastPruneAt = 0;
 

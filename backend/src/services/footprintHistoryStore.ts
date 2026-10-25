@@ -2,11 +2,15 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, resolve } from 'node:path';
 import type { CandleTimeframe, SerializedFootprintBar } from '../types/market.js';
 
+// MongoDB stores the retained 30-day footprint history; keep a bounded local
+// fallback cache on hosted deployments to avoid duplicating every price level.
+const maxBars = process.env.MONGODB_URI?.trim() ? 3_000 : 20_000;
+
 /** Persists completed, locally captured footprint bars. Klines cannot reconstruct trade-side volume. */
 export class FootprintHistoryStore {
   private readonly filePath: string;
   private readonly bars = new Map<string, SerializedFootprintBar>();
-  private readonly maxBars = 20_000;
+  private readonly maxBars = maxBars;
   private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
 
   constructor(filePath = resolve(process.cwd(), 'data', 'footprint-history.jsonl')) {

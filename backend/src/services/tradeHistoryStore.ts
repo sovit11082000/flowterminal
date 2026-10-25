@@ -2,11 +2,15 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, resolve } from 'node:path';
 import type { NormalizedTrade } from '../types/market.js';
 
+// Keep the full retained trade history in MongoDB when configured, and use a
+// small rolling in-process cache only for fallback reads.
+const maxTrades = process.env.MONGODB_URI?.trim() ? 25_000 : 500_000;
+
 /** Local rolling recorder for normalized public trades, used by replay and audits. */
 export class TradeHistoryStore {
   private readonly filePath: string;
   private readonly trades: NormalizedTrade[] = [];
-  private readonly maxTrades = 500_000;
+  private readonly maxTrades = maxTrades;
   private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
   private lastPruneAt = 0;
 
