@@ -29,7 +29,7 @@ import { FootprintHistoryStore } from './services/footprintHistoryStore.js';
 import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
-import { MongoHistoryStore } from './services/mongoHistoryStore.js';
+import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoHistoryStore.js';
 import { runOrderFlowCouncil, type AgentSnapshot } from './agents/orderFlowCouncil.js';
 
 function loadProjectEnv(): void {
@@ -192,9 +192,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       lastCouncilRequestAt = Date.now();
+      let paperPerformance: AgentPaperPerformance | null = null;
+      if (mongoHistory.connected) {
+        try {
+          paperPerformance = await mongoHistory.getAgentPaperPerformance(snapshot.symbol, snapshot.timeframe);
+          snapshot.paperPerformance = paperPerformance;
+        } catch (error) {
+          console.warn('[MongoDB] Could not load prior agent outcomes:', error instanceof Error ? error.message : error);
+        }
+      }
       const result = await runOrderFlowCouncil(snapshot);
+      let paperPlanSaved = false;
+      if (mongoHistory.connected) {
+        try { paperPlanSaved = await mongoHistory.saveAgentDecision(snapshot, result); }
+        catch (error) { console.warn('[MongoDB] Could not save agent paper plan:', error instanceof Error ? error.message : error); }
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(result));
+      res.end(JSON.stringify({ ...result, paperPerformance, paperPlanSaved }));
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Agent analysis failed.';
       const status = message.includes('too large') ? 413 : message.includes('not configured') ? 503 : message.includes('quota') ? 429 : 502;
@@ -508,6 +522,11 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
           tradesCount: 0, buyVolume: 0, sellVolume: 0, delta: 0, isClosed: row.confirm === true
         };
         latestExchangeCandles.set(`${symbol}:${timeframe}`, candle);
+        if (candle.isClosed) {
+          void mongoHistory.settleAgentDecisions(candle).catch((error: unknown) => {
+            console.warn('[MongoDB] Could not settle an agent paper plan:', error instanceof Error ? error.message : error);
+          });
+        }
         broadcast({ type: 'CANDLE', timeframe, data: candle, timestamp: Number((payload as { ts?: unknown }).ts) || Date.now() });
       }
     } else if (topic.startsWith('tickers.')) {

@@ -7,7 +7,11 @@ import type { SmartMoneyAnalysis } from './SmartMoneyOverlay.js';
 
 interface SpecialistReport { agentId: string; name: string; bias: 'LONG' | 'SHORT' | 'NEUTRAL'; strength: number; findings: string[]; concerns: string[]; missingData: string[]; }
 interface CouncilPlan { decision: 'LONG' | 'SHORT' | 'WAIT'; summary: string; entryTrigger: string; invalidation: string; exitPlan: string; agreeingAgents: string[]; dissent: string[]; }
-interface CouncilResult { reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number; }
+interface CouncilResult {
+  reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number;
+  paperPlanSaved?: boolean;
+  paperPerformance?: { resolved: number; wins: number; losses: number; expired: number; winRate: number | null; averageR: number | null } | null;
+}
 const priceFormat = (value: number) => value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 
 export default function AgentCouncilPanel({ symbol, timeframe, feedStatus, lastTradeAt, price, candles, footprints, trades, bids, asks, analysis }: {
@@ -107,6 +111,8 @@ export default function AgentCouncilPanel({ symbol, timeframe, feedStatus, lastT
         </div>}
         {result.plan.decision !== 'WAIT' && !levels && <div style={{ color: '#fbbf24', fontSize: 10, marginTop: 7 }}>Manager has a directional view, but recent candle structure is insufficient to calculate a safe sample stop. Treat this as WAIT.</div>}
         <div style={{ marginTop: 7, color: '#64748b', fontSize: 9 }}>Run {new Date(result.generatedAt).toLocaleTimeString('en-IN')} · {result.model} · {result.plan.agreeingAgents.length}/3 aligned specialist reports · AI plan is paper research only.</div>
+        {result.paperPlanSaved && <div style={{ marginTop: 6, color: '#93c5fd', fontSize: 10 }}>Paper plan saved to MongoDB. A later closed candle must touch entry and close in the planned direction to count as filled; if stop and target both fit in one candle, scoring counts the stop first. This candle-based replay approximates the written trigger.</div>}
+        {result.paperPerformance && <div style={{ marginTop: 5, color: '#94a3b8', fontSize: 10 }}>Prior AI paper outcomes · {result.paperPerformance.resolved} resolved · {result.paperPerformance.wins} wins / {result.paperPerformance.losses} losses / {result.paperPerformance.expired} expired · win rate {result.paperPerformance.winRate === null ? '—' : `${(result.paperPerformance.winRate * 100).toFixed(1)}%`} · average {result.paperPerformance.averageR === null ? '—' : `${result.paperPerformance.averageR.toFixed(2)}R`}. Small samples are not proof; this only gives the manager cautious historical context.</div>}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, padding: 10 }}>
         {result.reports.map((report) => <article key={report.agentId} style={{ border: '1px solid #1f2937', borderRadius: 4, padding: 8, background: '#0f1724' }}>

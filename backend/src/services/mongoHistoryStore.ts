@@ -1,8 +1,18 @@
 import { MongoClient, type Collection, type Document } from 'mongodb';
-import type { SerializedFootprintBar, NormalizedTrade, NormalizedLiquidation } from '../types/market.js';
+import type { NormalizedCandle, SerializedFootprintBar, NormalizedTrade, NormalizedLiquidation } from '../types/market.js';
 import type { OrderBookSample } from './orderBookHistoryStore.js';
+import type { CouncilResult, AgentSnapshot } from '../agents/orderFlowCouncil.js';
 
 type Stored<T> = T & { _id: string; expiresAt: Date };
+export interface AgentPaperPerformance {
+  resolved: number;
+  wins: number;
+  losses: number;
+  expired: number;
+  winRate: number | null;
+  averageR: number | null;
+  recent: Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }>;
+}
 
 /** MongoDB persistence for records captured after the service connects. It never imports local JSONL files. */
 export class MongoHistoryStore {
@@ -38,7 +48,9 @@ export class MongoHistoryStore {
       this.collection('order_books').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('order_books').createIndex({ symbol: 1, time: 1 }),
       this.collection('liquidations').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
-      this.collection('liquidations').createIndex({ symbol: 1, timestamp: 1 })
+      this.collection('liquidations').createIndex({ symbol: 1, timestamp: 1 }),
+      this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 })
     ]);
     console.log(`[MongoDB] Connected to database "${this.databaseName}". Existing local files were not imported.`);
   }
@@ -125,9 +137,98 @@ export class MongoHistoryStore {
     return { footprints, trades, orderBooks, liquidations };
   }
 
-  private collection(name: keyof typeof this.collectionNames): Collection<Document> {
+  async saveAgentDecision(snapshot: AgentSnapshot, result: CouncilResult): Promise<boolean> {
+    if (!this.db || (result.plan.decision !== 'LONG' && result.plan.decision !== 'SHORT') ||
+      result.plan.entryPrice === null || result.plan.stopPrice === null || result.plan.targetPrice === null || result.plan.targetR === null) return false;
+    const { plan } = result;
+    await this.collection('agent_decisions').insertOne({
+      symbol: snapshot.symbol,
+      timeframe: snapshot.timeframe,
+      generatedAt: result.generatedAt,
+      side: plan.decision,
+      entry: plan.entryPrice,
+      stop: plan.stopPrice,
+      target: plan.targetPrice,
+      targetR: plan.targetR,
+      summary: plan.summary,
+      reports: result.reports.map(({ agentId, bias, strength }) => ({ agentId, bias, strength })),
+      status: 'PENDING',
+      filledAt: null,
+      resolvedAt: null,
+      pnlR: null,
+      expiresAt: new Date(result.generatedAt + 30 * 24 * 60 * 60_000)
+    });
+    await this.enforceCap('agent_decisions', 10_000);
+    return true;
+  }
+
+  async settleAgentDecisions(candle: NormalizedCandle): Promise<void> {
+    if (!this.db || !candle.isClosed) return;
+    const collection = this.collection('agent_decisions');
+    const candleTimeMs = candle.time * 1000;
+    const pending = await collection.find({
+      symbol: candle.symbol,
+      timeframe: candle.timeframe,
+      status: { $in: ['PENDING', 'OPEN'] },
+      generatedAt: { $lt: candleTimeMs },
+      expiresAt: { $gt: new Date() }
+    }).sort({ generatedAt: 1 }).limit(200).toArray();
+    const intervalSeconds = candle.timeframe === '1m' ? 60 : candle.timeframe === '3m' ? 180 : candle.timeframe === '5m' ? 300 : candle.timeframe === '15m' ? 900 : candle.timeframe === '30m' ? 1800 : candle.timeframe === '1h' ? 3600 : candle.timeframe === '4h' ? 14400 : 86400;
+    for (const record of pending) {
+      const side = record.side as 'LONG' | 'SHORT';
+      const entry = Number(record.entry), stop = Number(record.stop), target = Number(record.target);
+      const maxWaitMs = 30 * intervalSeconds * 1000;
+      if (record.status === 'PENDING') {
+        const entryTouched = candle.low <= entry && candle.high >= entry &&
+          (side === 'LONG' ? candle.close >= entry : candle.close <= entry);
+        if (!entryTouched) {
+          if (candleTimeMs - Number(record.generatedAt) >= maxWaitMs) {
+            await collection.updateOne({ _id: record._id, status: 'PENDING' }, { $set: { status: 'EXPIRED', resolvedAt: candleTimeMs } });
+          }
+          continue;
+        }
+        const stopHit = side === 'LONG' ? candle.low <= stop : candle.high >= stop;
+        const targetHit = side === 'LONG' ? candle.high >= target : candle.low <= target;
+        if (stopHit) {
+          await collection.updateOne({ _id: record._id, status: 'PENDING' }, { $set: { status: 'LOSS', filledAt: candleTimeMs, resolvedAt: candleTimeMs, pnlR: -1 } });
+        } else if (targetHit) {
+          await collection.updateOne({ _id: record._id, status: 'PENDING' }, { $set: { status: 'WIN', filledAt: candleTimeMs, resolvedAt: candleTimeMs, pnlR: Number(record.targetR) } });
+        } else {
+          await collection.updateOne({ _id: record._id, status: 'PENDING' }, { $set: { status: 'OPEN', filledAt: candleTimeMs } });
+        }
+        continue;
+      }
+      const stopHit = side === 'LONG' ? candle.low <= stop : candle.high >= stop;
+      const targetHit = side === 'LONG' ? candle.high >= target : candle.low <= target;
+      // OHLC cannot establish which level traded first; score the stop first.
+      if (stopHit) await collection.updateOne({ _id: record._id, status: 'OPEN' }, { $set: { status: 'LOSS', resolvedAt: candleTimeMs, pnlR: -1 } });
+      else if (targetHit) await collection.updateOne({ _id: record._id, status: 'OPEN' }, { $set: { status: 'WIN', resolvedAt: candleTimeMs, pnlR: Number(record.targetR) } });
+    }
+  }
+
+  async getAgentPaperPerformance(symbol: string, timeframe: string, limit = 30): Promise<AgentPaperPerformance> {
+    const resolved = await this.collection('agent_decisions').find({
+      symbol, timeframe, status: { $in: ['WIN', 'LOSS', 'EXPIRED'] }
+    }).sort({ resolvedAt: -1 }).limit(limit).toArray();
+    const wins = resolved.filter((row) => row.status === 'WIN').length;
+    const losses = resolved.filter((row) => row.status === 'LOSS').length;
+    const scored = resolved.filter((row) => typeof row.pnlR === 'number');
+    return {
+      resolved: resolved.length,
+      wins,
+      losses,
+      expired: resolved.filter((row) => row.status === 'EXPIRED').length,
+      winRate: wins + losses ? wins / (wins + losses) : null,
+      averageR: scored.length ? scored.reduce((sum, row) => sum + Number(row.pnlR), 0) / scored.length : null,
+      recent: resolved.filter((row) => row.status === 'WIN' || row.status === 'LOSS').slice(0, 5).map((row) => ({
+        side: row.side as 'LONG' | 'SHORT', outcome: row.status as 'WIN' | 'LOSS', pnlR: Number(row.pnlR)
+      }))
+    };
+  }
+
+  private collection(name: keyof typeof this.collectionNames | 'agent_decisions'): Collection<Document> {
     if (!this.db) throw new Error('MongoDB is not connected.');
-    return this.db.collection(this.collectionNames[name]);
+    return this.db.collection(name === 'agent_decisions' ? name : this.collectionNames[name]);
   }
 
   private timeQuery(symbol: string, field: string, start?: number, end?: number): Document {
@@ -144,7 +245,7 @@ export class MongoHistoryStore {
     return record as T;
   }
 
-  private async enforceCap(name: keyof typeof this.collectionNames, cap: number): Promise<void> {
+  private async enforceCap(name: keyof typeof this.collectionNames | 'agent_decisions', cap: number): Promise<void> {
     if (!this.db) return;
     const now = Date.now();
     if (now - (this.lastCapCheckAt.get(name) ?? 0) < 60_000) return;
@@ -154,7 +255,7 @@ export class MongoHistoryStore {
     if (count <= cap) return;
     const excess = count - cap;
     const oldest = await collection.find({}, { projection: { _id: 1 } })
-      .sort(name === 'footprints' ? { time: 1 } : name === 'trades' || name === 'liquidations' ? { timestamp: 1 } : { time: 1 })
+      .sort(name === 'footprints' ? { time: 1 } : name === 'trades' || name === 'liquidations' ? { timestamp: 1 } : name === 'agent_decisions' ? { generatedAt: 1 } : { time: 1 })
       .limit(excess).toArray();
     if (oldest.length) await collection.deleteMany({ _id: { $in: oldest.map((doc) => doc._id) } });
   }

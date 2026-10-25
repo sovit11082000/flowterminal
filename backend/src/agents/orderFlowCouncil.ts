@@ -22,6 +22,11 @@ export interface AgentSnapshot {
   trades: Array<{ timestamp: number; side: string; price: number; size: number }>;
   bids: Array<[number, number]>;
   asks: Array<[number, number]>;
+  paperPerformance?: {
+    resolved: number; wins: number; losses: number; expired: number;
+    winRate: number | null; averageR: number | null;
+    recent: Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }>;
+  } | null;
 }
 
 type AiProvider = 'gemini' | 'groq' | 'ollama';
@@ -362,7 +367,7 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
 
   if (!managerProviders.length) throw new Error('No AI credential is configured for the manager. Add GEMINI_MANAGER_CREDENTIALS to backend/.env.');
   const rawPlan = await generateWithFallback<CouncilPlan>(managerProviders, 'manager',
-      `${ORDER_FLOW_SKILL}\nROLE: TRADE PLAN MANAGER\nReview the market snapshot and exactly three specialist reports. Return LONG/SHORT only if all three biases match and each strength is at least 2; any neutral, disagreement, failed specialist, stale feed, insufficient context, or missing level means WAIT. For a directional plan, specify an entry trigger as a conditional POC/VA pullback/retest, numeric entryPrice, structural invalidation text and numeric stopPrice, numeric targetPrice, targetR exactly 2 or 3 with target at that R multiple, and exitPlan. The target must sit before the nearest unswept opposing SMC liquidity level. Use supplied prices/levels only; if these constraints cannot be satisfied, return WAIT with null numeric levels. This is a paper/research suggestion only, never an exchange order.`,
+      `${ORDER_FLOW_SKILL}\nROLE: TRADE PLAN MANAGER\nReview the market snapshot and exactly three specialist reports. Return LONG/SHORT only if all three biases match and each strength is at least 2; any neutral, disagreement, failed specialist, stale feed, insufficient context, or missing level means WAIT. For a directional plan, specify an entry trigger as a conditional POC/VA pullback/retest, numeric entryPrice, structural invalidation text and numeric stopPrice, numeric targetPrice, targetR exactly 2 or 3 with target at that R multiple, and exitPlan. The target must sit before the nearest unswept opposing SMC liquidity level. Use supplied prices/levels only; if these constraints cannot be satisfied, return WAIT with null numeric levels.\n\nThe snapshot may contain paperPerformance from previously settled AI plans for the same symbol/timeframe. Use it only as cautious calibration: a sample under 20 resolved plans is too small to adjust the strategy; never claim a strategy is learned or profitable. If there are at least 20 resolved plans and performance is poor, require stronger confluence or choose WAIT; do not change price facts or relax the risk rules.\n\nThis is a paper/research suggestion only, never an exchange order.`,
     { snapshot: input, reports }, planSchema);
   const usedProviders = [...new Set([...configuredRoles.flat(), ...managerProviders].map((provider) => `${provider.provider}:${provider.model}`))].join(', ');
   return { reports, plan: sanitizePlan(rawPlan, reports, snapshot), model: usedProviders, generatedAt: Date.now() };
