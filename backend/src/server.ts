@@ -29,6 +29,7 @@ import { FootprintHistoryStore } from './services/footprintHistoryStore.js';
 import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
+import { MongoHistoryStore } from './services/mongoHistoryStore.js';
 import { runOrderFlowCouncil, type AgentSnapshot } from './agents/orderFlowCouncil.js';
 
 function loadProjectEnv(): void {
@@ -73,6 +74,20 @@ const binanceOptionsService = new BinanceOptionsService();
 const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
 const liquidationHistory = new LiquidationHistoryStore();
+const mongoHistory = new MongoHistoryStore();
+function persistToMongo(label: string, operation: Promise<void>): void {
+  void operation.catch((error: unknown) => {
+    console.warn(`[MongoDB] Could not persist ${label}:`, error instanceof Error ? error.message : error);
+  });
+}
+async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, readLocal: () => T): Promise<T> {
+  if (!mongoHistory.connected) return readLocal();
+  try { return await readMongo(); }
+  catch (error) {
+    console.warn(`[MongoDB] Could not read ${label}; using current-process cache:`, error instanceof Error ? error.message : error);
+    return readLocal();
+  }
+}
 const liveTickerBySymbol = new Map<string, { lastPrice: number | null; markPrice: number | null; indexPrice: number | null }>();
 const latestExchangeCandles = new Map<string, NormalizedCandle>();
 const firstFootprintBarByKey = new Map<string, number>();
@@ -271,8 +286,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Invalid footprint history timeframe or time range.' }));
       return;
     }
+    const bars = await readMongoOrLocal('footprints',
+      () => mongoHistory.getFootprints({ symbol, timeframe, startTimeMs, endTimeMs }),
+      () => footprintHistory.getHistory({ symbol, timeframe, startTimeMs, endTimeMs }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ symbol, timeframe, bars: footprintHistory.getHistory({ symbol, timeframe, startTimeMs, endTimeMs }) }));
+    res.end(JSON.stringify({ symbol, timeframe, bars }));
     return;
   }
 
@@ -346,8 +364,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Invalid order-book history request.' }));
       return;
     }
+    const samples = await readMongoOrLocal('order-book samples',
+      () => mongoHistory.getOrderBooks({ symbol, startTimeMs, endTimeMs, limit }),
+      () => orderBookHistory.getHistory({ symbol, startTimeMs, endTimeMs, limit }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ symbol, status: orderBookHistory.getStatus(), samples: orderBookHistory.getHistory({ symbol, startTimeMs, endTimeMs, limit }) }));
+    res.end(JSON.stringify({ symbol, status: orderBookHistory.getStatus(), samples }));
     return;
   }
 
@@ -365,8 +386,11 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Invalid recorded-trade history request.' }));
       return;
     }
+    const samples = await readMongoOrLocal('trades',
+      () => mongoHistory.getTrades({ symbol, startTimeMs, endTimeMs, limit }),
+      () => tradeHistory.getHistory({ symbol, startTimeMs, endTimeMs, limit }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ symbol, samples: tradeHistory.getHistory({ symbol, startTimeMs, endTimeMs, limit }) }));
+    res.end(JSON.stringify({ symbol, samples }));
     return;
   }
 
@@ -382,14 +406,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Invalid liquidation history request.' }));
       return;
     }
+    const events = await readMongoOrLocal('liquidations',
+      () => mongoHistory.getLiquidations({ symbol, startTimeMs, endTimeMs, limit }),
+      () => liquidationHistory.getHistory(symbol, startTimeMs, endTimeMs, limit));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ symbol, events: liquidationHistory.getHistory(symbol, startTimeMs, endTimeMs, limit) }));
+    res.end(JSON.stringify({ symbol, events }));
     return;
   }
 
   if (req.method === 'GET' && parsed.pathname === '/api/recorder/status') {
+    const mongoCounts = await readMongoOrLocal('recorder counts',
+      () => mongoHistory.getCounts(), () => null);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus() }));
+    res.end(JSON.stringify({ trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(), storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts } }));
     return;
   }
 
@@ -500,6 +529,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       const trades = parsePublicTradePayload(payload);
       if (trades.length > 0) {
         tradeHistory.save(trades);
+        persistToMongo('trades', mongoHistory.saveTrades(trades));
         // 1. Broadcast Raw Normalized Trades
         const tradeMsg: TradeGatewayMessage = {
           type: 'TRADE',
@@ -524,7 +554,10 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                 const serialized = pipeline.footprints['1m'].serializeBar(closedBar);
                 // The first bar captured after startup can be only partially
                 // observed; publish its close, but keep it out of persisted history.
-                if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) footprintHistory.save(serialized);
+                if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
+                  footprintHistory.save(serialized);
+                  persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                }
                 broadcast({
                   type: 'FOOTPRINT_BAR',
                   timeframe: '1m',
@@ -538,6 +571,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               for (const corrected of pipeline.footprints['1m'].getRecentBars(200).filter((bar) => bar.time >= fpBar1m.time && bar.isClosed)) {
                 const serialized = pipeline.footprints['1m'].serializeBar(corrected);
                 footprintHistory.save(serialized);
+                persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
                 broadcast({ type: 'FOOTPRINT_BAR', timeframe: '1m', data: serialized, timestamp: Date.now() });
               }
             }
@@ -555,7 +589,10 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               const closedBar = pipeline.footprints['5m'].getRecentBars().find((b) => b.time === prevBarTime5m);
               if (closedBar) {
                 const serialized = pipeline.footprints['5m'].serializeBar(closedBar);
-                if (firstFootprintBarByKey.get(fpKey5m) !== closedBar.time) footprintHistory.save(serialized);
+                if (firstFootprintBarByKey.get(fpKey5m) !== closedBar.time) {
+                  footprintHistory.save(serialized);
+                  persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                }
                 broadcast({
                   type: 'FOOTPRINT_BAR',
                   timeframe: '5m',
@@ -569,6 +606,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               for (const corrected of pipeline.footprints['5m'].getRecentBars(200).filter((bar) => bar.time >= fpBar5m.time && bar.isClosed)) {
                 const serialized = pipeline.footprints['5m'].serializeBar(corrected);
                 footprintHistory.save(serialized);
+                persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
                 broadcast({ type: 'FOOTPRINT_BAR', timeframe: '5m', data: serialized, timestamp: Date.now() });
               }
             }
@@ -593,6 +631,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       });
       if (liquidations.length) {
         liquidationHistory.save(liquidations);
+        persistToMongo('liquidations', mongoHistory.saveLiquidations(liquidations));
         broadcast({ type: 'LIQUIDATION', data: liquidations, timestamp: Date.now() });
       }
     } else if (topic.startsWith('orderbook.50.')) {
@@ -604,12 +643,14 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       if (raw.type === 'snapshot') {
         const ok = pipeline.orderBook.processSnapshot(payload);
         if (ok) {
-          orderBookHistory.save({
+          const sample = {
             symbol,
             time: Date.now(),
             bids: pipeline.orderBook.getSortedBids(20),
             asks: pipeline.orderBook.getSortedAsks(20)
-          });
+          };
+          orderBookHistory.save(sample);
+          persistToMongo('order-book sample', mongoHistory.saveOrderBook(sample));
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_SNAPSHOT',
@@ -633,12 +674,14 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       } else if (raw.type === 'delta') {
         const ok = pipeline.orderBook.processDelta(payload);
         if (ok) {
-          orderBookHistory.save({
+          const sample = {
             symbol,
             time: Date.now(),
             bids: pipeline.orderBook.getSortedBids(20),
             asks: pipeline.orderBook.getSortedAsks(20)
-          });
+          };
+          orderBookHistory.save(sample);
+          persistToMongo('order-book sample', mongoHistory.saveOrderBook(sample));
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_DELTA',
@@ -675,7 +718,11 @@ void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((resolvedTickSizes)
   console.log(`[FlowTerminal] Loaded exchange tick sizes for ${Object.keys(resolvedTickSizes).length}/${SUPPORTED_SYMBOLS.length} markets`);
 }).catch((error: unknown) => {
   console.warn('[FlowTerminal] Could not load instrument tick sizes; using configured fallback sizes.', error);
-}).finally(() => bybitClient.connect());
+}).finally(() => {
+  void mongoHistory.connect()
+    .catch((error: unknown) => console.error('[MongoDB] Connection failed; local recording remains active:', error))
+    .finally(() => bybitClient.connect());
+});
 
 wss.on('connection', (ws: WebSocket) => {
   selectedSymbolByClient.set(ws, DEFAULT_SYMBOL);
@@ -738,8 +785,10 @@ function gracefulShutdown(): void {
 
   wss.close(() => {
     server.close(() => {
-      console.log('[FlowTerminal Gateway] HTTP server and gateway closed.');
-      process.exit(0);
+      void mongoHistory.close().finally(() => {
+        console.log('[FlowTerminal Gateway] HTTP server and gateway closed.');
+        process.exit(0);
+      });
     });
   });
 }
