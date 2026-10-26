@@ -75,10 +75,42 @@ const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
 const liquidationHistory = new LiquidationHistoryStore();
 const mongoHistory = new MongoHistoryStore();
-function persistToMongo(label: string, operation: Promise<void>): void {
-  void operation.catch((error: unknown) => {
-    console.warn(`[MongoDB] Could not persist ${label}:`, error instanceof Error ? error.message : error);
-  });
+type MongoWriteTask = { label: string; write: () => Promise<void> };
+const mongoWriteQueue: MongoWriteTask[] = [];
+const MAX_PENDING_MONGO_WRITES = 128;
+const MAX_ACTIVE_MONGO_WRITES = 3;
+let activeMongoWrites = 0;
+let lastMongoQueueWarningAt = 0;
+
+function drainMongoWriteQueue(): void {
+  while (activeMongoWrites < MAX_ACTIVE_MONGO_WRITES && mongoWriteQueue.length) {
+    const task = mongoWriteQueue.shift()!;
+    activeMongoWrites++;
+    void task.write().catch((error: unknown) => {
+      console.warn(`[MongoDB] Could not persist ${task.label}:`, error instanceof Error ? error.message : error);
+    }).finally(() => {
+      activeMongoWrites--;
+      drainMongoWriteQueue();
+    });
+  }
+}
+
+function persistToMongo(label: string, write: () => Promise<void>): void {
+  if (mongoWriteQueue.length >= MAX_PENDING_MONGO_WRITES) {
+    // Book snapshots are useful for heatmap context but can be sampled again;
+    // preserve trades and closed footprints when MongoDB is under pressure.
+    const staleBookTask = mongoWriteQueue.findIndex((task) => task.label === 'order-book sample');
+    if (staleBookTask >= 0) mongoWriteQueue.splice(staleBookTask, 1);
+    else if (label === 'order-book sample') return;
+    else mongoWriteQueue.shift();
+
+    if (Date.now() - lastMongoQueueWarningAt > 60_000) {
+      lastMongoQueueWarningAt = Date.now();
+      console.warn('[MongoDB] Write queue reached its safety limit; discarded the oldest queued record to protect service memory.');
+    }
+  }
+  mongoWriteQueue.push({ label, write });
+  drainMongoWriteQueue();
 }
 async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, readLocal: () => T): Promise<T> {
   if (!mongoHistory.connected) return readLocal();
@@ -452,6 +484,7 @@ const server = http.createServer(async (req, res) => {
       marketStatus: currentMarketStatus,
       lastTradeReceivedAt,
       memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
+      mongoWriteQueue: { pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES },
       trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
       storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
     }));
@@ -598,7 +631,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       if (trades.length > 0) {
         lastTradeReceivedAt = Date.now();
         tradeHistory.save(trades);
-        persistToMongo('trades', mongoHistory.saveTrades(trades));
+        persistToMongo('trades', () => mongoHistory.saveTrades(trades));
         // 1. Broadcast Raw Normalized Trades
         const tradeMsg: TradeGatewayMessage = {
           type: 'TRADE',
@@ -625,7 +658,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                 // observed; publish its close, but keep it out of persisted history.
                 if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
                   footprintHistory.save(serialized);
-                  persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                  persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 }
                 broadcast({
                   type: 'FOOTPRINT_BAR',
@@ -640,7 +673,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               for (const corrected of pipeline.footprints['1m'].getRecentBars(200).filter((bar) => bar.time >= fpBar1m.time && bar.isClosed)) {
                 const serialized = pipeline.footprints['1m'].serializeBar(corrected);
                 footprintHistory.save(serialized);
-                persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 broadcast({ type: 'FOOTPRINT_BAR', timeframe: '1m', data: serialized, timestamp: Date.now() });
               }
             }
@@ -660,7 +693,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                 const serialized = pipeline.footprints['5m'].serializeBar(closedBar);
                 if (firstFootprintBarByKey.get(fpKey5m) !== closedBar.time) {
                   footprintHistory.save(serialized);
-                  persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                  persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 }
                 broadcast({
                   type: 'FOOTPRINT_BAR',
@@ -675,7 +708,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               for (const corrected of pipeline.footprints['5m'].getRecentBars(200).filter((bar) => bar.time >= fpBar5m.time && bar.isClosed)) {
                 const serialized = pipeline.footprints['5m'].serializeBar(corrected);
                 footprintHistory.save(serialized);
-                persistToMongo('footprint bar', mongoHistory.saveFootprint(serialized));
+                persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 broadcast({ type: 'FOOTPRINT_BAR', timeframe: '5m', data: serialized, timestamp: Date.now() });
               }
             }
@@ -700,7 +733,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       });
       if (liquidations.length) {
         liquidationHistory.save(liquidations);
-        persistToMongo('liquidations', mongoHistory.saveLiquidations(liquidations));
+        persistToMongo('liquidations', () => mongoHistory.saveLiquidations(liquidations));
         broadcast({ type: 'LIQUIDATION', data: liquidations, timestamp: Date.now() });
       }
     } else if (topic.startsWith('orderbook.50.')) {
@@ -718,8 +751,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
             bids: pipeline.orderBook.getSortedBids(20),
             asks: pipeline.orderBook.getSortedAsks(20)
           };
-          orderBookHistory.save(sample);
-          persistToMongo('order-book sample', mongoHistory.saveOrderBook(sample));
+          if (orderBookHistory.save(sample)) persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_SNAPSHOT',
@@ -749,8 +781,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
             bids: pipeline.orderBook.getSortedBids(20),
             asks: pipeline.orderBook.getSortedAsks(20)
           };
-          orderBookHistory.save(sample);
-          persistToMongo('order-book sample', mongoHistory.saveOrderBook(sample));
+          if (orderBookHistory.save(sample)) persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_DELTA',

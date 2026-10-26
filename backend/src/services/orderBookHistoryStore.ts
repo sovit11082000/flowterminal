@@ -48,15 +48,16 @@ export class OrderBookHistoryStore {
     }
   }
 
-  save(sample: OrderBookSample): void {
-    if (!this.isValid(sample)) return;
+  save(sample: OrderBookSample): boolean {
+    if (!this.isValid(sample)) return false;
     const lastSaved = this.lastSavedBySymbol.get(sample.symbol) ?? 0;
-    if (sample.time - lastSaved < this.sampleIntervalMs) return;
+    if (sample.time - lastSaved < this.sampleIntervalMs) return false;
     this.samples.push(sample);
     this.lastSavedBySymbol.set(sample.symbol, sample.time);
     appendFileSync(this.filePath, `${JSON.stringify(sample)}\n`, 'utf8');
     this.pruneExpired(Date.now());
     if (this.samples.length > this.maxSamples + 5_000) this.trimAndPersist();
+    return true;
   }
 
   getHistory(options: { symbol: string; startTimeMs?: number; endTimeMs?: number; limit?: number }): OrderBookSample[] {
