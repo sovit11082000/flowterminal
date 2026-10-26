@@ -2,6 +2,7 @@ import type { SerializedFootprintBar } from '../types/market.js';
 import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 import { analyzeSmartMoney, isOrderFlowConfirmed, type SmartMoneyAnalysis } from './SmartMoneyOverlay.js';
 import { calculateVolumeProfile } from './VolumeProfileCalculator.js';
+import type { PersistentLiquidityWall } from './LiquidityWallAnalysis.js';
 
 export interface OIHistoryPoint { timestamp: string; openInterest: string; }
 interface NormalizedOIPoint { timeMs: number; oi: number; }
@@ -25,6 +26,7 @@ export interface TradeSetup {
   reasons: string[];
   strategyVersion: number;
   agentReads: BacktestAgentRead[];
+  liquidityWall?: PersistentLiquidityWall;
 }
 
 export interface BacktestTrade extends TradeSetup {

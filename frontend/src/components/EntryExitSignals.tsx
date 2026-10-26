@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import type { SerializedFootprintBar } from '../types/market.js';
 import { findOrderFlowSetup, type BacktestTrade, type SignalCandle, type TradeSetup } from './EntryExitSignalEngine.js';
+import { findPersistentLiquidityWalls, findSupportingLiquidityWall } from './LiquidityWallAnalysis.js';
 import type { VolumeProfileResult } from './VolumeProfileCalculator.js';
 import type { BookSample, TradeDot } from './OrderBookHeatmap.js';
 import type { DerivativesPayload } from './DerivativesPanel.js';
@@ -20,12 +21,13 @@ const keyFor = (symbol: string, timeframe: string) => `flowterminal_signal_${sym
 const fmt = (value: number) => value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 const intervalSeconds: Record<string, number> = { '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
 
-export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, historicalOIStatus }: {
+export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, historicalOIStatus, onLiveSetupChange }: {
   symbol: string; timeframe: string; candles: SignalCandle[]; footprints: SerializedFootprintBar[];
   bids: [number, number][]; asks: [number, number][]; price: number | null; feedStatus: string; lastTradeAt: number | null;
   context: ConfluenceContext;
   backtestTrades: BacktestTrade[];
   historicalOIStatus: 'idle' | 'loading' | 'ready' | 'error';
+  onLiveSetupChange?: (setup: TradeSetup | null) => void;
 }) {
   const [position, setPosition] = useState<PaperPosition | null>(null);
   const [journal, setJournal] = useState<JournalRow[]>([]);
@@ -34,8 +36,17 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   const [notice, setNotice] = useState('');
   const [now, setNow] = useState(Date.now());
   const [hydratedKey, setHydratedKey] = useState('');
-  const setup = useMemo(() => strategyVersion <= 3 ? findOrderFlowSetup(candles, footprints, bids, asks, strategyVersion, context.derivatives?.openInterest ?? [], symbol, intervalSeconds[timeframe] ?? 60) : null,
+  const ruleSetup = useMemo(() => strategyVersion <= 3 ? findOrderFlowSetup(candles, footprints, bids, asks, strategyVersion, context.derivatives?.openInterest ?? [], symbol, intervalSeconds[timeframe] ?? 60) : null,
     [candles, footprints, bids, asks, strategyVersion, context.derivatives, symbol, timeframe]);
+  const supportingWall = useMemo(() => ruleSetup ? findSupportingLiquidityWall(ruleSetup, context.heatmap.samples, price) : null,
+    [ruleSetup, context.heatmap.samples, price]);
+  const setup = useMemo<TradeSetup | null>(() => ruleSetup && supportingWall ? {
+    ...ruleSetup,
+    score: ruleSetup.score + 1,
+    maxScore: ruleSetup.maxScore + 1,
+    liquidityWall: supportingWall,
+    reasons: [...ruleSetup.reasons, `Persistent ${supportingWall.side} wall at ${fmt(supportingWall.price)} · present as an outsized level in ${supportingWall.persistencePct}% of heatmap samples`]
+  } : null, [ruleSetup, supportingWall]);
   const storageKey = keyFor(symbol, timeframe);
   const feedLive = (feedStatus === 'LIVE' || feedStatus === 'DESYNCHRONIZED') && lastTradeAt !== null && now - lastTradeAt < 15_000;
   const setupRisk = setup ? Math.abs(setup.entry - setup.stop) : 0;
@@ -46,6 +57,11 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   const validationTrades = backtestTrades.filter((trade) => trade.phase === 'VALIDATION' && trade.outcome !== 'OPEN');
   const validationNetR = validationTrades.reduce((sum, trade) => sum + (trade.pnlR ?? 0), 0);
   const validationReady = validationTrades.length >= 10 && validationNetR > 0;
+
+  useEffect(() => {
+    onLiveSetupChange?.(position ?? (feedLive && setupFresh ? setup : null));
+    return () => onLiveSetupChange?.(null);
+  }, [onLiveSetupChange, position, setup, feedLive, setupFresh]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -95,7 +111,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   // Automatically shadow-test each eligible, newly closed-bar signal once. This
   // never sends orders; it records a hypothetical fill at the live last price.
   useEffect(() => {
-    if (hydratedKey !== storageKey || position || !validationReady || !setup || !setupFresh || !feedLive || price === null || !entryStillValid) return;
+    if (hydratedKey !== storageKey || position || !setup || !setupFresh || !feedLive || price === null || !entryStillValid) return;
     const signalKey = `${symbol}:${timeframe}:v${setup.strategyVersion}:${setup.time}`;
     if (signalKey === lastTestedSignal || lastTestedSignal.endsWith(`:${setup.time}`)) return;
     const risk = Math.abs(price - setup.stop);
@@ -105,7 +121,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     setPosition({ ...setup, entry: price, target1: price + direction * risk, target2: price + direction * risk * setup.targetR,
       symbol, timeframe, openedAt: Date.now(), signalKey });
     setNotice(`Auto paper-test started for strategy V${setup.strategyVersion} at live last price ${fmt(price)}.`);
-  }, [hydratedKey, storageKey, position, setup, setupFresh, feedLive, price, entryStillValid, lastTestedSignal, symbol, timeframe, validationReady]);
+  }, [hydratedKey, storageKey, position, setup, setupFresh, feedLive, price, entryStillValid, lastTestedSignal, symbol, timeframe]);
 
   const sideColor = position?.side === 'LONG' || (!position && setup?.side === 'LONG') ? '#34d399' : '#fb7185';
   const currentClose = candles[candles.length - 1]?.close ?? price;
@@ -116,6 +132,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   const bookAge = latestBook ? Math.max(0, Math.round((Date.now() - latestBook.time) / 1000)) : null;
   const bestDisplayedBid = latestBook?.bids[0];
   const bestDisplayedAsk = latestBook?.asks[0];
+  const visibleWalls = useMemo(() => findPersistentLiquidityWalls(context.heatmap.samples), [context.heatmap.samples]);
   const oiPoints = context.derivatives?.openInterest ?? [];
   const flowFootprintTimes = useMemo(() => footprints.filter((bar) => bar.isClosed).map((bar) => bar.time).sort((a, b) => a - b), [footprints]);
   const oiTimes = useMemo(() => oiPoints.map((point) => {
@@ -168,6 +185,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(155px, 1fr))', gap: 7, padding: '9px 12px', borderBottom: '1px solid #1f2937' }}>
       <ContextCell label="MANUAL VOLUME PROFILE" value={profileState} detail={context.profile?.levels.length ? `POC ${fmt(context.profile.poc)} · VA ${fmt(context.profile.val)}–${fmt(context.profile.vah)}` : 'Range selection / local trade capture required'} />
       <ContextCell label="RECORDED BOOK HEATMAP" value={bookAge === null ? 'No samples yet' : bookAge < 15 ? 'Live samples' : 'Stale samples'} detail={latestBook ? `Bid ${bestDisplayedBid ? fmt(bestDisplayedBid[0]) : '—'} · Ask ${bestDisplayedAsk ? fmt(bestDisplayedAsk[0]) : '—'} · ${bookAge}s old` : 'Bands are context, not intent'} />
+      <ContextCell label="PERSISTENT WALL CONFLUENCE" value={setup?.liquidityWall ? `${setup.liquidityWall.side.toUpperCase()} wall confirmed` : visibleWalls.length ? `${visibleWalls.length} wall(s) visible · no setup match` : 'No persistent wall'} detail={setup?.liquidityWall ? `${fmt(setup.liquidityWall.price)} · ${setup.liquidityWall.persistencePct}% persistence · adds one confluence point` : `Live paper plan needs a nearby ${ruleSetup?.side === 'LONG' ? 'bid' : ruleSetup?.side === 'SHORT' ? 'ask' : 'directional'} wall still present in the latest book.`} />
       <ContextCell label="BYBIT OI / FUNDING" value={oiChangePct === null ? 'Waiting for history' : `OI ${oiChangePct >= 0 ? '+' : ''}${oiChangePct.toFixed(2)}%`} detail={`30d replay OI: ${historicalOIStatus === 'ready' ? `${oiPoints.length} points` : historicalOIStatus} · Funding ${context.derivatives?.ticker?.fundingRate ? `${(Number(context.derivatives.ticker.fundingRate) * 100).toFixed(4)}%` : '—'} · OI alone has no direction`} />
       <ContextCell label="OPTIONS GAMMA CONTEXT" value={topGamma ? `${context.gamma?.source ?? 'Options'} max Γ×OI` : 'Unavailable'} detail={topGamma ? `Strike ${fmt(topGamma[0])} · not dealer net-GEX` : 'No valid option Gamma snapshot'} />
     </div>
@@ -192,6 +210,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <span>Gross R only · fees and slippage excluded</span>
     </div>
     <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>{flowHistoryLabel}</div>
+    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Historical backtest entry/SL/TP uses the recorded candle, footprint and OI rules. Persistent order-book wall confirmation is required for live paper plans; historical book data is not complete enough to claim a 30-day heatmap backtest.</div>
     {latestAgentReads.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 6, padding: '0 12px 9px' }}>
       {latestAgentReads.map((read) => <div key={read.agent} style={{ padding: 7, border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019', fontSize: 9 }}>
         <b style={{ color: read.bias === 'LONG' ? '#34d399' : read.bias === 'SHORT' ? '#fb7185' : '#94a3b8' }}>{read.agent} · {read.bias} · {read.strength}/3</b>
@@ -213,10 +232,10 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
         <span>1R <b>{fmt(setup.target1)}</b></span><span>TP 1:{setup.targetR} <b style={{ color: '#34d399' }}>{fmt(setup.target2)}</b></span>
       </div>
       <ul style={{ margin: '9px 0', paddingLeft: 18, color: '#94a3b8', fontSize: 10 }}>{setup.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
-      <div style={{ marginTop: 9, color: validationReady ? '#94a3b8' : '#fbbf24', fontSize: 10 }}>{validationReady ? 'Holdout gate passed: at least 10 completed holdout trades with positive gross R. Eligible signals are shadow-tested once per closed bar; fees, slippage and queue effects are excluded.' : `Paper entries are held until the last-30% holdout has at least 10 completed trades and positive gross R (${validationTrades.length}/10 completed, ${validationNetR >= 0 ? '+' : ''}${validationNetR.toFixed(1)}R).`}</div>
+      <div style={{ marginTop: 9, color: validationReady ? '#94a3b8' : '#fbbf24', fontSize: 10 }}>Paper test auto-starts once per fresh confirmed signal when price remains within 0.25R of entry and the stop is intact. Holdout: {validationTrades.length}/10 closed · {validationNetR >= 0 ? '+' : ''}{validationNetR.toFixed(1)}R · {validationReady ? 'positive sample' : 'not yet validated'}. Paper only; fees/slippage excluded.</div>
     </div> : <div style={{ padding: 12, color: '#94a3b8', fontSize: 11 }}>
-      <b>WAIT · No setup meets all required confirmations on the latest closed bar.</b>
-      <div style={{ marginTop: 5, color: '#64748b' }}>V{strategyVersion} needs {strategyVersion >= 2 ? '4+' : '3+'} stacked footprint levels ({strategyVersion >= 3 ? '4:1' : '3:1'} imbalance), aligned delta/CVD, rolling POC acceptance, rising OI, flow-confirmed BOS/CHoCH/MSS, a five-bar breakout, confirmed PO3 distribution, and previous-day discount for longs / premium for shorts. Missing historical flow or OI means no signal.</div>
+      <b>WAIT · {!ruleSetup ? 'No setup meets the SMC/ICT/order-flow rules on the latest closed bar.' : 'Rule setup found, but there is no fresh nearby persistent supporting wall.'}</b>
+      <div style={{ marginTop: 5, color: '#64748b' }}>V{strategyVersion} needs {strategyVersion >= 2 ? '4+' : '3+'} stacked footprint levels ({strategyVersion >= 3 ? '4:1' : '3:1'} imbalance), aligned delta/CVD, rolling POC acceptance, rising OI, flow-confirmed BOS/CHoCH/MSS, a five-bar breakout, confirmed PO3 distribution, and previous-day discount for longs / premium for shorts. A live paper plan additionally needs a current persistent bid wall for LONG or ask wall for SHORT within 0.15% or 2.5R of price. Missing data means WAIT.</div>
       {!['1m', '5m'].includes(timeframe) && <div style={{ marginTop: 5, color: '#fbbf24' }}>Trade-side footprint history is only recorded at 1m and 5m. This timeframe still shows candle-based SMC/ICT marks, but order-flow BUY/SELL replay is unavailable here.</div>}
       <div style={{ marginTop: 4 }}>No-trade is a valid outcome.</div>
     </div>}

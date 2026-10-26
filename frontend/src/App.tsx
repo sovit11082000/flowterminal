@@ -23,7 +23,7 @@ import EntryExitSignals from './components/EntryExitSignals.js';
 import AgentCouncilPanel from './components/AgentCouncilPanel.js';
 import GammaLevelsPanel, { type Snapshot as GammaSnapshot } from './components/GammaLevelsPanel.js';
 import { analyzeSmartMoney, drawSmartMoneyOverlay, type SmartMoneyAnalysis, type SmartMoneyFeatures } from './components/SmartMoneyOverlay.js';
-import { backtestOrderFlow, drawBacktestMarkers, findOrderFlowSetup, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
+import { backtestOrderFlow, drawBacktestMarkers, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
 import { calculateVolumeProfile } from './components/VolumeProfileCalculator.js';
 import {
   Trade,
@@ -1278,18 +1278,10 @@ export default function App() {
   smcCandlesRef.current = structureCandles;
   const smartMoneyAnalysis = useMemo(() => analyzeSmartMoney(structureCandles), [structureCandles]);
   smcAnalysisRef.current = smartMoneyAnalysis;
-  const liveOrderFlowSetup = useMemo(() => {
-    if (!supportsFootprint || (marketStatus !== 'LIVE' && marketStatus !== 'DESYNCHRONIZED') || !lastTradeAt || Date.now() - lastTradeAt >= 15_000) return null;
-    const setup = findOrderFlowSetup(signalCandles, signalFootprints, orderBookBids, orderBookAsks, 1,
-      replayOIHistory, selectedSymbol,
-      TIMEFRAME_SECONDS[selectedTimeframe]);
-    let latestFootprintTime = 0;
-    for (let i = signalFootprints.length - 1; i >= 0; i--) {
-      if (signalFootprints[i].isClosed) { latestFootprintTime = signalFootprints[i].time; break; }
-    }
-    return setup && latestFootprintTime - setup.time <= TIMEFRAME_SECONDS[selectedTimeframe] * 2 ? setup : null;
-  }, [supportsFootprint, marketStatus, lastTradeAt, signalCandles, signalFootprints, orderBookBids, orderBookAsks, replayOIHistory, selectedSymbol, selectedTimeframe]);
-  liveSetupRef.current = liveOrderFlowSetup;
+  const publishActivePaperSetup = useCallback((setup: TradeSetup | null) => {
+    liveSetupRef.current = setup;
+    scheduleOverlayRedraw();
+  }, [scheduleOverlayRedraw]);
   const backtestTrades = useMemo(() => supportsFootprint
     ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200)
     : [], [supportsFootprint, signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe]);
@@ -1701,6 +1693,7 @@ export default function App() {
         context={{ profile: selectedProfile, heatmap: heatmapSnapshot, derivatives: replayDerivativesSnapshot, gamma: gammaSnapshot?.baseCoin === selectedSymbol.replace(/USDT$/, '') ? gammaSnapshot : null }}
         backtestTrades={backtestTrades}
         historicalOIStatus={historicalOIStatus}
+        onLiveSetupChange={publishActivePaperSetup}
       />
 
       <section style={{ marginTop: 16 }}>

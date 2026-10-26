@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiUrl } from '../lib/api.js';
 import type { BookLevel } from './DOMLadder.js';
+import { findPersistentLiquidityWalls } from './LiquidityWallAnalysis.js';
 
 export interface BookSample { symbol: string; time: number; bids: BookLevel[]; asks: BookLevel[]; }
 interface HeatmapPayload { samples: BookSample[]; status: { sampleIntervalMs: number }; }
@@ -69,38 +70,76 @@ export default function OrderBookHeatmap({ symbol, enabled = true, onSnapshot }:
       }
 
       const plot = { left: 72, right: width - 12, top: 12, bottom: height - 28 };
-      const allLevels = samples.flatMap((sample) => [...sample.bids, ...sample.asks]);
       const visibleTrades = tradeDots.filter((trade) => trade.timestamp >= samples[0].time && trade.timestamp <= samples[samples.length - 1].time);
-      const minPrice = Math.min(
-        allLevels.reduce((min, [price]) => Math.min(min, price), Number.POSITIVE_INFINITY),
-        ...visibleTrades.map((trade) => trade.price)
-      );
-      const maxPrice = Math.max(
-        allLevels.reduce((max, [price]) => Math.max(max, price), Number.NEGATIVE_INFINITY),
-        ...visibleTrades.map((trade) => trade.price)
-      );
-      const maxSize = allLevels.reduce((max, [, size]) => Math.max(max, size), 0);
+      let minPrice = Number.POSITIVE_INFINITY;
+      let maxPrice = Number.NEGATIVE_INFINITY;
+      let maxSize = 0;
+      const typicalSnapshotSizes: number[] = [];
+      const snapshotSizes: number[] = [];
+      for (const sample of samples) {
+        snapshotSizes.length = 0;
+        for (const [price, size] of sample.bids) {
+          minPrice = Math.min(minPrice, price); maxPrice = Math.max(maxPrice, price);
+          if (size > 0) { snapshotSizes.push(size); maxSize = Math.max(maxSize, size); }
+        }
+        for (const [price, size] of sample.asks) {
+          minPrice = Math.min(minPrice, price); maxPrice = Math.max(maxPrice, price);
+          if (size > 0) { snapshotSizes.push(size); maxSize = Math.max(maxSize, size); }
+        }
+        if (snapshotSizes.length) {
+          snapshotSizes.sort((a, b) => a - b);
+          typicalSnapshotSizes.push(snapshotSizes[Math.floor(snapshotSizes.length / 2)]);
+        }
+      }
+      for (const trade of visibleTrades) {
+        minPrice = Math.min(minPrice, trade.price);
+        maxPrice = Math.max(maxPrice, trade.price);
+      }
+      typicalSnapshotSizes.sort((a, b) => a - b);
+      const typicalBookSize = typicalSnapshotSizes[Math.floor(typicalSnapshotSizes.length / 2)] ?? maxSize;
+      // A single oversized level should not wash out every other heatmap band.
+      const liquidityScale = Math.max(typicalBookSize * 5, Number.EPSILON);
       const from = samples[0].time;
       const to = samples[samples.length - 1].time;
       const timeSpan = Math.max(to - from, 1);
       const priceSpan = Math.max(maxPrice - minPrice, Number.EPSILON);
       const columnWidth = Math.max(1, Math.min(5, (plot.right - plot.left) / samples.length * 1.2));
       const cellHeight = Math.max(2, Math.min(8, (plot.bottom - plot.top) / 45));
+      const persistentWalls = findPersistentLiquidityWalls(samples);
+      const strongestWall = (side: 'bid' | 'ask') => persistentWalls.find((level) => level.side === side);
 
       for (const sample of samples) {
         const x = plot.left + ((sample.time - from) / timeSpan) * (plot.right - plot.left);
         for (const [price, size] of sample.bids) {
           const y = plot.top + ((maxPrice - price) / priceSpan) * (plot.bottom - plot.top);
-          const alpha = 0.08 + 0.76 * Math.sqrt(size / Math.max(maxSize, Number.EPSILON));
+          const alpha = 0.08 + 0.76 * Math.sqrt(Math.min(size / liquidityScale, 1));
           ctx.fillStyle = `rgba(34, 211, 238, ${alpha})`;
-          ctx.fillRect(x, y - cellHeight / 2, columnWidth, cellHeight);
+          ctx.fillRect(Math.round(x), Math.round(y - cellHeight / 2), Math.ceil(columnWidth), cellHeight);
         }
         for (const [price, size] of sample.asks) {
           const y = plot.top + ((maxPrice - price) / priceSpan) * (plot.bottom - plot.top);
-          const alpha = 0.08 + 0.76 * Math.sqrt(size / Math.max(maxSize, Number.EPSILON));
+          const alpha = 0.08 + 0.76 * Math.sqrt(Math.min(size / liquidityScale, 1));
           ctx.fillStyle = `rgba(168, 85, 247, ${alpha})`;
-          ctx.fillRect(x, y - cellHeight / 2, columnWidth, cellHeight);
+          ctx.fillRect(Math.round(x), Math.round(y - cellHeight / 2), Math.ceil(columnWidth), cellHeight);
         }
+      }
+
+      // Mark a current wall only if it was repeatedly large during this sample window.
+      for (const side of ['bid', 'ask'] as const) {
+        const wall = strongestWall(side);
+        if (!wall) continue;
+        const y = Math.round(plot.top + ((maxPrice - wall.price) / priceSpan) * (plot.bottom - plot.top));
+        ctx.save();
+        ctx.strokeStyle = 'rgba(250, 204, 21, 0.9)';
+        ctx.fillStyle = '#fde68a';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(plot.left, y + 0.5); ctx.lineTo(plot.right, y + 0.5); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.textAlign = side === 'bid' ? 'left' : 'right';
+        ctx.font = '10px monospace';
+        ctx.fillText(`${side.toUpperCase()} WALL ${wall.price} · ${wall.persistencePct}%`, side === 'bid' ? plot.left + 4 : plot.right - 4, Math.max(plot.top + 10, y - 4));
+        ctx.restore();
       }
 
       // Executed trades are plotted at their exchange timestamp and trade price.
@@ -156,17 +195,18 @@ export default function OrderBookHeatmap({ symbol, enabled = true, onSnapshot }:
     <section style={{ marginTop: 16, background: '#0b0e14', border: '1px solid #1f2937', borderRadius: 6, overflow: 'hidden' }}>
       <header style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 12px', borderBottom: '1px solid #1f2937', color: '#cbd5e1', fontSize: 13, fontWeight: 700 }}>
         <span>ORDER-BOOK HEATMAP · {symbol}</span>
-        <span style={{ color: '#64748b', fontSize: 11 }}>Recorded locally · {sampleIntervalMs} ms sampling · display downsampled · last 30 min</span>
+        <span style={{ color: '#64748b', fontSize: 11 }}>Bybit public depth · {sampleIntervalMs} ms samples · downsampled · last 30 min</span>
       </header>
       <div style={{ display: 'flex', gap: 16, padding: '7px 12px', color: '#94a3b8', fontSize: 10 }}>
         <span style={{ color: '#22d3ee' }}>■ Bid liquidity</span><span style={{ color: '#c084fc' }}>■ Ask liquidity</span>
         <span>Brighter band = more resting liquidity</span>
+        <span style={{ color: '#fde68a' }}>┄ Persistent wall</span>
         <span style={{ color: '#34d399' }}>● Buy trades</span><span style={{ color: '#f87171' }}>● Sell trades</span>
         <span>Larger dot = larger executed trade</span>
       </div>
       <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: 260 }} />
       <div style={{ padding: '6px 12px', color: '#64748b', fontSize: 10 }}>
-        Bands show recorded resting orders; dots show sampled recorded market trades at their actual time and price (up to 3,000 dots per 30 minutes). Recording starts with the backend, so older history can be incomplete.
+        Gold wall marks require a level to be at least 3× that snapshot’s median displayed size in 10% or more of samples, and still present in the latest book. This is visible resting depth, not proof of a limit order’s intent. Dots show recorded trades at their actual time and price; recording starts with the backend, so earlier history may be incomplete.
       </div>
     </section>
   );
