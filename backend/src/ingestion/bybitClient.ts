@@ -32,8 +32,10 @@ export class BybitWebSocketClient {
   private readonly symbols: string[];
   private readonly callbacks: BybitClientCallbacks;
   private readonly topicResubscribeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly lastTopicResubscribeAt = new Map<string, number>();
   private readonly lastPublicTradeAtBySymbol = new Map<string, number>();
   private readonly lastTickerAtBySymbol = new Map<string, number>();
+  private readonly lastKlineAtByTopic = new Map<string, number>();
 
   constructor(symbols: string | string[] = DEFAULT_SYMBOL, callbacks: BybitClientCallbacks) {
     this.symbols = Array.isArray(symbols) ? symbols : [symbols];
@@ -67,6 +69,9 @@ export class BybitWebSocketClient {
       for (const symbol of this.symbols) {
         this.lastPublicTradeAtBySymbol.set(symbol, openedAt);
         this.lastTickerAtBySymbol.set(symbol, openedAt);
+        for (const interval of ['1', '3', '5', '15', '30', '60', '240', 'D'] as const) {
+          this.lastKlineAtByTopic.set(TOPIC_KLINE(interval, symbol), openedAt);
+        }
       }
       this.startHeartbeat();
       this.startMarketDataWatchdog();
@@ -119,7 +124,10 @@ export class BybitWebSocketClient {
   }
 
   private resubscribeTopic(topic: string): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.topicResubscribeTimers.has(topic)) return;
+    const now = Date.now();
+    const lastResubscribeAt = this.lastTopicResubscribeAt.get(topic) ?? 0;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.topicResubscribeTimers.has(topic) || now - lastResubscribeAt < 60_000) return;
+    this.lastTopicResubscribeAt.set(topic, now);
     this.ws.send(JSON.stringify({ op: 'unsubscribe', args: [topic] }));
     const timer = setTimeout(() => {
       this.topicResubscribeTimers.delete(topic);
@@ -164,6 +172,8 @@ export class BybitWebSocketClient {
         this.lastPublicTradeAtBySymbol.set(msg.topic.slice('publicTrade.'.length), this.lastMarketDataAt);
       } else if (msg.topic.startsWith('tickers.')) {
         this.lastTickerAtBySymbol.set(msg.topic.slice('tickers.'.length), this.lastMarketDataAt);
+      } else if (msg.topic.startsWith('kline.')) {
+        this.lastKlineAtByTopic.set(msg.topic, this.lastMarketDataAt);
       }
       if (!this.hasReceivedMarketData) {
         this.hasReceivedMarketData = true;
@@ -222,7 +232,12 @@ export class BybitWebSocketClient {
         const tickerAt = this.lastTickerAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         const tradeAt = this.lastPublicTradeAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         if (now - tickerAt >= 45_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
-        else if (now - tradeAt >= 60_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
+        if (now - tradeAt >= 60_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
+        for (const interval of ['1', '3', '5', '15', '30', '60', '240', 'D'] as const) {
+          const topic = TOPIC_KLINE(interval, symbol);
+          const lastAt = this.lastKlineAtByTopic.get(topic) ?? this.lastMarketDataAt;
+          if (now - lastAt >= 90_000) this.resubscribeTopic(topic);
+        }
       }
     }, 15_000);
   }
@@ -246,6 +261,31 @@ export class BybitWebSocketClient {
       clearTimeout(this.pongTimeout);
       this.pongTimeout = null;
     }
+  }
+
+  public getDiagnostics(): {
+    socket: 'CONNECTING' | 'OPEN' | 'CLOSING' | 'CLOSED' | 'DISCONNECTED';
+    lastMarketDataAt: number | null;
+    lastTradeAtBySymbol: Record<string, number | null>;
+    lastTickerAtBySymbol: Record<string, number | null>;
+    lastKlineAtBySymbol: Record<string, Record<string, number | null>>;
+  } {
+    const readyState = this.ws?.readyState;
+    const socket = readyState === WebSocket.CONNECTING ? 'CONNECTING'
+      : readyState === WebSocket.OPEN ? 'OPEN'
+        : readyState === WebSocket.CLOSING ? 'CLOSING'
+          : readyState === WebSocket.CLOSED ? 'CLOSED' : 'DISCONNECTED';
+    const intervals = ['1', '3', '5', '15', '30', '60', '240', 'D'] as const;
+    return {
+      socket,
+      lastMarketDataAt: this.lastMarketDataAt || null,
+      lastTradeAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastPublicTradeAtBySymbol.get(symbol) ?? null])),
+      lastTickerAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastTickerAtBySymbol.get(symbol) ?? null])),
+      lastKlineAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [
+        symbol,
+        Object.fromEntries(intervals.map((interval) => [interval, this.lastKlineAtByTopic.get(TOPIC_KLINE(interval, symbol)) ?? null]))
+      ]))
+    };
   }
 
   private clearReconnectTimer(): void {

@@ -494,6 +494,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       marketStatus: currentMarketStatus,
       lastTradeReceivedAt,
+      bybit: bybitClient.getDiagnostics(),
       memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
       mongoWriteQueue: { pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES },
       retention: { footprintsDays: 5, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },

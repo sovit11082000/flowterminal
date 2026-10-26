@@ -262,7 +262,7 @@ export class MongoHistoryStore {
   /** Convert existing TTL dates once, then let MongoDB's TTL monitor prune them. */
   private async applyRetentionPolicy(): Promise<void> {
     if (!this.db) return;
-    const settings = this.db.collection('settings');
+    const settings = this.db.collection<{ _id: string; appliedAt?: Date }>('settings');
     if (await settings.findOne({ _id: RETENTION_POLICY_ID })) return;
 
     const migrations = [
