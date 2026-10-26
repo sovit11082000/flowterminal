@@ -10,7 +10,7 @@ export class LiquidationHistoryStore {
   private readonly filePath: string;
   private readonly events: NormalizedLiquidation[] = [];
   private readonly maxEvents = maxEvents;
-  private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
+  private readonly retentionMs = 48 * 60 * 60 * 1000;
   private lastPruneAt = 0;
 
   constructor(filePath = resolve(process.cwd(), 'data', 'liquidation-history.jsonl')) {

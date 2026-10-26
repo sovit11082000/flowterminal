@@ -31,7 +31,9 @@ export class BybitWebSocketClient {
   private lastMarketDataAt = 0;
   private readonly symbols: string[];
   private readonly callbacks: BybitClientCallbacks;
-  private readonly orderBookResubscribeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly topicResubscribeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly lastPublicTradeAtBySymbol = new Map<string, number>();
+  private readonly lastTickerAtBySymbol = new Map<string, number>();
 
   constructor(symbols: string | string[] = DEFAULT_SYMBOL, callbacks: BybitClientCallbacks) {
     this.symbols = Array.isArray(symbols) ? symbols : [symbols];
@@ -61,6 +63,11 @@ export class BybitWebSocketClient {
     this.ws.on('open', () => {
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.lastMarketDataAt = Date.now();
+      const openedAt = this.lastMarketDataAt;
+      for (const symbol of this.symbols) {
+        this.lastPublicTradeAtBySymbol.set(symbol, openedAt);
+        this.lastTickerAtBySymbol.set(symbol, openedAt);
+      }
       this.startHeartbeat();
       this.startMarketDataWatchdog();
       this.subscribeTopics();
@@ -107,15 +114,18 @@ export class BybitWebSocketClient {
   }
 
   public resubscribeOrderBook(symbol: string): void {
-    if (!this.symbols.includes(symbol) || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    if (this.orderBookResubscribeTimers.has(symbol)) return;
-    const topic = TOPIC_ORDERBOOK_50(symbol);
+    if (!this.symbols.includes(symbol)) return;
+    this.resubscribeTopic(TOPIC_ORDERBOOK_50(symbol));
+  }
+
+  private resubscribeTopic(topic: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.topicResubscribeTimers.has(topic)) return;
     this.ws.send(JSON.stringify({ op: 'unsubscribe', args: [topic] }));
     const timer = setTimeout(() => {
-      this.orderBookResubscribeTimers.delete(symbol);
+      this.topicResubscribeTimers.delete(topic);
       if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ op: 'subscribe', args: [topic] }));
     }, 300);
-    this.orderBookResubscribeTimers.set(symbol, timer);
+    this.topicResubscribeTimers.set(topic, timer);
   }
 
   private handleIncomingRawMessage(rawData: WebSocket.RawData): void {
@@ -150,6 +160,11 @@ export class BybitWebSocketClient {
     // Route topic messages
     if (typeof msg.topic === 'string') {
       this.lastMarketDataAt = Date.now();
+      if (msg.topic.startsWith('publicTrade.')) {
+        this.lastPublicTradeAtBySymbol.set(msg.topic.slice('publicTrade.'.length), this.lastMarketDataAt);
+      } else if (msg.topic.startsWith('tickers.')) {
+        this.lastTickerAtBySymbol.set(msg.topic.slice('tickers.'.length), this.lastMarketDataAt);
+      }
       if (!this.hasReceivedMarketData) {
         this.hasReceivedMarketData = true;
         this.callbacks.onStatusChange('LIVE', 'Market data streaming verified');
@@ -194,9 +209,21 @@ export class BybitWebSocketClient {
     this.marketDataWatchdog = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       const silentForMs = Date.now() - this.lastMarketDataAt;
-      if (silentForMs < 60_000) return;
-      this.callbacks.onStatusChange('STALE', `No Bybit market-data messages for ${Math.floor(silentForMs / 1000)}s; reconnecting`);
-      this.ws.terminate();
+      if (silentForMs >= 60_000) {
+        this.callbacks.onStatusChange('STALE', `No Bybit market-data messages for ${Math.floor(silentForMs / 1000)}s; reconnecting`);
+        this.ws.terminate();
+        return;
+      }
+
+      // Other topics (for example klines) can keep the socket looking healthy
+      // while a ticker or public-trade subscription has silently stalled.
+      const now = Date.now();
+      for (const symbol of this.symbols) {
+        const tickerAt = this.lastTickerAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
+        const tradeAt = this.lastPublicTradeAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
+        if (now - tickerAt >= 45_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
+        else if (now - tradeAt >= 60_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
+      }
     }, 15_000);
   }
 
@@ -235,8 +262,8 @@ export class BybitWebSocketClient {
       this.marketDataWatchdog = null;
     }
     this.clearReconnectTimer();
-    for (const timer of this.orderBookResubscribeTimers.values()) clearTimeout(timer);
-    this.orderBookResubscribeTimers.clear();
+    for (const timer of this.topicResubscribeTimers.values()) clearTimeout(timer);
+    this.topicResubscribeTimers.clear();
   }
 
   public disconnect(): void {

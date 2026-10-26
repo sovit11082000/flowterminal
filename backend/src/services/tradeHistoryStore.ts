@@ -11,7 +11,7 @@ export class TradeHistoryStore {
   private readonly filePath: string;
   private readonly trades: NormalizedTrade[] = [];
   private readonly maxTrades = maxTrades;
-  private readonly retentionMs = 30 * 24 * 60 * 60 * 1000;
+  private readonly retentionMs = 48 * 60 * 60 * 1000;
   private lastPruneAt = 0;
 
   constructor(filePath = resolve(process.cwd(), 'data', 'trade-history.jsonl')) {

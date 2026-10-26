@@ -970,21 +970,45 @@ export default function App() {
 
   // 6. Live WebSocket Client Ingestion
   useEffect(() => {
-    const ws = new WebSocket(gatewayWebSocketUrl());
-    gatewaySocketRef.current = ws;
+    let disposed = false;
+    let reconnectTimer: number | null = null;
+    let reconnectAttempt = 0;
+    let activeSocket: WebSocket | null = null;
 
-    ws.onopen = () => {
-      setGatewayConnected(true);
-      ws.send(JSON.stringify({ type: 'SELECT_SYMBOL', symbol: selectedSymbolRef.current }));
-    };
-    ws.onclose = () => {
-      if (gatewaySocketRef.current === ws) gatewaySocketRef.current = null;
-      setGatewayConnected(false);
-      setMarketStatus('DISCONNECTED');
-    };
-    ws.onerror = () => setGatewayConnected(false);
+    const connect = () => {
+      if (disposed) return;
+      setMarketStatus('RECONNECTING');
+      const ws = new WebSocket(gatewayWebSocketUrl());
+      activeSocket = ws;
+      gatewaySocketRef.current = ws;
 
-    ws.onmessage = (event) => {
+      ws.onopen = () => {
+        if (disposed || activeSocket !== ws) return;
+        reconnectAttempt = 0;
+        setGatewayConnected(true);
+        ws.send(JSON.stringify({ type: 'SELECT_SYMBOL', symbol: selectedSymbolRef.current }));
+      };
+      ws.onclose = () => {
+        if (disposed || activeSocket !== ws) return;
+        if (gatewaySocketRef.current === ws) gatewaySocketRef.current = null;
+        activeSocket = null;
+        setGatewayConnected(false);
+        setMarketStatus('RECONNECTING');
+        setLastTradeAt(null);
+        setLiveTicker(null);
+        setBestBid(null);
+        setBestAsk(null);
+        const delayMs = Math.min(1_000 * (2 ** Math.min(reconnectAttempt, 5)), 30_000);
+        reconnectAttempt++;
+        reconnectTimer = window.setTimeout(connect, delayMs);
+      };
+      ws.onerror = () => {
+        setGatewayConnected(false);
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close();
+      };
+
+      ws.onmessage = (event) => {
+      if (disposed || activeSocket !== ws) return;
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'STATUS') {
@@ -1140,11 +1164,16 @@ export default function App() {
       } catch (err) {
         console.error('Failed to parse gateway message:', err);
       }
+      };
     };
 
+    connect();
+
     return () => {
-      if (gatewaySocketRef.current === ws) gatewaySocketRef.current = null;
-      ws.close();
+      disposed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (gatewaySocketRef.current === activeSocket) gatewaySocketRef.current = null;
+      activeSocket?.close();
     };
   }, [scheduleOverlayRedraw]);
 

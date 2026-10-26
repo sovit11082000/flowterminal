@@ -4,6 +4,10 @@ import type { OrderBookSample } from './orderBookHistoryStore.js';
 import type { CouncilResult, AgentSnapshot } from '../agents/orderFlowCouncil.js';
 
 type Stored<T> = T & { _id: string; expiresAt: Date };
+const FOOTPRINT_RETENTION_MS = 5 * 24 * 60 * 60 * 1000;
+const OTHER_DATA_RETENTION_MS = 48 * 60 * 60 * 1000;
+const ORDER_BOOK_PERSIST_INTERVAL_MS = 15_000;
+const RETENTION_POLICY_ID = 'retention-policy-5d-footprints-48h-other-v1';
 export interface AgentPaperPerformance {
   resolved: number;
   wins: number;
@@ -23,6 +27,7 @@ export class MongoHistoryStore {
     footprints: 'footprints', trades: 'trades', orderBooks: 'order_books', liquidations: 'liquidations'
   } as const;
   private lastCapCheckAt = new Map<string, number>();
+  private readonly lastOrderBookSavedAt = new Map<string, number>();
 
   constructor(uri = process.env.MONGODB_URI, databaseName = process.env.MONGODB_DATABASE || 'flowterminal') {
     this.client = uri ? new MongoClient(uri, { serverSelectionTimeoutMS: 10_000, maxPoolSize: 5 }) : null;
@@ -52,6 +57,7 @@ export class MongoHistoryStore {
       this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 })
     ]);
+    await this.applyRetentionPolicy();
     console.log(`[MongoDB] Connected to database "${this.databaseName}". Existing local files were not imported.`);
   }
 
@@ -59,12 +65,12 @@ export class MongoHistoryStore {
 
   async saveFootprint(bar: SerializedFootprintBar): Promise<void> {
     if (!this.db || !bar.isClosed) return;
-    const expiresAt = new Date(bar.time * 1000 + 30 * 24 * 60 * 60_000);
+    const expiresAt = new Date(bar.time * 1000 + FOOTPRINT_RETENTION_MS);
     await this.collection('footprints').replaceOne(
       { symbol: bar.symbol, timeframe: bar.timeframe, time: bar.time },
       { ...bar, expiresAt }, { upsert: true }
     );
-    await this.enforceCap('footprints', 20_000);
+    await this.enforceCap('footprints', 100_000);
   }
 
   async saveTrades(trades: NormalizedTrade[]): Promise<void> {
@@ -73,7 +79,7 @@ export class MongoHistoryStore {
     await collection.bulkWrite(trades.map((trade) => ({
       updateOne: {
         filter: { symbol: trade.symbol, tradeId: trade.tradeId },
-        update: { $setOnInsert: { ...trade, expiresAt: new Date(trade.timestamp + 30 * 24 * 60 * 60_000) } },
+        update: { $setOnInsert: { ...trade, expiresAt: new Date(trade.timestamp + OTHER_DATA_RETENTION_MS) } },
         upsert: true
       }
     })), { ordered: false });
@@ -82,8 +88,11 @@ export class MongoHistoryStore {
 
   async saveOrderBook(sample: OrderBookSample): Promise<void> {
     if (!this.db) return;
+    const lastSaved = this.lastOrderBookSavedAt.get(sample.symbol) ?? 0;
+    if (sample.time - lastSaved < ORDER_BOOK_PERSIST_INTERVAL_MS) return;
+    this.lastOrderBookSavedAt.set(sample.symbol, sample.time);
     await this.collection('orderBooks').insertOne({
-      ...sample, expiresAt: new Date(sample.time + 30 * 24 * 60 * 60_000)
+      ...sample, expiresAt: new Date(sample.time + OTHER_DATA_RETENTION_MS)
     });
     await this.enforceCap('orderBooks', 120_000);
   }
@@ -94,7 +103,7 @@ export class MongoHistoryStore {
     await collection.bulkWrite(events.map((event) => ({
       updateOne: {
         filter: { symbol: event.symbol, timestamp: event.timestamp, price: event.price, size: event.size, side: event.side },
-        update: { $setOnInsert: { ...event, expiresAt: new Date(event.timestamp + 30 * 24 * 60 * 60_000) } },
+        update: { $setOnInsert: { ...event, expiresAt: new Date(event.timestamp + OTHER_DATA_RETENTION_MS) } },
         upsert: true
       }
     })), { ordered: false });
@@ -161,7 +170,7 @@ export class MongoHistoryStore {
       filledAt: null,
       resolvedAt: null,
       pnlR: null,
-      expiresAt: new Date(result.generatedAt + 30 * 24 * 60 * 60_000)
+      expiresAt: new Date(result.generatedAt + OTHER_DATA_RETENTION_MS)
     });
     await this.enforceCap('agent_decisions', 10_000);
     return true;
@@ -248,6 +257,31 @@ export class MongoHistoryStore {
   private clean<T>(doc: Document): T {
     const { _id: _ignoredId, expiresAt: _ignoredExpiry, ...record } = doc;
     return record as T;
+  }
+
+  /** Convert existing TTL dates once, then let MongoDB's TTL monitor prune them. */
+  private async applyRetentionPolicy(): Promise<void> {
+    if (!this.db) return;
+    const settings = this.db.collection('settings');
+    if (await settings.findOne({ _id: RETENTION_POLICY_ID })) return;
+
+    const migrations = [
+      this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]),
+      this.collection('trades').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
+      this.collection('orderBooks').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$time', OTHER_DATA_RETENTION_MS] } } } }]),
+      this.collection('liquidations').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
+      this.collection('agent_decisions').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$generatedAt', OTHER_DATA_RETENTION_MS] } } } }])
+    ];
+    await Promise.all(migrations);
+    const expired = new Date();
+    await Promise.all([
+      this.collection('footprints').deleteMany({ expiresAt: { $lte: expired } }),
+      this.collection('trades').deleteMany({ expiresAt: { $lte: expired } }),
+      this.collection('orderBooks').deleteMany({ expiresAt: { $lte: expired } }),
+      this.collection('liquidations').deleteMany({ expiresAt: { $lte: expired } }),
+      this.collection('agent_decisions').deleteMany({ expiresAt: { $lte: expired } })
+    ]);
+    await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: expired } }, { upsert: true });
   }
 
   private async enforceCap(name: keyof typeof this.collectionNames | 'agent_decisions', cap: number): Promise<void> {

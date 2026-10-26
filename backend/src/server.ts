@@ -112,6 +112,17 @@ function persistToMongo(label: string, write: () => Promise<void>): void {
   mongoWriteQueue.push({ label, write });
   drainMongoWriteQueue();
 }
+
+async function waitForMongoWrites(maxWaitMs = 20_000): Promise<void> {
+  const deadline = Date.now() + maxWaitMs;
+  while ((mongoWriteQueue.length > 0 || activeMongoWrites > 0) && Date.now() < deadline) {
+    drainMongoWriteQueue();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (mongoWriteQueue.length || activeMongoWrites) {
+    console.warn(`[MongoDB] Shutdown wait expired with ${mongoWriteQueue.length} queued and ${activeMongoWrites} active writes.`);
+  }
+}
 async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, readLocal: () => T): Promise<T> {
   if (!mongoHistory.connected) return readLocal();
   try { return await readMongo(); }
@@ -485,6 +496,7 @@ const server = http.createServer(async (req, res) => {
       lastTradeReceivedAt,
       memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
       mongoWriteQueue: { pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES },
+      retention: { footprintsDays: 5, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },
       trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
       storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
     }));
@@ -874,7 +886,10 @@ wss.on('error', (err: Error) => {
   console.error('[FlowTerminal Gateway] Server error:', err.message);
 });
 
+let isShuttingDown = false;
 function gracefulShutdown(): void {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log('[FlowTerminal Gateway] Initiating graceful shutdown...');
   bybitClient.disconnect();
   updateMarketStatus('DISCONNECTED', 'Gateway shutting down');
@@ -885,7 +900,7 @@ function gracefulShutdown(): void {
 
   wss.close(() => {
     server.close(() => {
-      void mongoHistory.close().finally(() => {
+      void waitForMongoWrites().finally(() => mongoHistory.close()).finally(() => {
         console.log('[FlowTerminal Gateway] HTTP server and gateway closed.');
         process.exit(0);
       });
