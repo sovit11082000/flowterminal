@@ -75,16 +75,36 @@ const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
 const liquidationHistory = new LiquidationHistoryStore();
 const mongoHistory = new MongoHistoryStore();
-type MongoWriteTask = { label: string; write: () => Promise<void> };
+type MongoWriteTask = { label: string; priority: number; write: () => Promise<void> };
 const mongoWriteQueue: MongoWriteTask[] = [];
 const MAX_PENDING_MONGO_WRITES = 128;
 const MAX_ACTIVE_MONGO_WRITES = 3;
 let activeMongoWrites = 0;
 let lastMongoQueueWarningAt = 0;
+const droppedMongoWrites: Record<string, number> = {};
+
+function mongoWritePriority(label: string): number {
+  if (label === 'footprint bar') return 3;
+  if (label === 'trades') return 2;
+  if (label === 'liquidations') return 1;
+  return 0; // Order-book samples are reconstructible from the next snapshot.
+}
+
+function recordDroppedMongoWrite(label: string): void {
+  droppedMongoWrites[label] = (droppedMongoWrites[label] ?? 0) + 1;
+  if (Date.now() - lastMongoQueueWarningAt > 60_000) {
+    lastMongoQueueWarningAt = Date.now();
+    console.warn(`[MongoDB] Write queue is full; dropped a ${label} record to protect service memory.`);
+  }
+}
 
 function drainMongoWriteQueue(): void {
   while (activeMongoWrites < MAX_ACTIVE_MONGO_WRITES && mongoWriteQueue.length) {
-    const task = mongoWriteQueue.shift()!;
+    let next = 0;
+    for (let i = 1; i < mongoWriteQueue.length; i++) {
+      if (mongoWriteQueue[i].priority > mongoWriteQueue[next].priority) next = i;
+    }
+    const [task] = mongoWriteQueue.splice(next, 1);
     activeMongoWrites++;
     void task.write().catch((error: unknown) => {
       console.warn(`[MongoDB] Could not persist ${task.label}:`, error instanceof Error ? error.message : error);
@@ -97,19 +117,23 @@ function drainMongoWriteQueue(): void {
 
 function persistToMongo(label: string, write: () => Promise<void>): void {
   if (mongoWriteQueue.length >= MAX_PENDING_MONGO_WRITES) {
-    // Book snapshots are useful for heatmap context but can be sampled again;
-    // preserve trades and closed footprints when MongoDB is under pressure.
-    const staleBookTask = mongoWriteQueue.findIndex((task) => task.label === 'order-book sample');
-    if (staleBookTask >= 0) mongoWriteQueue.splice(staleBookTask, 1);
-    else if (label === 'order-book sample') return;
-    else mongoWriteQueue.shift();
-
-    if (Date.now() - lastMongoQueueWarningAt > 60_000) {
-      lastMongoQueueWarningAt = Date.now();
-      console.warn('[MongoDB] Write queue reached its safety limit; discarded the oldest queued record to protect service memory.');
+    // Keep completed footprint bars ahead of high-rate tape and sampled book
+    // writes. At equal priority, evict the oldest queued write so recent records
+    // remain available after a temporary MongoDB slowdown.
+    const incomingPriority = mongoWritePriority(label);
+    let lowest = 0;
+    for (let i = 1; i < mongoWriteQueue.length; i++) {
+      if (mongoWriteQueue[i].priority < mongoWriteQueue[lowest].priority) lowest = i;
     }
+    const queuedVictim = mongoWriteQueue[lowest];
+    if (incomingPriority < queuedVictim.priority) {
+      recordDroppedMongoWrite(label);
+      return;
+    }
+    mongoWriteQueue.splice(lowest, 1);
+    recordDroppedMongoWrite(queuedVictim.label);
   }
-  mongoWriteQueue.push({ label, write });
+  mongoWriteQueue.push({ label, priority: mongoWritePriority(label), write });
   drainMongoWriteQueue();
 }
 
@@ -496,7 +520,14 @@ const server = http.createServer(async (req, res) => {
       lastTradeReceivedAt,
       bybit: bybitClient.getDiagnostics(),
       memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
-      mongoWriteQueue: { pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES },
+      mongoWriteQueue: {
+        pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES,
+        dropped: { ...droppedMongoWrites },
+        pendingByType: mongoWriteQueue.reduce<Record<string, number>>((counts, task) => {
+          counts[task.label] = (counts[task.label] ?? 0) + 1;
+          return counts;
+        }, {})
+      },
       retention: { footprintsDays: 5, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },
       trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
       storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
