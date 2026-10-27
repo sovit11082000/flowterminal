@@ -1,6 +1,72 @@
-/** Shared market-reading rules supplied to every specialist and the manager. */
+export type StrategyFamily = 'smc' | 'ict' | 'orderflow';
+export type StrategyDirection = 'LONG' | 'SHORT' | 'BOTH';
+export interface StrategyRule { id: string; family: StrategyFamily; direction: StrategyDirection; name: string; rule: string; }
+
+/** Compact, auditable research catalog. These are candidate setups, not validated profitable systems. */
+export const STRATEGY_CATALOG: readonly StrategyRule[] = [
+  { id: 'SMC01', family: 'smc', direction: 'LONG', name: 'Bull BOS pullback', rule: 'Confirmed close above prior confirmed swing high, then pullback holds the broken level.' },
+  { id: 'SMC02', family: 'smc', direction: 'SHORT', name: 'Bear BOS pullback', rule: 'Confirmed close below prior confirmed swing low, then retest rejects the broken level.' },
+  { id: 'SMC03', family: 'smc', direction: 'LONG', name: 'Bull CHoCH reversal', rule: 'After bearish structure, confirmed close breaks a prior lower high; wait for retest/hold.' },
+  { id: 'SMC04', family: 'smc', direction: 'SHORT', name: 'Bear CHoCH reversal', rule: 'After bullish structure, confirmed close breaks a prior higher low; wait for retest/rejection.' },
+  { id: 'SMC05', family: 'smc', direction: 'LONG', name: 'EQL sweep reversal', rule: 'At least two confirmed low tests, wick sweeps the pool, candle closes back above it, then bullish confirmation.' },
+  { id: 'SMC06', family: 'smc', direction: 'SHORT', name: 'EQH sweep reversal', rule: 'At least two confirmed high tests, wick sweeps the pool, candle closes back below it, then bearish confirmation.' },
+  { id: 'SMC07', family: 'smc', direction: 'LONG', name: 'Bull inducement continuation', rule: 'A confirmed internal low/liquidity inducement is swept before bullish displacement and continuation BOS.' },
+  { id: 'SMC08', family: 'smc', direction: 'SHORT', name: 'Bear inducement continuation', rule: 'A confirmed internal high/liquidity inducement is swept before bearish displacement and continuation BOS.' },
+  { id: 'SMC09', family: 'smc', direction: 'LONG', name: 'Bull order-block retest', rule: 'Retest of the last opposing down candle before confirmed bullish displacement/BOS; zone must remain unmitigated.' },
+  { id: 'SMC10', family: 'smc', direction: 'SHORT', name: 'Bear order-block retest', rule: 'Retest of the last opposing up candle before confirmed bearish displacement/BOS; zone must remain unmitigated.' },
+  { id: 'SMC11', family: 'smc', direction: 'LONG', name: 'Bull breaker retest', rule: 'Previously valid bearish block is decisively broken upward and then holds as resistance-turned-support.' },
+  { id: 'SMC12', family: 'smc', direction: 'SHORT', name: 'Bear breaker retest', rule: 'Previously valid bullish block is decisively broken downward and then rejects as support-turned-resistance.' },
+  { id: 'SMC13', family: 'smc', direction: 'BOTH', name: 'FVG continuation', rule: 'Three-candle displacement gap in trend direction; only consider an unfilled retest with confirming close.' },
+  { id: 'SMC14', family: 'smc', direction: 'LONG', name: 'Bull OB + FVG overlap', rule: 'Unmitigated bullish order block overlaps a bullish three-candle FVG after confirmed displacement.' },
+  { id: 'SMC15', family: 'smc', direction: 'SHORT', name: 'Bear OB + FVG overlap', rule: 'Unmitigated bearish order block overlaps a bearish three-candle FVG after confirmed displacement.' },
+  { id: 'ICT01', family: 'ict', direction: 'LONG', name: '2022 model long', rule: 'Confirmed sell-side raid, bullish displacement/MSS, then retracement to supported FVG/OB; session data must be known.' },
+  { id: 'ICT02', family: 'ict', direction: 'SHORT', name: '2022 model short', rule: 'Confirmed buy-side raid, bearish displacement/MSS, then retracement to supported FVG/OB; session data must be known.' },
+  { id: 'ICT03', family: 'ict', direction: 'LONG', name: 'Silver Bullet long', rule: 'Within the configured Silver Bullet window only: sell-side raid, displacement and bullish FVG retracement.' },
+  { id: 'ICT04', family: 'ict', direction: 'SHORT', name: 'Silver Bullet short', rule: 'Within the configured Silver Bullet window only: buy-side raid, displacement and bearish FVG retracement.' },
+  { id: 'ICT05', family: 'ict', direction: 'LONG', name: 'Asia low raid', rule: 'Known Asia range low is swept and price confirms bullish displacement/reclaim.' },
+  { id: 'ICT06', family: 'ict', direction: 'SHORT', name: 'Asia high raid', rule: 'Known Asia range high is swept and price confirms bearish displacement/rejection.' },
+  { id: 'ICT07', family: 'ict', direction: 'LONG', name: 'London Judas long', rule: 'In a timestamp-verified London window, downside false move raids liquidity before bullish displacement.' },
+  { id: 'ICT08', family: 'ict', direction: 'SHORT', name: 'London Judas short', rule: 'In a timestamp-verified London window, upside false move raids liquidity before bearish displacement.' },
+  { id: 'ICT09', family: 'ict', direction: 'LONG', name: 'New York Judas long', rule: 'In a timestamp-verified New York window, downside false move raids liquidity before bullish displacement.' },
+  { id: 'ICT10', family: 'ict', direction: 'SHORT', name: 'New York Judas short', rule: 'In a timestamp-verified New York window, upside false move raids liquidity before bearish displacement.' },
+  { id: 'ICT11', family: 'ict', direction: 'LONG', name: 'Bull PO3', rule: 'Observed accumulation, downside manipulation/raid, then confirmed bullish distribution; do not infer phase from clock alone.' },
+  { id: 'ICT12', family: 'ict', direction: 'SHORT', name: 'Bear PO3', rule: 'Observed accumulation, upside manipulation/raid, then confirmed bearish distribution; do not infer phase from clock alone.' },
+  { id: 'ICT13', family: 'ict', direction: 'LONG', name: 'PDL raid reversal', rule: 'Known previous-day low is swept, reclaimed and followed by bullish displacement.' },
+  { id: 'ICT14', family: 'ict', direction: 'SHORT', name: 'PDH raid reversal', rule: 'Known previous-day high is swept, rejected and followed by bearish displacement.' },
+  { id: 'ICT15', family: 'ict', direction: 'LONG', name: 'PWL raid reversal', rule: 'Known previous-week low is swept, reclaimed and followed by bullish displacement.' },
+  { id: 'ICT16', family: 'ict', direction: 'SHORT', name: 'PWH raid reversal', rule: 'Known previous-week high is swept, rejected and followed by bearish displacement.' },
+  { id: 'ICT17', family: 'ict', direction: 'BOTH', name: 'OTE retracement', rule: 'Use only a confirmed dealing range and measured retracement zone; require directional displacement and invalidation.' },
+  { id: 'OF01', family: 'orderflow', direction: 'LONG', name: 'Bid absorption', rule: 'Repeated aggressive selling at a level with limited downside progress and footprint evidence, followed by reclaim.' },
+  { id: 'OF02', family: 'orderflow', direction: 'SHORT', name: 'Ask absorption', rule: 'Repeated aggressive buying at a level with limited upside progress and footprint evidence, followed by rejection.' },
+  { id: 'OF03', family: 'orderflow', direction: 'LONG', name: 'Positive delta divergence', rule: 'Price makes a lower low while closed-bar delta improves; require subsequent price reclaim.' },
+  { id: 'OF04', family: 'orderflow', direction: 'SHORT', name: 'Negative delta divergence', rule: 'Price makes a higher high while closed-bar delta weakens; require subsequent price rejection.' },
+  { id: 'OF05', family: 'orderflow', direction: 'LONG', name: 'Bull CVD divergence', rule: 'Price makes a lower low while supplied CVD forms a higher low; require price confirmation.' },
+  { id: 'OF06', family: 'orderflow', direction: 'SHORT', name: 'Bear CVD divergence', rule: 'Price makes a higher high while supplied CVD forms a lower high; require price confirmation.' },
+  { id: 'OF07', family: 'orderflow', direction: 'LONG', name: 'Stacked ask imbalance', rule: 'At least three adjacent meaningful-volume ask-side imbalances and acceptance/reclaim above their area.' },
+  { id: 'OF08', family: 'orderflow', direction: 'SHORT', name: 'Stacked bid imbalance', rule: 'At least three adjacent meaningful-volume bid-side imbalances and acceptance/reclaim below their area.' },
+  { id: 'OF09', family: 'orderflow', direction: 'LONG', name: 'Buy imbalance exhaustion', rule: 'Aggressive buying loses price progress at a tested resistance, then price confirms rejection lower; avoid countertrend guess.' },
+  { id: 'OF10', family: 'orderflow', direction: 'SHORT', name: 'Sell imbalance exhaustion', rule: 'Aggressive selling loses price progress at tested support, then price confirms rejection higher; avoid countertrend guess.' },
+  { id: 'OF11', family: 'orderflow', direction: 'LONG', name: 'POC reclaim', rule: 'Closed bar reclaims footprint POC and holds/retests it with supportive participation.' },
+  { id: 'OF12', family: 'orderflow', direction: 'SHORT', name: 'POC rejection', rule: 'Closed bar rejects footprint POC from below with supportive sell participation.' },
+  { id: 'OF13', family: 'orderflow', direction: 'LONG', name: 'VAL rejection', rule: 'Supplied value-area low is tested, rejected and reclaimed with closed-bar confirmation.' },
+  { id: 'OF14', family: 'orderflow', direction: 'SHORT', name: 'VAH rejection', rule: 'Supplied value-area high is tested, rejected and lost with closed-bar confirmation.' },
+  { id: 'OF15', family: 'orderflow', direction: 'BOTH', name: 'LVN traverse', rule: 'A supplied low-volume node is crossed with acceptance; direction follows confirmed close and participation.' },
+  { id: 'OF16', family: 'orderflow', direction: 'BOTH', name: 'HVN rejection', rule: 'Supplied high-volume node rejects price; direction follows confirmed close and footprint response.' },
+  { id: 'OF17', family: 'orderflow', direction: 'LONG', name: 'Book imbalance + break', rule: 'Synchronized two-sided DOM imbalance aligns with closed-bar break/reclaim; DOM alone is not a trigger.' },
+  { id: 'OF18', family: 'orderflow', direction: 'SHORT', name: 'Book pull + failed break', rule: 'Synchronized book liquidity pulls as an upside break fails and price closes back below the level.' }
+] as const;
+
+export function strategiesFor(family: StrategyFamily): readonly StrategyRule[] {
+  return STRATEGY_CATALOG.filter((strategy) => strategy.family === family);
+}
+
+export function strategyById(id: string): StrategyRule | undefined {
+  return STRATEGY_CATALOG.find((strategy) => strategy.id === id);
+}
+
+/** Shared evidence-quality rules supplied to each specialist and the manager. */
 export const ORDER_FLOW_SKILL = `
-ORDER-FLOW RESEARCH PLAYBOOK
+MARKET ANALYSIS QUALITY RULES
 
 DATA CONTRACT AND QUALITY GATES
 - The supplied snapshot is the entire evidence set. Never infer a missing candle, trade, footprint level, session, funding value, news item, or exchange fact.
@@ -22,16 +88,6 @@ TAPE, ABSORPTION, AND LIQUIDITY
 - Iceberg detection cannot be proven by this snapshot. Never label a hidden order as confirmed.
 - DOM is a point-in-time view of displayed resting orders. Compare cumulative visible bid and ask depth only when both sides are present and synchronized. Orders can cancel; a wall is not guaranteed support/resistance and spoofing cannot be concluded from one snapshot.
 
-SMC STRUCTURE READ (SMC SPECIALIST)
-- Review technicalContext.smc when present as a month-history map, then audit its recent claims against the supplied candle history. The map is a candidate annotation set, not unquestionable truth. Use only confirmed swing points and candle closes. A BOS is a close through the prior confirmed swing in the prevailing direction; CHoCH is a confirmed break against that direction. Do not label a wick-only breach as a break.
-- Treat equal highs/lows as a liquidity pool only when at least two confirmed swing tests cluster within a tight tolerance and price reacts away between tests. A sweep requires a wick through the pool and a close back across it.
-- Call an order block only when a prior opposing candle is followed by a confirmed displacement/break; call an FVG only for a three-candle gap. Mark them as zones of interest, never as guaranteed reversal points.
-
-ICT READ (ICT SPECIALIST)
-- Review technicalContext.ict when present as a month-history map, then audit the recent claims against supplied bars. Assess premium/discount only against an explicitly supplied confirmed dealing range. Read PDH/PDL, liquidity raids, displacement, and FVG/OB confluence only when supported by evidence.
-- PO3 is a possible accumulation → manipulation → distribution sequence, not a clock-based certainty. State which phase is confirmed, which remains unconfirmed, and what price action would invalidate the interpretation.
-- Do not invent session boundaries, news, higher-timeframe levels, or future confirmation. Historical labels must be knowable from bars up to their timestamp.
-
 SETUP AND RISK STANDARD
 - Separate observation, interpretation, and uncertainty. Cite the exact supplied values behind every material claim.
 - Seek confluence across independent evidence (price response, footprint/delta, tape, synchronized DOM, and profile context); repeated versions of the same delta signal are not independent votes.
@@ -44,7 +100,7 @@ SETUP AND RISK STANDARD
 `;
 
 export const SPECIALIST_AGENTS = [
-  { id: 'smc', name: 'SMC Structure Analyst', focus: 'Independently analyze the supplied 30-day SMC context and recent candle history: confirmed swing structure, BOS/CHoCH, equal highs/lows, liquidity sweeps, displacement, order blocks, and fair value gaps. Audit context markers against candles when possible. Separate confirmed past events from active unconfirmed zones; cite candle times and price levels.' },
-  { id: 'ict', name: 'ICT Context Analyst', focus: 'Independently analyze the supplied 30-day ICT context and recent candle history: confirmed dealing range and premium/discount, prior-day levels, liquidity raids, displacement, FVG, and cautious PO3 sequence. Audit context against available bars. State what is confirmed versus pending; never invent sessions or future events.' },
-  { id: 'orderflow', name: 'Order Flow Analyst', focus: 'Analyze only supplied closed footprints, row-level bid/ask, delta/CVD, public trade sample, synchronized DOM, and volume profile. Assess imbalance, absorption hypotheses, acceptance/rejection, and participation. Flag missing evidence; do not treat repeated delta measures as independent confirmation.' }
+  { id: 'smc', name: 'SMC Structure Analyst', focus: 'Own the SMC strategy family only. Read confirmed swing structure, BOS/CHoCH, EQH/EQL pools, sweeps, inducement, displacement, OB, breaker and FVG from the provided history. Audit annotations against candles; distinguish historical confirmation from active unfilled zones.' },
+  { id: 'ict', name: 'ICT Context Analyst', focus: 'Own the ICT strategy family only. Read confirmed dealing range/premium-discount, PDH/PDL/PWH/PWL raids, verified sessions, displacement, FVG/OB and PO3 sequence. Timestamp/session data must be supplied; otherwise mark session strategies unavailable.' },
+  { id: 'orderflow', name: 'Order Flow Analyst', focus: 'Own the Order Flow strategy family only. Analyze closed footprint rows, delta/CVD, sampled public trades, synchronized DOM and supplied profile. Assess imbalance, absorption hypotheses, POC/VA response, LVN/HVN, and participation; do not treat repeated delta measures as independent confirmation.' }
 ] as const;

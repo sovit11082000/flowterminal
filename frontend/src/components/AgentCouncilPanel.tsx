@@ -6,8 +6,8 @@ import type { SignalCandle } from './EntryExitSignalEngine.js';
 import { calculateVolumeProfile } from './VolumeProfileCalculator.js';
 import type { SmartMoneyAnalysis } from './SmartMoneyOverlay.js';
 
-interface SpecialistReport { agentId: string; name: string; bias: 'LONG' | 'SHORT' | 'NEUTRAL'; strength: number; findings: string[]; concerns: string[]; missingData: string[]; }
-interface CouncilPlan { decision: 'LONG' | 'SHORT' | 'WAIT'; summary: string; entryTrigger: string; invalidation: string; exitPlan: string; agreeingAgents: string[]; dissent: string[]; }
+interface SpecialistReport { agentId: string; name: string; bias: 'LONG' | 'SHORT' | 'NEUTRAL'; strength: number; findings: string[]; strategyCandidates: string[]; concerns: string[]; missingData: string[]; }
+interface CouncilPlan { decision: 'LONG' | 'SHORT' | 'WAIT'; summary: string; entryTrigger: string; invalidation: string; exitPlan: string; agreeingAgents: string[]; dissent: string[]; strategyIds: string[]; strategyNames: string[]; }
 interface CouncilResult {
   reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number;
   paperPlanSaved?: boolean;
@@ -106,6 +106,7 @@ export default function AgentCouncilPanel({ symbol, timeframe, feedStatus, lastT
           <div><b style={{ color: '#fb7185' }}>Invalidation</b><div>{result.plan.invalidation}</div></div>
           <div><b style={{ color: '#34d399' }}>Exit plan</b><div>{result.plan.exitPlan}</div></div>
         </div>
+        {result.plan.strategyIds.length > 0 && <div style={{ marginTop: 8, padding: 7, border: '1px solid #334155', borderRadius: 4, background: '#0f1724', fontSize: 10 }}><b style={{ color: '#c4b5fd' }}>Cross-family confluence</b><div style={{ marginTop: 4 }}>{result.plan.strategyIds.map((id, index) => <span key={id} style={{ marginRight: 10 }}><b>{id}</b> {result.plan.strategyNames[index] ?? ''}</span>)}</div></div>}
         {levels && <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginTop: 9, fontSize: 11 }}>
           <span>Analysis price <b>{priceFormat(levels.entry)}</b></span><span>Structure stop <b style={{ color: '#fb7185' }}>{priceFormat(levels.stop)}</b></span>
           <span>1R <b>{priceFormat(levels.target1)}</b></span><span>2R <b style={{ color: '#34d399' }}>{priceFormat(levels.target2)}</b></span>
@@ -118,6 +119,7 @@ export default function AgentCouncilPanel({ symbol, timeframe, feedStatus, lastT
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 8, padding: 10 }}>
         {result.reports.map((report) => <article key={report.agentId} style={{ border: '1px solid #1f2937', borderRadius: 4, padding: 8, background: '#0f1724' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, fontSize: 10 }}><b>{report.name}</b><strong style={{ color: report.bias === 'LONG' ? '#34d399' : report.bias === 'SHORT' ? '#fb7185' : '#94a3b8' }}>{report.bias} · {report.strength}/3</strong></div>
+          {report.strategyCandidates.length > 0 && <div style={{ marginTop: 5, color: '#c4b5fd', fontSize: 9 }}>Supported setups: {report.strategyCandidates.join(', ')}</div>}
           {report.findings.map((item, index) => <div key={`f${index}`} style={{ marginTop: 5, fontSize: 10, color: '#cbd5e1' }}>• {item}</div>)}
           {report.concerns.map((item, index) => <div key={`c${index}`} style={{ marginTop: 4, fontSize: 9, color: '#fbbf24' }}>Concern: {item}</div>)}
           {report.missingData.length > 0 && <div style={{ marginTop: 4, fontSize: 9, color: '#94a3b8' }}>Missing: {report.missingData.join(', ')}</div>}

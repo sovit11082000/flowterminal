@@ -1,4 +1,4 @@
-import { SPECIALIST_AGENTS, ORDER_FLOW_SKILL } from './orderFlowSkill.js';
+import { SPECIALIST_AGENTS, ORDER_FLOW_SKILL, strategiesFor, strategyById, type StrategyFamily } from './orderFlowSkill.js';
 import { createHash } from 'node:crypto';
 
 export interface AgentSnapshot {
@@ -94,6 +94,7 @@ export interface SpecialistReport {
   bias: 'LONG' | 'SHORT' | 'NEUTRAL';
   strength: number;
   findings: string[];
+  strategyCandidates: string[];
   concerns: string[];
   missingData: string[];
 }
@@ -110,6 +111,8 @@ export interface CouncilPlan {
   exitPlan: string;
   agreeingAgents: string[];
   dissent: string[];
+  strategyIds: string[];
+  strategyNames: string[];
 }
 
 export interface CouncilResult { reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number; }
@@ -120,10 +123,11 @@ const reportSchema = {
     bias: { type: 'STRING', enum: ['LONG', 'SHORT', 'NEUTRAL'] },
     strength: { type: 'INTEGER' },
     findings: { type: 'ARRAY', items: { type: 'STRING' } },
+    strategyCandidates: { type: 'ARRAY', items: { type: 'STRING' } },
     concerns: { type: 'ARRAY', items: { type: 'STRING' } },
     missingData: { type: 'ARRAY', items: { type: 'STRING' } }
   },
-  required: ['bias', 'strength', 'findings', 'concerns', 'missingData']
+  required: ['bias', 'strength', 'findings', 'strategyCandidates', 'concerns', 'missingData']
 };
 
 const planSchema = {
@@ -139,9 +143,10 @@ const planSchema = {
     targetR: { type: 'INTEGER', nullable: true },
     exitPlan: { type: 'STRING' },
     agreeingAgents: { type: 'ARRAY', items: { type: 'STRING' } },
-    dissent: { type: 'ARRAY', items: { type: 'STRING' } }
+    dissent: { type: 'ARRAY', items: { type: 'STRING' } },
+    strategyIds: { type: 'ARRAY', items: { type: 'STRING' } }
   },
-  required: ['decision', 'summary', 'entryTrigger', 'entryPrice', 'invalidation', 'stopPrice', 'targetPrice', 'targetR', 'exitPlan', 'agreeingAgents', 'dissent']
+  required: ['decision', 'summary', 'entryTrigger', 'entryPrice', 'invalidation', 'stopPrice', 'targetPrice', 'targetR', 'exitPlan', 'agreeingAgents', 'dissent', 'strategyIds']
 };
 
 function textList(value: unknown): string[] {
@@ -278,12 +283,19 @@ function getProviderConfigs(role: AgentRole): ProviderConfig[] {
 }
 
 function sanitizeReport(value: SpecialistReport, agent: typeof SPECIALIST_AGENTS[number]): SpecialistReport {
+  const allowed = new Set(strategiesFor(agent.id).map((strategy) => strategy.id));
+  const direction = value.bias === 'LONG' || value.bias === 'SHORT' ? value.bias : 'NEUTRAL';
+  const strategyCandidates = textList(value.strategyCandidates).filter((id) => {
+    const strategy = strategyById(id);
+    return allowed.has(id) && strategy && (direction === 'NEUTRAL' || strategy.direction === 'BOTH' || strategy.direction === direction);
+  }).slice(0, 3);
   return {
     agentId: agent.id,
     name: agent.name,
-    bias: value.bias === 'LONG' || value.bias === 'SHORT' ? value.bias : 'NEUTRAL',
+    bias: direction,
     strength: Math.max(0, Math.min(3, Math.round(Number(value.strength) || 0))),
     findings: textList(value.findings),
+    strategyCandidates,
     concerns: textList(value.concerns),
     missingData: textList(value.missingData)
   };
@@ -298,6 +310,16 @@ function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], snapshot:
   const consensusBias = reports.length === SPECIALIST_AGENTS.length &&
     (firstBias === 'LONG' || firstBias === 'SHORT') && reports.every((report) => report.bias === firstBias && report.strength >= 2)
     ? firstBias : null;
+  const eligibleCandidates = new Set(reports.flatMap((report) => report.bias === consensusBias ? report.strategyCandidates : []));
+  const selectedStrategyIds = [...new Set(textList(value.strategyIds).filter((id) => eligibleCandidates.has(id)))].slice(0, 6);
+  const familyCoverage = new Set(selectedStrategyIds.map((id) => strategyById(id)?.family).filter(Boolean));
+  const everyRoleHasCandidate = consensusBias !== null && reports.every((report) =>
+    report.bias === consensusBias && report.strategyCandidates.some((id) => {
+      const strategy = strategyById(id);
+      return strategy && (strategy.direction === 'BOTH' || strategy.direction === consensusBias);
+    })
+  );
+  const completeConfluence = (['smc', 'ict', 'orderflow'] as StrategyFamily[]).every((family) => familyCoverage.has(family));
   const hasFreshFeed = snapshot.feedStatus === 'LIVE' &&
     snapshot.lastTradeAt !== null && Date.now() - snapshot.lastTradeAt < 15_000;
   const hasContext = snapshot.footprints.filter((bar) => bar.isClosed).length >= 4 && snapshot.candles.length >= 4;
@@ -324,11 +346,15 @@ function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], snapshot:
     (decision === 'LONG' ? targetPrice < opposingLiquidity.price : targetPrice > opposingLiquidity.price);
   // A directional plan is allowed only with unanimous specialist agreement,
   // fresh evidence, a POC/VA pullback trigger and valid structural risk levels.
-  if (decision !== 'WAIT' && (!unanimous || !hasFreshFeed || !hasContext || !hasPocOrValueAreaTrigger ||
+  if (decision !== 'WAIT' && (!unanimous || !everyRoleHasCandidate || !completeConfluence || !hasFreshFeed || !hasContext || !hasPocOrValueAreaTrigger ||
     !validLevels || !targetBeforeOpposingLiquidity || !invalidation || !exitPlan)) decision = 'WAIT';
   return {
     decision,
-    summary: String(value.summary ?? 'Insufficient agreement; wait.').slice(0, 420),
+    summary: decision === 'WAIT'
+      ? (value.decision === 'LONG' || value.decision === 'SHORT'
+        ? 'WAIT: cross-family strategy support, fresh evidence, unanimous agreement, or risk checks were insufficient.'
+        : String(value.summary ?? 'Insufficient agreement; wait.').slice(0, 420))
+      : String(value.summary ?? 'Confirmed cross-family setup.').slice(0, 420),
     entryTrigger: decision === 'WAIT' ? 'WAIT: no entry until unanimous confirmation and a valid POC/VA pullback trigger.' : trigger.slice(0, 260),
     entryPrice: decision === 'WAIT' ? null : entryPrice,
     invalidation: decision === 'WAIT' ? 'WAIT: no active structural invalidation level.' : invalidation.slice(0, 260),
@@ -338,7 +364,9 @@ function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], snapshot:
     exitPlan: decision === 'WAIT' ? 'WAIT: reassess after the trigger, closed-bar confirmation, or invalidation.' : exitPlan.slice(0, 260),
     agreeingAgents: decision === 'WAIT' ? [] : aligned.map((report) => report.name),
     dissent: reports.filter((report) => !consensusBias || report.bias !== consensusBias || report.strength < 2)
-      .map((report) => `${report.name}: ${report.bias} (strength ${report.strength})`)
+      .map((report) => `${report.name}: ${report.bias} (strength ${report.strength})`),
+    strategyIds: decision === 'WAIT' ? [] : selectedStrategyIds,
+    strategyNames: decision === 'WAIT' ? [] : selectedStrategyIds.map((id) => strategyById(id)?.name ?? id)
   };
 }
 
@@ -355,13 +383,13 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
   const reports = await Promise.all(SPECIALIST_AGENTS.map(async (agent, index) => {
     try {
       const raw = await generateWithFallback<SpecialistReport>(configuredRoles[index], agent.id,
-        `${ORDER_FLOW_SKILL}\nROLE: ${agent.name}\nTASK: ${agent.focus}\nReturn bias LONG, SHORT, or NEUTRAL; strength 0-3; concrete findings, concerns, and missing data. Do not create an entry price or target.`,
+        `${ORDER_FLOW_SKILL}\nROLE: ${agent.name}\nTASK: ${agent.focus}\n\nASSIGNED STRATEGY CATALOG (only these IDs belong to you):\n${strategiesFor(agent.id).map(({ id, name, rule }) => `${id} ${name}: ${rule}`).join('\n')}\n\nReturn bias LONG, SHORT, or NEUTRAL; strength 0-3; concrete findings; up to 3 strategyCandidates IDs from your assigned family whose full conditions are evidenced by the supplied snapshot; concerns; and missing data. If none is confirmed, return an empty candidate list. Do not select a strategy based on a future/predicted event. Do not create an entry price or target.`,
         input, reportSchema);
       return sanitizeReport(raw, agent);
     } catch (error) {
       return {
         agentId: agent.id, name: agent.name, bias: 'NEUTRAL' as const, strength: 0,
-        findings: [], concerns: [error instanceof Error ? error.message.slice(0, 220) : 'Specialist analysis failed.'],
+        findings: [], strategyCandidates: [], concerns: [error instanceof Error ? error.message.slice(0, 220) : 'Specialist analysis failed.'],
         missingData: ['Specialist analysis unavailable; strict consensus cannot be formed.']
       };
     }
@@ -369,7 +397,7 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
 
   if (!managerProviders.length) throw new Error('No AI credential is configured for the manager. Add GEMINI_MANAGER_CREDENTIALS to backend/.env.');
   const rawPlan = await generateWithFallback<CouncilPlan>(managerProviders, 'manager',
-      `${ORDER_FLOW_SKILL}\nROLE: TRADE PLAN MANAGER\nReview the market snapshot and exactly three specialist reports. Return LONG/SHORT only if all three biases match and each strength is at least 2; any neutral, disagreement, failed specialist, stale feed, insufficient context, or missing level means WAIT. For a directional plan, specify an entry trigger as a conditional POC/VA pullback/retest, numeric entryPrice, structural invalidation text and numeric stopPrice, numeric targetPrice, targetR exactly 2 or 3 with target at that R multiple, and exitPlan. The target must sit before the nearest unswept opposing SMC liquidity level. Use supplied prices/levels only; if these constraints cannot be satisfied, return WAIT with null numeric levels.\n\nThe snapshot may contain paperPerformance from previously settled AI plans for the same symbol/timeframe. Use it only as cautious calibration: a sample under 20 resolved plans is too small to adjust the strategy; never claim a strategy is learned or profitable. If there are at least 20 resolved plans and performance is poor, require stronger confluence or choose WAIT; do not change price facts or relax the risk rules.\n\nThis is a paper/research suggestion only, never an exchange order.`,
+      `${ORDER_FLOW_SKILL}\nROLE: TRADE PLAN MANAGER\nReview the market snapshot and exactly three specialist reports. Return LONG/SHORT only if all three biases match, each strength is at least 2, and each specialist has at least one direction-compatible strategy candidate. Select strategyIds only from those candidate IDs, and require at least one selected SMC, ICT, and Order Flow strategy to show cross-family confluence. If any family has no supported candidate, return WAIT and []. For a directional plan, specify an entry trigger as a conditional POC/VA pullback/retest, numeric entryPrice, structural invalidation text and numeric stopPrice, numeric targetPrice, targetR exactly 2 or 3 with target at that R multiple, and exitPlan. The target must sit before the nearest unswept opposing SMC liquidity level. Use supplied prices/levels only; if these constraints cannot be satisfied, return WAIT with null numeric levels.\n\nThe snapshot may contain paperPerformance from previously settled AI plans for the same symbol/timeframe. Use it only as cautious calibration: a sample under 20 resolved plans is too small to adjust the strategy; never claim a strategy is learned or profitable. If there are at least 20 resolved plans and performance is poor, require stronger confluence or choose WAIT; do not change price facts or relax the risk rules.\n\nThis is a paper/research suggestion only, never an exchange order.`,
     { snapshot: input, reports }, planSchema);
   const usedProviders = [...new Set([...configuredRoles.flat(), ...managerProviders].map((provider) => `${provider.provider}:${provider.model}`))].join(', ');
   return { reports, plan: sanitizePlan(rawPlan, reports, snapshot), model: usedProviders, generatedAt: Date.now() };
