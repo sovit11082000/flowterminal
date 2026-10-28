@@ -162,6 +162,10 @@ export default function App() {
   heatmapSnapshotRef.current = heatmapSnapshot;
   const heatmapEnabledRef = useRef(heatmapEnabled);
   heatmapEnabledRef.current = heatmapEnabled;
+  const orderBookBidsRef = useRef(orderBookBids);
+  orderBookBidsRef.current = orderBookBids;
+  const orderBookAsksRef = useRef(orderBookAsks);
+  orderBookAsksRef.current = orderBookAsks;
   const backtestTradesRef = useRef<BacktestTrade[]>([]);
   const liveSetupRef = useRef<TradeSetup | null>(null);
   const [fixedProfileRange, setFixedProfileRange] = useState<[number, number] | null>(null);
@@ -350,7 +354,7 @@ export default function App() {
     }
 
     if (heatmapEnabledRef.current) {
-      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples, timeframeSeconds: TIMEFRAME_SECONDS[currentTimeframe] });
+      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples, timeframeSeconds: TIMEFRAME_SECONDS[currentTimeframe], liveBids: orderBookBidsRef.current, liveAsks: orderBookAsksRef.current, currentCandleTime: latestCandleTimeRef.current });
     }
 
     drawBacktestMarkers({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, trades: backtestTradesRef.current, liveSetup: liveSetupRef.current });
@@ -535,7 +539,7 @@ export default function App() {
 
   useEffect(() => {
     scheduleOverlayRedraw();
-  }, [profileMode, profileViewMode, selectedSymbol, selectedTimeframe, profileShelfX, fixedProfileRange, smcFeatures, gammaSnapshot, heatmapEnabled, heatmapSnapshot, scheduleOverlayRedraw]);
+  }, [profileMode, profileViewMode, selectedSymbol, selectedTimeframe, profileShelfX, fixedProfileRange, smcFeatures, gammaSnapshot, heatmapEnabled, heatmapSnapshot, orderBookBids, orderBookAsks, latestCandleTime, scheduleOverlayRedraw]);
 
   // 2. Main Chart Initialization
   useEffect(() => {
@@ -1613,8 +1617,8 @@ export default function App() {
           </div>
         </div>
 
-        <div aria-label="Select market" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 5, margin: '0 0 8px', padding: '6px 8px', border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019' }}>
-          <span style={{ marginRight: 4, color: '#94a3b8', fontSize: 10, fontWeight: 700 }}>MARKETS</span>
+        <div aria-label="Select market for candle chart and heatmap" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 5, margin: '0 0 8px', padding: '6px 8px', border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019' }}>
+          <span style={{ marginRight: 4, color: '#94a3b8', fontSize: 10, fontWeight: 700 }}>CHART + HEATMAP</span>
           {MARKETS.map((market) => <button
             key={market.symbol}
             aria-pressed={selectedSymbol === market.symbol}

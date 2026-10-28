@@ -10,9 +10,12 @@ export function drawOrderBookLiquidityOverlay(args: {
   height: number;
   samples: readonly LiquidityBookSample[];
   timeframeSeconds: number;
+  liveBids: readonly (readonly [number, number])[];
+  liveAsks: readonly (readonly [number, number])[];
+  currentCandleTime: number | null;
 }): void {
-  const { ctx, chart, series, width, height, samples, timeframeSeconds } = args;
-  if (samples.length < 6) return;
+  const { ctx, chart, series, width, height, samples, timeframeSeconds, liveBids, liveAsks, currentCandleTime } = args;
+  if (!samples.length && !liveBids.length && !liveAsks.length) return;
   const visible = chart.timeScale().getVisibleRange();
   if (!visible) return;
   const from = typeof visible.from === 'number' ? visible.from : -Infinity;
@@ -21,7 +24,6 @@ export function drawOrderBookLiquidityOverlay(args: {
     .filter((wall) => wall.persistencePct >= 20)
     .sort((a, b) => b.persistencePct - a.persistencePct || b.averageSize - a.averageSize);
   const selected = (['bid', 'ask'] as const).flatMap((side) => walls.filter((wall) => wall.side === side).slice(0, 2));
-  if (!selected.length) return;
 
   ctx.save();
   // Collapse 15-second snapshots into chart bars so order-book bands line up
@@ -61,6 +63,27 @@ export function drawOrderBookLiquidityOverlay(args: {
       ctx.fillStyle = level.side === 'bid' ? '#22d3ee' : '#c084fc';
       ctx.fillRect(x - candleWidth / 2, y - 3, candleWidth, 6);
     }
+  }
+
+  // Always paint the live book at the latest candle, even before historical
+  // snapshots have accumulated or if Mongo history is unavailable.
+  const currentX = currentCandleTime === null ? null : timeScale.timeToCoordinate(currentCandleTime as import('lightweight-charts').UTCTimestamp);
+  if (currentX !== null) {
+    const nextX = timeScale.timeToCoordinate((currentCandleTime! + timeframeSeconds) as import('lightweight-charts').UTCTimestamp);
+    const previousX = timeScale.timeToCoordinate((currentCandleTime! - timeframeSeconds) as import('lightweight-charts').UTCTimestamp);
+    const liveWidth = Math.max(12, Math.min(38, Math.abs(nextX !== null ? nextX - currentX : previousX !== null ? currentX - previousX : 16) * 0.9));
+    const paintLiveSide = (side: 'bid' | 'ask', levels: readonly (readonly [number, number])[]) => {
+      const color = side === 'bid' ? '#22d3ee' : '#c084fc';
+      for (const [price, size] of levels.slice(0, 5)) {
+        const y = series.priceToCoordinate(price);
+        if (y === null || y < -8 || y > height + 8 || !Number.isFinite(size) || size <= 0) continue;
+        ctx.globalAlpha = 0.2 + 0.25 * Math.sqrt(Math.min(size / Math.max(levels[0]?.[1] ?? size, Number.EPSILON), 1));
+        ctx.fillStyle = color;
+        ctx.fillRect(currentX! - liveWidth / 2, y - 4, liveWidth, 8);
+      }
+    };
+    paintLiveSide('bid', liveBids);
+    paintLiveSide('ask', liveAsks);
   }
 
   ctx.font = '9px monospace';
