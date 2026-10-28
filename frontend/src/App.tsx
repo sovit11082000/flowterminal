@@ -24,7 +24,7 @@ import EntryExitSignals from './components/EntryExitSignals.js';
 import AgentCouncilPanel from './components/AgentCouncilPanel.js';
 import GammaLevelsPanel, { type Snapshot as GammaSnapshot } from './components/GammaLevelsPanel.js';
 import { analyzeSmartMoney, drawSmartMoneyOverlay, type SmartMoneyAnalysis, type SmartMoneyFeatures } from './components/SmartMoneyOverlay.js';
-import { backtestOrderFlow, drawBacktestMarkers, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
+import { backtestOrderFlow, drawBacktestMarkers, type BacktestCostAssumptions, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
 import { calculateVolumeProfile } from './components/VolumeProfileCalculator.js';
 import {
   Trade,
@@ -124,6 +124,17 @@ const MARKETS = [
   { symbol: 'AVAXUSDT', name: 'Avalanche' }, { symbol: 'XAUTUSDT', name: 'Gold (XAUT)' }
 ] as const;
 
+const BACKTEST_COSTS_KEY = 'flowterminal_backtest_costs_v1';
+function loadBacktestCosts(): BacktestCostAssumptions {
+  try {
+    const saved = JSON.parse(localStorage.getItem(BACKTEST_COSTS_KEY) ?? 'null') as Partial<BacktestCostAssumptions> | null;
+    if (saved && Number.isFinite(saved.feeBpsPerSide) && Number.isFinite(saved.slippageBpsPerSide)) {
+      return { feeBpsPerSide: Math.max(0, saved.feeBpsPerSide!), slippageBpsPerSide: Math.max(0, saved.slippageBpsPerSide!) };
+    }
+  } catch { /* use the visible baseline assumptions below */ }
+  return { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 };
+}
+
 export default function App() {
   const [gatewayConnected, setGatewayConnected] = useState<boolean>(false);
   const [marketStatus, setMarketStatus] = useState<ConnectionStatus>('DISCONNECTED');
@@ -141,6 +152,7 @@ export default function App() {
   const [derivativesSnapshot, setDerivativesSnapshot] = useState<DerivativesPayload | null>(null);
   const [historicalOI, setHistoricalOI] = useState<OIHistoryPoint[]>([]);
   const [historicalOIStatus, setHistoricalOIStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [backtestCosts, setBacktestCosts] = useState<BacktestCostAssumptions>(loadBacktestCosts);
   const [gammaSnapshot, setGammaSnapshot] = useState<GammaSnapshot | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTCUSDT');
   const [selectedTimeframe, setSelectedTimeframe] = useState<CandleTimeframe>('1m');
@@ -1356,8 +1368,9 @@ export default function App() {
     scheduleOverlayRedraw();
   }, [scheduleOverlayRedraw]);
   const backtestTrades = useMemo(() => supportsFootprint
-    ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200)
-    : [], [supportsFootprint, signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe]);
+    ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200, backtestCosts)
+    : [], [supportsFootprint, signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe, backtestCosts]);
+  useEffect(() => { localStorage.setItem(BACKTEST_COSTS_KEY, JSON.stringify(backtestCosts)); }, [backtestCosts]);
   backtestTradesRef.current = backtestTrades;
   useEffect(() => { scheduleOverlayRedraw(); }, [backtestTrades, scheduleOverlayRedraw]);
   useEffect(() => { scheduleOverlayRedraw(); }, [smartMoneyAnalysis, scheduleOverlayRedraw]);
@@ -1768,6 +1781,8 @@ export default function App() {
         lastTradeAt={lastTradeAt}
         context={{ profile: selectedProfile, heatmap: heatmapSnapshot, derivatives: replayDerivativesSnapshot, gamma: gammaSnapshot?.baseCoin === selectedSymbol.replace(/USDT$/, '') ? gammaSnapshot : null }}
         backtestTrades={backtestTrades}
+        costs={backtestCosts}
+        onCostsChange={setBacktestCosts}
         tradeReplayInfo={{ ...tradeReplayInfo, barsCount: tradeReplayBars.length }}
         historicalOIStatus={historicalOIStatus}
         onLiveSetupChange={publishActivePaperSetup}

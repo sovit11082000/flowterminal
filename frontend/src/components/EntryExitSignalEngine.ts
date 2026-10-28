@@ -33,10 +33,18 @@ export interface BacktestTrade extends TradeSetup {
   phase: 'TRAIN' | 'VALIDATION';
   outcome: 'WIN' | 'LOSS' | 'BREAKEVEN' | 'TIME' | 'OPEN';
   exitTime: number | null;
+  exitPrice: number | null;
   pnlR: number | null;
+  costR: number | null;
+  netPnlR: number | null;
   target1Hit: boolean;
   target2Hit: boolean;
   lossReview: string | null;
+}
+
+export interface BacktestCostAssumptions {
+  feeBpsPerSide: number;
+  slippageBpsPerSide: number;
 }
 
 /**
@@ -45,7 +53,7 @@ export interface BacktestTrade extends TradeSetup {
  * DOM and manual profile are deliberately excluded because historical snapshots
  * for those inputs are not retained consistently.
  */
-export function backtestOrderFlow(candles: SignalCandle[], footprints: SerializedFootprintBar[], oiHistory: OIHistoryPoint[], symbol: string, barSeconds: number, strategyVersion = 1, maxBars = 43_200): BacktestTrade[] {
+export function backtestOrderFlow(candles: SignalCandle[], footprints: SerializedFootprintBar[], oiHistory: OIHistoryPoint[], symbol: string, barSeconds: number, strategyVersion = 1, maxBars = 43_200, costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
   const closedFootprints = footprints.filter((bar) => bar.isClosed).sort((a, b) => a.time - b.time);
   const latestClosedTime = closedFootprints[closedFootprints.length - 1]?.time ?? 0;
   // Do not score against the currently-forming candle. The latest closed
@@ -82,6 +90,7 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     const isLong = setup.side === 'LONG';
     let outcome: BacktestTrade['outcome'] = 'OPEN';
     let exitTime: number | null = null;
+    let exitPrice: number | null = null;
     let pnlR: number | null = null;
     let target1Hit = false;
     let target2Hit = false;
@@ -111,12 +120,14 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
           outcome = 'LOSS'; pnlR = -1;
         }
         exitTime = bar.time;
+        exitPrice = target1Hit ? (target1 + setup.stop) / 2 : setup.stop;
         exitBar = bar;
         break;
       }
       if (target2Reached) {
         target1Hit = true; target2Hit = true;
         outcome = 'WIN'; exitTime = bar.time;
+        exitPrice = (target1 + target2) / 2;
         exitBar = bar;
         pnlR = 0.5 + setup.targetR * 0.5;
         break;
@@ -126,6 +137,7 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     if (outcome === 'OPEN' && fullHorizonAvailable) {
       const bar = history[horizon];
       outcome = 'TIME'; exitTime = bar.time;
+      exitPrice = target1Hit ? (target1 + bar.close) / 2 : bar.close;
       exitBar = bar;
       const unrealizedR = (isLong ? bar.close - setup.entry : setup.entry - bar.close) / risk;
       pnlR = target1Hit ? 0.5 + 0.5 * unrealizedR : unrealizedR;
@@ -157,11 +169,15 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     }
     blockedThroughIndex = outcome === 'OPEN' ? horizon : history.findIndex((bar) => bar.time === exitTime);
     const phase = setup.time >= validationStartTime ? 'VALIDATION' : 'TRAIN';
-    results.push({ ...setup, phase, outcome, exitTime, pnlR, target1Hit, target2Hit, lossReview });
+    const costR = pnlR !== null && exitPrice !== null
+      ? ((setup.entry + exitPrice) * (Math.max(0, costs.feeBpsPerSide) + Math.max(0, costs.slippageBpsPerSide)) / 10_000) / risk
+      : null;
+    const netPnlR = pnlR !== null && costR !== null ? pnlR - costR : null;
+    results.push({ ...setup, phase, outcome, exitTime, exitPrice, pnlR, costR, netPnlR, target1Hit, target2Hit, lossReview });
     // A loss updates only later replay decisions: step up the confluence tier;
     // if the strictest tier also loses, stop replaying this strategy entirely.
     const trainingTradeClosedBeforeBoundary = phase === 'TRAIN' && exitTime !== null && exitTime < validationStartTime;
-    if (trainingTradeClosedBeforeBoundary && (outcome === 'LOSS' || (outcome === 'TIME' && (pnlR ?? 0) < 0))) {
+    if (trainingTradeClosedBeforeBoundary && (outcome === 'LOSS' || (netPnlR ?? 0) < 0)) {
       if (replayVersion < 3) replayVersion += 1;
       else paused = true;
     }
@@ -219,7 +235,7 @@ export function drawBacktestMarkers(args: {
     ctx.closePath(); ctx.fill();
     if (labels.some((previous) => Math.abs(previous - markerY) < 14)) continue;
     labels.push(markerY);
-    const result = trade.outcome === 'OPEN' ? `OPEN · 1:${trade.targetR}` : `${trade.outcome} ${trade.pnlR?.toFixed(1)}R`;
+    const result = trade.outcome === 'OPEN' ? `OPEN · 1:${trade.targetR}` : `${trade.outcome} ${(trade.netPnlR ?? trade.pnlR)?.toFixed(1)}R net`;
     const text = `${isLong ? 'BUY' : 'SELL'} · ${result}`;
     const textWidth = ctx.measureText(text).width;
     const labelX = Math.max(2, Math.min(width - textWidth - 8, x + 7));
