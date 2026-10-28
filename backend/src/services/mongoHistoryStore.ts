@@ -4,10 +4,11 @@ import type { OrderBookSample } from './orderBookHistoryStore.js';
 import type { CouncilResult, AgentSnapshot } from '../agents/orderFlowCouncil.js';
 
 type Stored<T> = T & { _id: string; expiresAt: Date };
-const FOOTPRINT_RETENTION_MS = 5 * 24 * 60 * 60 * 1000;
+const FOOTPRINT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const OTHER_DATA_RETENTION_MS = 48 * 60 * 60 * 1000;
 const ORDER_BOOK_PERSIST_INTERVAL_MS = 15_000;
-const RETENTION_POLICY_ID = 'retention-policy-5d-footprints-48h-other-v1';
+const RETENTION_POLICY_ID = 'retention-policy-1d-footprints-48h-other-v2';
+const PREVIOUS_RETENTION_POLICY_ID = 'retention-policy-5d-footprints-48h-other-v1';
 export interface AgentPaperPerformance {
   resolved: number;
   wins: number;
@@ -57,7 +58,11 @@ export class MongoHistoryStore {
       this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 })
     ]);
-    await this.applyRetentionPolicy();
+    try {
+      await this.applyRetentionPolicy();
+    } catch (error) {
+      console.warn('[MongoDB] Could not apply retention cleanup; new footprints will still expire after 24 hours:', error);
+    }
     console.log(`[MongoDB] Connected to database "${this.databaseName}". Existing local files were not imported.`);
   }
 
@@ -265,6 +270,18 @@ export class MongoHistoryStore {
     if (!this.db) return;
     const settings = this.db.collection<{ _id: string; appliedAt?: Date }>('settings');
     if (await settings.findOne({ _id: RETENTION_POLICY_ID })) return;
+
+    const previousPolicy = await settings.findOne({ _id: PREVIOUS_RETENTION_POLICY_ID });
+    if (previousPolicy) {
+      // The previous policy already assigned TTLs to trades, books and decisions.
+      // Only shorten footprint retention, deleting expired bars before refreshing
+      // their TTL dates so the migration also frees space on a nearly-full cluster.
+      const cutoffTime = Math.floor((Date.now() - FOOTPRINT_RETENTION_MS) / 1000);
+      await this.collection('footprints').deleteMany({ time: { $lte: cutoffTime } });
+      await this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]);
+      await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: new Date() } }, { upsert: true });
+      return;
+    }
 
     const migrations = [
       this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]),
