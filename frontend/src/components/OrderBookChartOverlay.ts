@@ -9,8 +9,9 @@ export function drawOrderBookLiquidityOverlay(args: {
   width: number;
   height: number;
   samples: readonly LiquidityBookSample[];
+  timeframeSeconds: number;
 }): void {
-  const { ctx, chart, series, width, height, samples } = args;
+  const { ctx, chart, series, width, height, samples, timeframeSeconds } = args;
   if (samples.length < 6) return;
   const visible = chart.timeScale().getVisibleRange();
   if (!visible) return;
@@ -23,12 +24,52 @@ export function drawOrderBookLiquidityOverlay(args: {
   if (!selected.length) return;
 
   ctx.save();
+  // Collapse 15-second snapshots into chart bars so order-book bands line up
+  // with the selected candle interval (rather than floating between candles).
+  const levelsByBar = new Map<number, Map<string, { side: 'bid' | 'ask'; price: number; size: number }>>();
+  for (const sample of samples) {
+    const sampleSeconds = Math.floor(sample.time / 1000);
+    if (sampleSeconds < from || sampleSeconds > to) continue;
+    const barTime = Math.floor(sampleSeconds / timeframeSeconds) * timeframeSeconds;
+    const levels = levelsByBar.get(barTime) ?? new Map<string, { side: 'bid' | 'ask'; price: number; size: number }>();
+    for (const [side, entries] of [['bid', sample.bids], ['ask', sample.asks]] as const) {
+      for (const [price, size] of entries.slice(0, 5)) {
+        if (!Number.isFinite(price) || !Number.isFinite(size) || size <= 0) continue;
+        const key = `${side}:${price}`;
+        const current = levels.get(key);
+        // Show the strongest displayed size observed within this candle bucket.
+        if (!current || size > current.size) levels.set(key, { side, price, size });
+      }
+    }
+    levelsByBar.set(barTime, levels);
+  }
+  const timeScale = chart.timeScale();
+  for (const [barTime, levelMap] of levelsByBar) {
+    const x = timeScale.timeToCoordinate(barTime as import('lightweight-charts').UTCTimestamp);
+    if (x === null || x < -20 || x > width + 20) continue;
+    const nextX = timeScale.timeToCoordinate((barTime + timeframeSeconds) as import('lightweight-charts').UTCTimestamp);
+    const previousX = timeScale.timeToCoordinate((barTime - timeframeSeconds) as import('lightweight-charts').UTCTimestamp);
+    const candleWidth = Math.max(3, Math.min(34, Math.abs(nextX !== null ? nextX - x : previousX !== null ? x - previousX : 8) * 0.72));
+    const values = [...levelMap.values()];
+    const sortedSizes = values.map((level) => level.size).sort((a, b) => a - b);
+    const typicalSize = sortedSizes[Math.floor(sortedSizes.length / 2)] ?? 1;
+    for (const level of values) {
+      const y = series.priceToCoordinate(level.price);
+      if (y === null || y < -8 || y > height + 8) continue;
+      const intensity = Math.sqrt(Math.min(level.size / Math.max(typicalSize * 3, Number.EPSILON), 1));
+      ctx.globalAlpha = 0.08 + intensity * 0.28;
+      ctx.fillStyle = level.side === 'bid' ? '#22d3ee' : '#c084fc';
+      ctx.fillRect(x - candleWidth / 2, y - 3, candleWidth, 6);
+    }
+  }
+
   ctx.font = '9px monospace';
   for (const wall of selected) {
     const y = series.priceToCoordinate(wall.price);
     if (y === null || y < 0 || y > height) continue;
     const color = wall.side === 'bid' ? '#22d3ee' : '#c084fc';
-    const matchingSamples = samples.filter((sample) => sample.time / 1000 >= from && sample.time / 1000 <= to);
+    const wallSamples = samples.filter((sample) => (wall.side === 'bid' ? sample.bids : sample.asks).some(([price]) => price === wall.price));
+    const matchingSamples = wallSamples.filter((sample) => sample.time / 1000 >= from && sample.time / 1000 <= to);
     if (!matchingSamples.length) continue;
     const first = matchingSamples[0];
     const last = matchingSamples[matchingSamples.length - 1];

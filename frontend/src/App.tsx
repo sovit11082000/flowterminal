@@ -149,7 +149,7 @@ export default function App() {
   const [profileMode, setProfileMode] = useState<VolumeProfileMode>('Off');
   const [profileViewMode, setProfileViewMode] = useState<VolumeProfileViewMode>('Total Volume');
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
-  const [heatmapEnabled, setHeatmapEnabled] = useState(false);
+  const [heatmapEnabled, setHeatmapEnabled] = useState(true);
   const [smcMenuOpen, setSmcMenuOpen] = useState(false);
   const [smcFeatures, setSmcFeatures] = useState<SmartMoneyFeatures>({ structure: false, liquidity: false, zones: false });
   const smcFeaturesRef = useRef(smcFeatures);
@@ -350,7 +350,7 @@ export default function App() {
     }
 
     if (heatmapEnabledRef.current) {
-      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples });
+      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples, timeframeSeconds: TIMEFRAME_SECONDS[currentTimeframe] });
     }
 
     drawBacktestMarkers({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, trades: backtestTradesRef.current, liveSetup: liveSetupRef.current });
@@ -1424,15 +1424,6 @@ export default function App() {
         {/* Navigation & Mode Selection Toolbar */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' }}>
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-            <label htmlFor="market-select" style={{ fontSize: '12px', fontWeight: 'bold', color: '#94a3b8' }}>Market:</label>
-            <select
-              id="market-select"
-              value={selectedSymbol}
-              onChange={(event) => setSelectedSymbol(event.target.value)}
-              style={{ background: '#111827', color: '#e2e8f0', border: '1px solid #334155', borderRadius: '4px', padding: '5px 8px', fontFamily: 'monospace' }}
-            >
-              {MARKETS.map((market) => <option key={market.symbol} value={market.symbol}>{market.name} · {market.symbol}</option>)}
-            </select>
             <span style={{ fontSize: '12px', fontWeight: 'bold', color: '#94a3b8' }}>Interval:</span>
             {TIMEFRAMES.map((timeframe) => (
               <button key={timeframe} onClick={() => {
@@ -1498,10 +1489,11 @@ export default function App() {
                 color: '#fff', border: 'none', padding: '4px 10px', borderRadius: '4px',
                 cursor: 'pointer', fontSize: '12px', marginLeft: '4px'
               }}
-              title="Show order-book liquidity heatmap and trade bubbles"
+              title="Show bid/ask liquidity bands and persistent walls directly on the candle chart"
             >
               Heatmap {heatmapEnabled ? 'ON' : 'OFF'}
             </button>
+            {heatmapEnabled && <span style={{ fontSize: 9, color: '#64748b' }}><span style={{ color: '#22d3ee' }}>■ BID</span> · <span style={{ color: '#c084fc' }}>■ ASK</span> · dotted = persistent wall</span>}
 
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
@@ -1621,6 +1613,17 @@ export default function App() {
           </div>
         </div>
 
+        <div aria-label="Select market" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 5, margin: '0 0 8px', padding: '6px 8px', border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019' }}>
+          <span style={{ marginRight: 4, color: '#94a3b8', fontSize: 10, fontWeight: 700 }}>MARKETS</span>
+          {MARKETS.map((market) => <button
+            key={market.symbol}
+            aria-pressed={selectedSymbol === market.symbol}
+            title={`${market.name} · ${market.symbol}`}
+            onClick={() => setSelectedSymbol(market.symbol)}
+            style={{ background: selectedSymbol === market.symbol ? '#1d4ed8' : '#172033', color: selectedSymbol === market.symbol ? '#fff' : '#cbd5e1', border: `1px solid ${selectedSymbol === market.symbol ? '#3b82f6' : '#334155'}`, borderRadius: 4, padding: '4px 7px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10, fontWeight: selectedSymbol === market.symbol ? 800 : 600 }}
+          >{market.symbol}</button>)}
+        </div>
+
         {/* OHLCV & Footprint Delta HUD Strip */}
         <div style={{ background: '#111827', padding: '6px 12px', borderRadius: '4px', marginBottom: '8px', fontSize: '12px', display: 'flex', gap: '14px', flexWrap: 'wrap', border: '1px solid #1f2937' }}>
           <div>
@@ -1725,7 +1728,7 @@ export default function App() {
         {supportsFootprint ? <div style={{ marginTop: '8px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', fontSize: '11px', color: '#94a3b8' }}>
             <span style={{ fontWeight: 'bold' }}>DELTA BARS + CVD</span>
-            <span>Delta: green = buyers, red = sellers · Trade bubbles appear only in Heatmap</span>
+            <span>Delta: green = buyers, red = sellers · Book liquidity is overlaid on candles when Heatmap is ON</span>
           </div>
           <div ref={deltaContainerRef} style={{ width: '100%', height: '140px' }} />
         </div> : <div style={{ marginTop: 8, color: '#64748b', fontSize: 11 }}>
@@ -1733,7 +1736,7 @@ export default function App() {
         </div>}
       </section>
 
-      <OrderBookHeatmap symbol={selectedSymbol} enabled={heatmapEnabled} onSnapshot={onHeatmapSnapshot} />
+      <OrderBookHeatmap symbol={selectedSymbol} enabled={heatmapEnabled} renderPanel={false} onSnapshot={onHeatmapSnapshot} />
 
       <AlertManager symbol={selectedSymbol} price={activeLatestBar?.close ?? null} delta={activeLatestFp?.delta ?? null} />
       {supportsFootprint && <AgentCouncilPanel

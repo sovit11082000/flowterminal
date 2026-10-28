@@ -8,8 +8,8 @@ interface HeatmapPayload { samples: BookSample[]; status: { sampleIntervalMs: nu
 export interface TradeDot { symbol: string; timestamp: number; price: number; size: number; side: 'Buy' | 'Sell'; tradeId: string; }
 interface TradePayload { samples: TradeDot[]; }
 
-export default function OrderBookHeatmap({ symbol, enabled = true, onSnapshot }: {
-  symbol: string; enabled?: boolean; onSnapshot?: (snapshot: { samples: BookSample[]; trades: TradeDot[] }) => void;
+export default function OrderBookHeatmap({ symbol, enabled = true, renderPanel = true, onSnapshot }: {
+  symbol: string; enabled?: boolean; renderPanel?: boolean; onSnapshot?: (snapshot: { samples: BookSample[]; trades: TradeDot[] }) => void;
 }) {
   const [samples, setSamples] = useState<BookSample[]>([]);
   const [tradeDots, setTradeDots] = useState<TradeDot[]>([]);
@@ -189,7 +189,7 @@ export default function OrderBookHeatmap({ symbol, enabled = true, onSnapshot }:
 
   useEffect(() => { onSnapshot?.({ samples, trades: tradeDots }); }, [samples, tradeDots, onSnapshot]);
 
-  if (!enabled) return null;
+  if (!enabled || !renderPanel) return null;
 
   return (
     <section style={{ marginTop: 16, background: '#0b0e14', border: '1px solid #1f2937', borderRadius: 6, overflow: 'hidden' }}>
