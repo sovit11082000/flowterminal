@@ -36,6 +36,7 @@ export interface BacktestTrade extends TradeSetup {
   pnlR: number | null;
   target1Hit: boolean;
   target2Hit: boolean;
+  lossReview: string | null;
 }
 
 /**
@@ -59,10 +60,12 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
   let blockedThroughIndex = -1;
   let replayVersion = Math.max(1, strategyVersion);
   let paused = false;
-  // Keep the latest 30% as a chronological holdout. Strategy tightening is
-  // learned only from trades closed entirely before this boundary.
-  const validationStartIndex = Math.floor(history.length * 0.7);
-  const validationStartTime = history[validationStartIndex]?.time ?? Infinity;
+  // Split the actual footprint/candle overlap, not all candle history. A
+  // 30-day candle cache with only 48h of raw fills must not label every
+  // eligible trade as holdout just because the older candles lack flow data.
+  const eligibleSignalTimes = history.filter((bar) => footprintsByTime.has(bar.time)).map((bar) => bar.time);
+  const validationStartIndex = Math.floor(eligibleSignalTimes.length * 0.7);
+  const validationStartTime = eligibleSignalTimes[validationStartIndex] ?? Infinity;
 
   for (let i = 7; i < history.length; i++) {
     if (paused) break;
@@ -82,12 +85,18 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     let pnlR: number | null = null;
     let target1Hit = false;
     let target2Hit = false;
+    let lossReview: string | null = null;
     const target1 = setup.target1;
     const target2 = setup.target2;
     const fullHorizonAvailable = i + 30 < history.length;
     const horizon = Math.min(history.length - 1, i + 30);
+    let maxAdverseR = 0;
+    let maxFavorableR = 0;
+    let exitBar: SignalCandle | null = null;
     for (let j = i + 1; j <= horizon; j++) {
       const bar = history[j];
+      maxAdverseR = Math.max(maxAdverseR, isLong ? (setup.entry - bar.low) / risk : (bar.high - setup.entry) / risk);
+      maxFavorableR = Math.max(maxFavorableR, isLong ? (bar.high - setup.entry) / risk : (setup.entry - bar.low) / risk);
       const stopHit = isLong ? bar.low <= setup.stop : bar.high >= setup.stop;
       const target1Reached = isLong ? bar.high >= target1 : bar.low <= target1;
       const target2Reached = isLong ? bar.high >= target2 : bar.low <= target2;
@@ -102,11 +111,13 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
           outcome = 'LOSS'; pnlR = -1;
         }
         exitTime = bar.time;
+        exitBar = bar;
         break;
       }
       if (target2Reached) {
         target1Hit = true; target2Hit = true;
         outcome = 'WIN'; exitTime = bar.time;
+        exitBar = bar;
         pnlR = 0.5 + setup.targetR * 0.5;
         break;
       }
@@ -115,12 +126,38 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     if (outcome === 'OPEN' && fullHorizonAvailable) {
       const bar = history[horizon];
       outcome = 'TIME'; exitTime = bar.time;
+      exitBar = bar;
       const unrealizedR = (isLong ? bar.close - setup.entry : setup.entry - bar.close) / risk;
       pnlR = target1Hit ? 0.5 + 0.5 * unrealizedR : unrealizedR;
     }
+    if (outcome === 'LOSS' && exitBar && exitTime !== null) {
+      const observations: string[] = ['Structural stop was reached before TP1'];
+      const exitFootprint = footprintsByTime.get(exitTime);
+      const entryFootprint = footprintsByTime.get(setup.time);
+      if (exitFootprint) {
+        const deltaAgainst = isLong ? exitFootprint.delta < 0 : exitFootprint.delta > 0;
+        if (deltaAgainst) observations.push(`exit-bar aggressive delta opposed ${setup.side} (${exitFootprint.delta.toFixed(3)})`);
+        if (entryFootprint) {
+          const cvdAgainst = isLong
+            ? exitFootprint.cumulativeDelta < entryFootprint.cumulativeDelta
+            : exitFootprint.cumulativeDelta > entryFootprint.cumulativeDelta;
+          if (cvdAgainst) observations.push(`CVD moved against the position from ${entryFootprint.cumulativeDelta.toFixed(3)} to ${exitFootprint.cumulativeDelta.toFixed(3)}`);
+        }
+      } else observations.push('no saved footprint on the stop bar, so delta/CVD cannot be checked');
+      const entryOiIndex = upperBoundOITime(normalizedOI, (setup.time + barSeconds) * 1000) - 1;
+      const exitOiIndex = upperBoundOITime(normalizedOI, (exitTime + barSeconds) * 1000) - 1;
+      const entryOi = normalizedOI[entryOiIndex];
+      const exitOi = normalizedOI[exitOiIndex];
+      if (entryOi && exitOi && exitOi.timeMs - entryOi.timeMs <= 30 * barSeconds * 1000 && exitOi.oi > entryOi.oi) {
+        const priceMovedAgainst = isLong ? exitBar.close < setup.entry : exitBar.close > setup.entry;
+        observations.push(priceMovedAgainst ? 'open interest rose while price closed against the position (new participation; direction is not identifiable from OI alone)' : 'open interest rose into the stop (positioning direction is ambiguous)');
+      }
+      observations.push(`during the trade, maximum favorable move was ${Math.max(0, maxFavorableR).toFixed(2)}R and adverse excursion reached ${Math.max(0, maxAdverseR).toFixed(2)}R`);
+      lossReview = `${observations.join('; ')}. These are observed conditions, not proof of a single cause.`;
+    }
     blockedThroughIndex = outcome === 'OPEN' ? horizon : history.findIndex((bar) => bar.time === exitTime);
     const phase = setup.time >= validationStartTime ? 'VALIDATION' : 'TRAIN';
-    results.push({ ...setup, phase, outcome, exitTime, pnlR, target1Hit, target2Hit });
+    results.push({ ...setup, phase, outcome, exitTime, pnlR, target1Hit, target2Hit, lossReview });
     // A loss updates only later replay decisions: step up the confluence tier;
     // if the strictest tier also loses, stop replaying this strategy entirely.
     const trainingTradeClosedBeforeBoundary = phase === 'TRAIN' && exitTime !== null && exitTime < validationStartTime;

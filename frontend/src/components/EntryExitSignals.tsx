@@ -21,11 +21,12 @@ const keyFor = (symbol: string, timeframe: string) => `flowterminal_signal_${sym
 const fmt = (value: number) => value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 const intervalSeconds: Record<string, number> = { '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
 
-export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, historicalOIStatus, onLiveSetupChange }: {
+export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, historicalOIStatus, tradeReplayInfo, onLiveSetupChange }: {
   symbol: string; timeframe: string; candles: SignalCandle[]; footprints: SerializedFootprintBar[];
   bids: [number, number][]; asks: [number, number][]; price: number | null; feedStatus: string; lastTradeAt: number | null;
   context: ConfluenceContext;
   backtestTrades: BacktestTrade[];
+  tradeReplayInfo: { status: 'idle' | 'loading' | 'ready' | 'error'; sourceTradeCount: number; windowHours: number; barsCount: number };
   historicalOIStatus: 'idle' | 'loading' | 'ready' | 'error';
   onLiveSetupChange?: (setup: TradeSetup | null) => void;
 }) {
@@ -157,6 +158,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   }
   const topGamma = [...gammaByStrike.entries()].sort((a, b) => b[1] - a[1])[0];
   const completedBacktests = backtestTrades.filter((trade) => trade.outcome !== 'OPEN');
+  const reviewedLosses = backtestTrades.filter((trade) => trade.outcome === 'LOSS' && trade.lossReview).slice(-5).reverse();
   const backtestWins = completedBacktests.filter((trade) => trade.outcome === 'WIN').length;
   const backtestLosses = completedBacktests.filter((trade) => trade.outcome === 'LOSS').length;
   const backtestBreakeven = completedBacktests.filter((trade) => trade.outcome === 'BREAKEVEN').length;
@@ -190,8 +192,9 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <ContextCell label="OPTIONS GAMMA CONTEXT" value={topGamma ? `${context.gamma?.source ?? 'Options'} max Γ×OI` : 'Unavailable'} detail={topGamma ? `Strike ${fmt(topGamma[0])} · not dealer net-GEX` : 'No valid option Gamma snapshot'} />
     </div>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', padding: '9px 12px', borderBottom: '1px solid #1f2937', background: '#0a1019', fontSize: 10 }}>
-      <b style={{ color: '#cbd5e1' }}>HISTORICAL REPLAY · up to 30 days · {timeframe}</b>
+      <b style={{ color: '#cbd5e1' }}>HISTORICAL REPLAY · {timeframe}</b>
       <span style={{ color: '#94a3b8' }}>{backtestTrades.length} entries · {replaySpanDays.toFixed(1)}d candles</span>
+      <span style={{ color: tradeReplayInfo.status === 'ready' ? '#67e8f9' : '#fbbf24' }}>Raw trade replay: {tradeReplayInfo.status === 'ready' ? `${tradeReplayInfo.sourceTradeCount.toLocaleString()} ${symbol} fills → ${tradeReplayInfo.barsCount} ${tradeReplayInfo.windowHours}h bars` : tradeReplayInfo.status === 'loading' ? 'aggregating retained fills…' : tradeReplayInfo.status === 'error' ? 'unavailable · using saved footprints' : 'not requested'}</span>
       <span style={{ color: '#34d399' }}>Wins {backtestWins}</span>
       <span style={{ color: '#fb7185' }}>Losses {backtestLosses}</span>
       <span style={{ color: '#fbbf24' }}>Breakeven {backtestBreakeven}</span>
@@ -210,7 +213,14 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <span>Gross R only · fees and slippage excluded</span>
     </div>
     <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>{flowHistoryLabel}</div>
-    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Historical backtest entry/SL/TP uses the recorded candle, footprint and OI rules. Persistent order-book wall confirmation is required for live paper plans; historical book data is not complete enough to claim a 30-day heatmap backtest.</div>
+    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Each backtest entry is a strategy-generated setup from candles plus recorded/reconstructed trade-side footprints and OI—not one win/loss per raw fill. Raw fills are aggregated into 1m/5m bars from the retained 48h window; persistent order-book wall confirmation is required for live paper plans, and historical book coverage is too short for a book-based long-period result.</div>
+    {reviewedLosses.length > 0 && <details style={{ borderTop: '1px solid #1f2937', borderBottom: '1px solid #1f2937', marginBottom: 8 }}>
+      <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10, color: '#fda4af' }}>Backtest loss review · latest {reviewedLosses.length}</summary>
+      <div style={{ padding: '0 12px 9px', fontSize: 10, color: '#94a3b8' }}>{reviewedLosses.map((trade) => <div key={`${trade.time}-${trade.strategyVersion}`} style={{ padding: '6px 0', borderTop: '1px solid #172033' }}>
+        <b style={{ color: trade.side === 'LONG' ? '#34d399' : '#fb7185' }}>{new Date(trade.time * 1000).toLocaleString('en-IN')} · {trade.side} · V{trade.strategyVersion} · {trade.phase}</b>
+        <div style={{ marginTop: 3 }}>{trade.lossReview}</div>
+      </div>)}</div>
+    </details>}
     {latestAgentReads.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 6, padding: '0 12px 9px' }}>
       {latestAgentReads.map((read) => <div key={read.agent} style={{ padding: 7, border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019', fontSize: 9 }}>
         <b style={{ color: read.bias === 'LONG' ? '#34d399' : read.bias === 'SHORT' ? '#fb7185' : '#94a3b8' }}>{read.agent} · {read.bias} · {read.strength}/3</b>

@@ -139,6 +139,59 @@ export class MongoHistoryStore {
     return docs.map((doc) => this.clean<NormalizedTrade>(doc)).reverse();
   }
 
+  /** Rebuild bounded 1m/5m footprints from retained raw fills without loading ticks into Node memory. */
+  async reconstructFootprintsFromTrades(options: { symbol: string; timeframe: '1m' | '5m'; startTimeMs: number; endTimeMs: number; tickSize: number }): Promise<{ bars: SerializedFootprintBar[]; trades: number }> {
+    const intervalSeconds = options.timeframe === '1m' ? 60 : 300;
+    const intervalMs = intervalSeconds * 1000;
+    const match = { symbol: options.symbol, timestamp: { $gte: options.startTimeMs, $lte: options.endTimeMs } };
+    const trades = await this.collection('trades').countDocuments(match);
+    if (!trades) return { bars: [], trades: 0 };
+    const bucket = { $multiply: [{ $floor: { $divide: ['$timestamp', intervalMs] } }, intervalSeconds] };
+    const [ohlcRows, levelRows] = await Promise.all([
+      this.collection('trades').aggregate([
+        { $match: match }, { $sort: { timestamp: 1 } }, { $addFields: { bucket: bucket } },
+        { $group: { _id: '$bucket', open: { $first: '$price' }, close: { $last: '$price' }, high: { $max: '$price' }, low: { $min: '$price' }, totalVolume: { $sum: '$size' }, buyVolume: { $sum: { $cond: [{ $eq: ['$side', 'Buy'] }, '$size', 0] } }, sellVolume: { $sum: { $cond: [{ $eq: ['$side', 'Sell'] }, '$size', 0] } }, tradesCount: { $sum: 1 } } },
+        { $sort: { _id: 1 } }, { $limit: 3000 }
+      ], { allowDiskUse: true }).toArray(),
+      this.collection('trades').aggregate([
+        { $match: match },
+        { $addFields: { bucket: bucket, levelPrice: { $multiply: [{ $round: [{ $divide: ['$price', options.tickSize] }, 0] }, options.tickSize] } } },
+        { $group: { _id: { time: '$bucket', price: '$levelPrice' }, bidVolume: { $sum: { $cond: [{ $eq: ['$side', 'Sell'] }, '$size', 0] } }, askVolume: { $sum: { $cond: [{ $eq: ['$side', 'Buy'] }, '$size', 0] } }, tradesCount: { $sum: 1 } } },
+        { $sort: { '_id.time': 1, '_id.price': 1 } }, { $limit: 500_000 }
+      ], { allowDiskUse: true }).toArray()
+    ]);
+    const levelsByTime = new Map<number, SerializedFootprintBar['priceLevels']>();
+    for (const row of levelRows) {
+      const time = Number(row._id.time);
+      const bidVolume = Number(row.bidVolume);
+      const askVolume = Number(row.askVolume);
+      const totalVolume = bidVolume + askVolume;
+      if (!Number.isFinite(time) || totalVolume <= 0) continue;
+      const levels = levelsByTime.get(time) ?? [];
+      levels.push({ price: Number(row._id.price), bidVolume, askVolume, totalVolume, delta: askVolume - bidVolume, tradesCount: Number(row.tradesCount) });
+      levelsByTime.set(time, levels);
+    }
+    let cumulativeDelta = 0;
+    const bars = ohlcRows.map((row) => {
+      const time = Number(row._id);
+      const priceLevels = levelsByTime.get(time) ?? [];
+      const totalVolume = Number(row.totalVolume);
+      const buyVolume = Number(row.buyVolume);
+      const sellVolume = Number(row.sellVolume);
+      const delta = buyVolume - sellVolume;
+      cumulativeDelta += delta;
+      const poc = priceLevels.reduce((best, level) => level.totalVolume > best.totalVolume ? level : best, priceLevels[0] ?? { price: Number(row.close), totalVolume: 0 });
+      return {
+        symbol: options.symbol, timeframe: options.timeframe, time,
+        open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close),
+        totalVolume, buyVolume, sellVolume, delta, cumulativeDelta,
+        pocPrice: poc.price, pocVolume: poc.totalVolume, tradesCount: Number(row.tradesCount), priceLevels,
+        isClosed: (time + intervalSeconds) * 1000 <= options.endTimeMs
+      } satisfies SerializedFootprintBar;
+    });
+    return { bars, trades };
+  }
+
   async getOrderBooks(options: { symbol: string; startTimeMs?: number; endTimeMs?: number; limit: number }): Promise<OrderBookSample[]> {
     const query = this.timeQuery(options.symbol, 'time', options.startTimeMs, options.endTimeMs);
     const docs = await this.collection('orderBooks').find(query).sort({ time: -1 }).limit(options.limit).toArray();

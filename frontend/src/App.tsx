@@ -15,6 +15,7 @@ import { drawVolumeProfile, VolumeProfileMode, VolumeProfileViewMode } from './c
 import DOMLadder, { BookLevel } from './components/DOMLadder.js';
 import DerivativesPanel, { type DerivativesPayload } from './components/DerivativesPanel.js';
 import OrderBookHeatmap, { type BookSample, type TradeDot } from './components/OrderBookHeatmap.js';
+import { drawOrderBookLiquidityOverlay } from './components/OrderBookChartOverlay.js';
 import RecorderStatus from './components/RecorderStatus.js';
 import AlertManager from './components/AlertManager.js';
 import ChartDrawingLayer from './components/ChartDrawingLayer.js';
@@ -135,6 +136,8 @@ export default function App() {
   const [lastTradeAt, setLastTradeAt] = useState<number | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [heatmapSnapshot, setHeatmapSnapshot] = useState<{ samples: BookSample[]; trades: TradeDot[] }>({ samples: [], trades: [] });
+  const [tradeReplayBars, setTradeReplayBars] = useState<SerializedFootprintBar[]>([]);
+  const [tradeReplayInfo, setTradeReplayInfo] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; sourceTradeCount: number; windowHours: number }>({ status: 'idle', sourceTradeCount: 0, windowHours: 48 });
   const [derivativesSnapshot, setDerivativesSnapshot] = useState<DerivativesPayload | null>(null);
   const [historicalOI, setHistoricalOI] = useState<OIHistoryPoint[]>([]);
   const [historicalOIStatus, setHistoricalOIStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -155,6 +158,10 @@ export default function App() {
   const smcCandlesRef = useRef<CachedCandle[]>([]);
   const gammaSnapshotRef = useRef(gammaSnapshot);
   gammaSnapshotRef.current = gammaSnapshot;
+  const heatmapSnapshotRef = useRef(heatmapSnapshot);
+  heatmapSnapshotRef.current = heatmapSnapshot;
+  const heatmapEnabledRef = useRef(heatmapEnabled);
+  heatmapEnabledRef.current = heatmapEnabled;
   const backtestTradesRef = useRef<BacktestTrade[]>([]);
   const liveSetupRef = useRef<TradeSetup | null>(null);
   const [fixedProfileRange, setFixedProfileRange] = useState<[number, number] | null>(null);
@@ -342,6 +349,10 @@ export default function App() {
       drawSmartMoneyOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, candles: smcCandlesRef.current, features: smc, footprints: footprintBarsRef.current[currentTimeframe], analysis: smcAnalysisRef.current ?? undefined });
     }
 
+    if (heatmapEnabledRef.current) {
+      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples });
+    }
+
     drawBacktestMarkers({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, trades: backtestTradesRef.current, liveSetup: liveSetupRef.current });
 
     const gamma = gammaSnapshotRef.current;
@@ -524,7 +535,7 @@ export default function App() {
 
   useEffect(() => {
     scheduleOverlayRedraw();
-  }, [profileMode, profileViewMode, selectedSymbol, selectedTimeframe, profileShelfX, fixedProfileRange, smcFeatures, gammaSnapshot, scheduleOverlayRedraw]);
+  }, [profileMode, profileViewMode, selectedSymbol, selectedTimeframe, profileShelfX, fixedProfileRange, smcFeatures, gammaSnapshot, heatmapEnabled, heatmapSnapshot, scheduleOverlayRedraw]);
 
   // 2. Main Chart Initialization
   useEffect(() => {
@@ -1259,8 +1270,14 @@ export default function App() {
     .sort((a, b) => a.time - b.time)
     .map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
   [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
-  const signalFootprints = useMemo(() => Array.from(footprintBarsRef.current[selectedTimeframe].values())
-    .sort((a, b) => a.time - b.time), [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
+  const signalFootprints = useMemo(() => {
+    const byTime = new Map<number, SerializedFootprintBar>();
+    for (const bar of tradeReplayBars) if (bar.symbol === selectedSymbol && bar.timeframe === selectedTimeframe) byTime.set(bar.time, bar);
+    // Exchange-captured persistent bars replace reconstructed values where
+    // both sources overlap; the reconstructed raw-trade history fills older gaps.
+    for (const bar of footprintBarsRef.current[selectedTimeframe].values()) byTime.set(bar.time, bar);
+    return [...byTime.values()].sort((a, b) => a.time - b.time);
+  }, [tradeReplayBars, selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
   const replayOIHistory = useMemo(() => {
     const points = new Map<string, OIHistoryPoint>();
     for (const point of historicalOI) points.set(String(point.timestamp), point);
@@ -1297,6 +1314,29 @@ export default function App() {
     // minute derivatives snapshot is merged above for the freshest points.
     return () => { cancelled = true; };
   }, [selectedSymbol, supportsFootprint]);
+  useEffect(() => {
+    if (!supportsFootprint) {
+      setTradeReplayBars([]);
+      setTradeReplayInfo({ status: 'idle', sourceTradeCount: 0, windowHours: 48 });
+      return;
+    }
+    let cancelled = false;
+    const timeframe = selectedTimeframe as '1m' | '5m';
+    setTradeReplayBars([]);
+    setTradeReplayInfo({ status: 'loading', sourceTradeCount: 0, windowHours: 48 });
+    void fetch(apiUrl(`/api/footprint/replay?symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${timeframe}&hours=48`))
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Mongo raw-trade replay unavailable');
+        return await response.json() as { symbol: string; timeframe: string; windowHours: number; sourceTradeCount: number; bars: SerializedFootprintBar[] };
+      })
+      .then((payload) => {
+        if (cancelled || payload.symbol !== selectedSymbol || payload.timeframe !== timeframe) return;
+        setTradeReplayBars(Array.isArray(payload.bars) ? payload.bars : []);
+        setTradeReplayInfo({ status: 'ready', sourceTradeCount: Number(payload.sourceTradeCount) || 0, windowHours: payload.windowHours });
+      })
+      .catch(() => { if (!cancelled) setTradeReplayInfo({ status: 'error', sourceTradeCount: 0, windowHours: 48 }); });
+    return () => { cancelled = true; };
+  }, [selectedSymbol, selectedTimeframe, supportsFootprint]);
   const structureCandles = useMemo(() => {
     const interval = TIMEFRAME_SECONDS[selectedTimeframe];
     const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
@@ -1721,6 +1761,7 @@ export default function App() {
         lastTradeAt={lastTradeAt}
         context={{ profile: selectedProfile, heatmap: heatmapSnapshot, derivatives: replayDerivativesSnapshot, gamma: gammaSnapshot?.baseCoin === selectedSymbol.replace(/USDT$/, '') ? gammaSnapshot : null }}
         backtestTrades={backtestTrades}
+        tradeReplayInfo={{ ...tradeReplayInfo, barsCount: tradeReplayBars.length }}
         historicalOIStatus={historicalOIStatus}
         onLiveSetupChange={publishActivePaperSetup}
       />

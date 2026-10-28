@@ -59,6 +59,7 @@ const tickSizes: Record<string, number> = {
   BNBUSDT: 0.01, DOGEUSDT: 0.00001, ADAUSDT: 0.0001, LINKUSDT: 0.001,
   AVAXUSDT: 0.01, XAUTUSDT: 0.1
 };
+let resolvedTickSizes: Record<string, number> = { ...tickSizes };
 const footprintHistory = new FootprintHistoryStore();
 const marketPipelines = new Map<string, MarketPipeline>(SUPPORTED_SYMBOLS.map((symbol): [string, MarketPipeline] => [symbol, {
   orderBook: new OrderBookState(),
@@ -387,6 +388,35 @@ const server = http.createServer(async (req, res) => {
       () => footprintHistory.getHistory({ symbol, timeframe, startTimeMs, endTimeMs }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ symbol, timeframe, bars }));
+    return;
+  }
+
+  if (req.method === 'GET' && parsed.pathname === '/api/footprint/replay') {
+    const symbol = (typeof parsed.query.symbol === 'string' ? parsed.query.symbol : DEFAULT_SYMBOL).toUpperCase();
+    const timeframe = parsed.query.timeframe;
+    const hours = parsed.query.hours === undefined ? 48 : Number(parsed.query.hours);
+    if (!SUPPORTED_SYMBOLS.includes(symbol as typeof SUPPORTED_SYMBOLS[number]) ||
+      (timeframe !== '1m' && timeframe !== '5m') || !Number.isInteger(hours) || hours < 1 || hours > 48) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Replay accepts a supported symbol, 1m/5m timeframe and a 1–48 hour window.' }));
+      return;
+    }
+    if (!mongoHistory.connected) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'MongoDB must be connected to rebuild a replay from retained raw trades.' }));
+      return;
+    }
+    try {
+      const endTimeMs = Date.now();
+      const startTimeMs = endTimeMs - hours * 60 * 60_000;
+      const replay = await mongoHistory.reconstructFootprintsFromTrades({ symbol, timeframe, startTimeMs, endTimeMs, tickSize: resolvedTickSizes[symbol] ?? tickSizes[symbol] });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ symbol, timeframe, windowHours: hours, sourceTradeCount: replay.trades, bars: replay.bars }));
+    } catch (error) {
+      console.warn('[Trade replay] Could not aggregate raw fills:', error);
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Could not rebuild replay bars from MongoDB raw trades.' }));
+    }
     return;
   }
 
@@ -850,8 +880,9 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
   }
 });
 
-void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((resolvedTickSizes) => {
-  for (const [symbol, tickSize] of Object.entries(resolvedTickSizes)) {
+void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((exchangeTickSizes) => {
+  resolvedTickSizes = { ...resolvedTickSizes, ...exchangeTickSizes };
+  for (const [symbol, tickSize] of Object.entries(exchangeTickSizes)) {
     const pipeline = marketPipelines.get(symbol);
     if (!pipeline) continue;
     pipeline.footprints = {
@@ -859,7 +890,7 @@ void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((resolvedTickSizes)
       '5m': new OrderFlowAggregator({ timeframe: '5m', tickSize })
     };
   }
-  console.log(`[FlowTerminal] Loaded exchange tick sizes for ${Object.keys(resolvedTickSizes).length}/${SUPPORTED_SYMBOLS.length} markets`);
+  console.log(`[FlowTerminal] Loaded exchange tick sizes for ${Object.keys(exchangeTickSizes).length}/${SUPPORTED_SYMBOLS.length} markets`);
 }).catch((error: unknown) => {
   console.warn('[FlowTerminal] Could not load instrument tick sizes; using configured fallback sizes.', error);
 }).finally(() => {
