@@ -528,7 +528,7 @@ const server = http.createServer(async (req, res) => {
           return counts;
         }, {})
       },
-      retention: { footprintsDays: 1, footprintsHours: 24, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },
+      retention: { footprintsDays: 1, footprintsHours: 24, orderBookHours: 24, orderBookLevelsPerSide: 5, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },
       trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
       storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
     }));

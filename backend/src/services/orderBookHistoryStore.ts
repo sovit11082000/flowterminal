@@ -9,19 +9,19 @@ export interface OrderBookSample {
   asks: OrderBookEntry[];
 }
 
-// MongoDB is the durable 48-hour store on hosted deployments. Keep only a small
-// process-local fallback there; retaining 120k full depth snapshots needlessly
-// duplicates the same records in the Node heap.
-const maxSamples = process.env.MONGODB_URI?.trim() ? 5_000 : 120_000;
+const MAX_SAMPLES = 60_000;
+const STORED_LEVELS_PER_SIDE = 5;
+const SAMPLE_INTERVAL_MS = 15_000;
+const RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/** Rolling local order-book recorder. Samples the synchronized top 20 levels twice a second. */
+/** Rolling compact recorder for synchronized top-of-book liquidity history. */
 export class OrderBookHistoryStore {
   private readonly filePath: string;
   private readonly samples: OrderBookSample[] = [];
   private readonly lastSavedBySymbol = new Map<string, number>();
-  private readonly sampleIntervalMs = 500;
-  private readonly maxSamples = maxSamples;
-  private readonly retentionMs = 48 * 60 * 60 * 1000;
+  private readonly sampleIntervalMs = SAMPLE_INTERVAL_MS;
+  private readonly maxSamples = MAX_SAMPLES;
+  private readonly retentionMs = RETENTION_MS;
   private lastPruneAt = 0;
 
   constructor(filePath = resolve(process.cwd(), 'data', 'orderbook-history.jsonl')) {
@@ -33,7 +33,11 @@ export class OrderBookHistoryStore {
         if (!line) continue;
         try {
           const sample = JSON.parse(line) as OrderBookSample;
-          if (this.isValid(sample)) this.samples.push(sample);
+          if (this.isValid(sample)) this.samples.push({
+            ...sample,
+            bids: sample.bids.slice(0, STORED_LEVELS_PER_SIDE),
+            asks: sample.asks.slice(0, STORED_LEVELS_PER_SIDE)
+          });
         } catch {
           // Ignore a partial final line and retain earlier valid samples.
         }
@@ -52,9 +56,14 @@ export class OrderBookHistoryStore {
     if (!this.isValid(sample)) return false;
     const lastSaved = this.lastSavedBySymbol.get(sample.symbol) ?? 0;
     if (sample.time - lastSaved < this.sampleIntervalMs) return false;
-    this.samples.push(sample);
+    const compactSample: OrderBookSample = {
+      ...sample,
+      bids: sample.bids.slice(0, STORED_LEVELS_PER_SIDE),
+      asks: sample.asks.slice(0, STORED_LEVELS_PER_SIDE)
+    };
+    this.samples.push(compactSample);
     this.lastSavedBySymbol.set(sample.symbol, sample.time);
-    appendFileSync(this.filePath, `${JSON.stringify(sample)}\n`, 'utf8');
+    appendFileSync(this.filePath, `${JSON.stringify(compactSample)}\n`, 'utf8');
     this.pruneExpired(Date.now());
     if (this.samples.length > this.maxSamples + 5_000) this.trimAndPersist();
     return true;

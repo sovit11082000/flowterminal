@@ -6,9 +6,14 @@ import type { CouncilResult, AgentSnapshot } from '../agents/orderFlowCouncil.js
 type Stored<T> = T & { _id: string; expiresAt: Date };
 const FOOTPRINT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const OTHER_DATA_RETENTION_MS = 48 * 60 * 60 * 1000;
+const ORDER_BOOK_RETENTION_MS = 24 * 60 * 60 * 1000;
 const ORDER_BOOK_PERSIST_INTERVAL_MS = 15_000;
-const RETENTION_POLICY_ID = 'retention-policy-1d-footprints-48h-other-v2';
-const PREVIOUS_RETENTION_POLICY_ID = 'retention-policy-5d-footprints-48h-other-v1';
+const ORDER_BOOK_LEVELS_PER_SIDE = 5;
+const RETENTION_POLICY_ID = 'retention-policy-1d-footprints-1d-orderbook-48h-other-v3';
+const PREVIOUS_RETENTION_POLICY_IDS = [
+  'retention-policy-1d-footprints-48h-other-v2',
+  'retention-policy-5d-footprints-48h-other-v1'
+];
 export interface AgentPaperPerformance {
   resolved: number;
   wins: number;
@@ -97,9 +102,12 @@ export class MongoHistoryStore {
     if (sample.time - lastSaved < ORDER_BOOK_PERSIST_INTERVAL_MS) return;
     this.lastOrderBookSavedAt.set(sample.symbol, sample.time);
     await this.collection('orderBooks').insertOne({
-      ...sample, expiresAt: new Date(sample.time + OTHER_DATA_RETENTION_MS)
+      ...sample,
+      bids: sample.bids.slice(0, ORDER_BOOK_LEVELS_PER_SIDE),
+      asks: sample.asks.slice(0, ORDER_BOOK_LEVELS_PER_SIDE),
+      expiresAt: new Date(sample.time + ORDER_BOOK_RETENTION_MS)
     });
-    await this.enforceCap('orderBooks', 120_000);
+    await this.enforceCap('orderBooks', 60_000);
   }
 
   async saveLiquidations(events: NormalizedLiquidation[]): Promise<void> {
@@ -271,14 +279,24 @@ export class MongoHistoryStore {
     const settings = this.db.collection<{ _id: string; appliedAt?: Date }>('settings');
     if (await settings.findOne({ _id: RETENTION_POLICY_ID })) return;
 
-    const previousPolicy = await settings.findOne({ _id: PREVIOUS_RETENTION_POLICY_ID });
+    const previousPolicy = await settings.findOne({ _id: { $in: PREVIOUS_RETENTION_POLICY_IDS } });
     if (previousPolicy) {
-      // The previous policy already assigned TTLs to trades, books and decisions.
-      // Only shorten footprint retention, deleting expired bars before refreshing
-      // their TTL dates so the migration also frees space on a nearly-full cluster.
-      const cutoffTime = Math.floor((Date.now() - FOOTPRINT_RETENTION_MS) / 1000);
-      await this.collection('footprints').deleteMany({ time: { $lte: cutoffTime } });
+      // Prior policies already assigned 48-hour TTLs to trades and decisions.
+      // Shorten footprints and order-book snapshots; delete expired rows first
+      // to reclaim space before refreshing the TTL dates of retained rows.
+      const now = Date.now();
+      const footprintCutoff = Math.floor((now - FOOTPRINT_RETENTION_MS) / 1000);
+      const orderBookCutoff = now - ORDER_BOOK_RETENTION_MS;
+      await Promise.all([
+        this.collection('footprints').deleteMany({ time: { $lte: footprintCutoff } }),
+        this.collection('orderBooks').deleteMany({ time: { $lte: orderBookCutoff } })
+      ]);
       await this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]);
+      await this.collection('orderBooks').updateMany({}, [{ $set: {
+        expiresAt: { $toDate: { $add: ['$time', ORDER_BOOK_RETENTION_MS] } },
+        bids: { $slice: ['$bids', ORDER_BOOK_LEVELS_PER_SIDE] },
+        asks: { $slice: ['$asks', ORDER_BOOK_LEVELS_PER_SIDE] }
+      } }]);
       await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: new Date() } }, { upsert: true });
       return;
     }
@@ -286,7 +304,11 @@ export class MongoHistoryStore {
     const migrations = [
       this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]),
       this.collection('trades').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
-      this.collection('orderBooks').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$time', OTHER_DATA_RETENTION_MS] } } } }]),
+      this.collection('orderBooks').updateMany({}, [{ $set: {
+        expiresAt: { $toDate: { $add: ['$time', ORDER_BOOK_RETENTION_MS] } },
+        bids: { $slice: ['$bids', ORDER_BOOK_LEVELS_PER_SIDE] },
+        asks: { $slice: ['$asks', ORDER_BOOK_LEVELS_PER_SIDE] }
+      } }]),
       this.collection('liquidations').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
       this.collection('agent_decisions').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$generatedAt', OTHER_DATA_RETENTION_MS] } } } }])
     ];
