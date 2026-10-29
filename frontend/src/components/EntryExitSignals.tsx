@@ -15,7 +15,7 @@ interface ConfluenceContext {
 }
 
 type PaperPosition = TradeSetup & { symbol: string; timeframe: string; openedAt: number; signalKey: string };
-type JournalRow = { side: string; entry: number; exit: number; reason: string; closedAt: number; strategyVersion: number; pnlR: number; result: 'WIN' | 'LOSS' | 'BREAKEVEN' };
+type JournalRow = { side: string; entry: number; exit: number; reason: string; closedAt: number; strategyVersion: number; grossPnlR?: number; costR?: number; feeBpsPerSide?: number; slippageBpsPerSide?: number; pnlR: number; result: 'WIN' | 'LOSS' | 'BREAKEVEN' };
 type SavedState = { position: PaperPosition | null; journal: JournalRow[]; strategyVersion: number; lastTestedSignal: string };
 const keyFor = (symbol: string, timeframe: string) => `flowterminal_signal_${symbol}_${timeframe}`;
 const fmt = (value: number) => value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
@@ -75,7 +75,7 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) ?? '{}') as Partial<SavedState>;
       setPosition(saved.position?.symbol === symbol && saved.position?.timeframe === timeframe ? saved.position : null);
-      setJournal(Array.isArray(saved.journal) ? saved.journal.slice(0, 10) : []);
+      setJournal(Array.isArray(saved.journal) ? saved.journal.slice(0, 200) : []);
       setStrategyVersion(Number.isInteger(saved.strategyVersion) ? Math.max(1, saved.strategyVersion!) : 1);
       setLastTestedSignal(typeof saved.lastTestedSignal === 'string' ? saved.lastTestedSignal : '');
     } catch { setPosition(null); setJournal([]); }
@@ -95,8 +95,11 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     const costR = risk > 0 ? ((position.entry + exit) * (costs.feeBpsPerSide + costs.slippageBpsPerSide) / 10_000) / risk : 0;
     const pnlR = grossPnlR - costR;
     const result: JournalRow['result'] = pnlR > 0.05 ? 'WIN' : pnlR < -0.05 ? 'LOSS' : 'BREAKEVEN';
-    const row: JournalRow = { side: position.side, entry: position.entry, exit, reason, closedAt: Date.now(), strategyVersion: position.strategyVersion, pnlR, result };
-    setJournal((current) => [row, ...current].slice(0, 10));
+    const row: JournalRow = {
+      side: position.side, entry: position.entry, exit, reason, closedAt: Date.now(), strategyVersion: position.strategyVersion,
+      grossPnlR, costR, feeBpsPerSide: costs.feeBpsPerSide, slippageBpsPerSide: costs.slippageBpsPerSide, pnlR, result
+    };
+    setJournal((current) => [row, ...current].slice(0, 200));
     if (result === 'LOSS' && position.strategyVersion === strategyVersion) setStrategyVersion((version) => Math.min(4, version + 1));
     setPosition(null);
     setNotice(`Paper ${position.side.toLowerCase()} ${result} · ${pnlR.toFixed(2)}R · ${reason}. ${result === 'LOSS' ? 'That rule version is paused; the next stricter version will be evaluated.' : ''}`);
@@ -161,6 +164,14 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     if (row.gamma !== null) gammaByStrike.set(row.strike, (gammaByStrike.get(row.strike) ?? 0) + row.gamma * row.openInterest);
   }
   const topGamma = [...gammaByStrike.entries()].sort((a, b) => b[1] - a[1])[0];
+  const paperWins = journal.filter((row) => row.pnlR > 0).length;
+  const paperLosses = journal.filter((row) => row.pnlR < 0).length;
+  const paperNetR = journal.reduce((sum, row) => sum + row.pnlR, 0);
+  const paperGrossR = journal.reduce((sum, row) => sum + (row.grossPnlR ?? row.pnlR), 0);
+  const paperCostsR = journal.reduce((sum, row) => sum + (row.costR ?? 0), 0);
+  const paperWinR = journal.reduce((sum, row) => sum + Math.max(0, row.pnlR), 0);
+  const paperLossR = journal.reduce((sum, row) => sum + Math.min(0, row.pnlR), 0);
+  const paperProfitFactor = paperLossR < 0 ? paperWinR / Math.abs(paperLossR) : paperWinR > 0 ? Infinity : null;
   const completedBacktests = backtestTrades.filter((trade) => trade.outcome !== 'OPEN');
   const reviewedLosses = backtestTrades.filter((trade) => (trade.netPnlR ?? 0) < 0 && trade.lossReview).slice(-5).reverse();
   const backtestWins = completedBacktests.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
@@ -260,7 +271,21 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <div style={{ marginTop: 4 }}>No-trade is a valid outcome.</div>
     </div>}
     {notice && <div style={{ padding: '0 12px 9px', color: '#fbbf24', fontSize: 10 }}>{notice}</div>}
-    <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>Strategy test: {strategyVersion > 3 ? 'ALL VERSIONS PAUSED' : `V${strategyVersion} active`}; {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'WIN').length} wins / {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'LOSS').length} losses in recent log. A loss pauses that version and moves to stricter confluence rules.</div>
+    <div style={{ margin: '0 12px 9px', padding: '9px', border: '1px solid #263449', borderRadius: 4, background: '#0a1019', fontSize: 10 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center' }}>
+        <b style={{ color: '#cbd5e1' }}>PAPER FORWARD JOURNAL · {symbol} · {timeframe}</b>
+        <span>{journal.length} / 200 saved trades</span>
+        <span style={{ color: '#34d399' }}>Net wins {paperWins}</span>
+        <span style={{ color: '#fb7185' }}>Net losses {paperLosses}</span>
+        <span>Gross {paperGrossR >= 0 ? '+' : ''}{paperGrossR.toFixed(2)}R</span>
+        <span>Estimated costs −{paperCostsR.toFixed(2)}R</span>
+        <b style={{ color: paperNetR >= 0 ? '#34d399' : '#fb7185' }}>Net {paperNetR >= 0 ? '+' : ''}{paperNetR.toFixed(2)}R</b>
+        <span>Expectancy {journal.length ? `${(paperNetR / journal.length >= 0 ? '+' : '')}${(paperNetR / journal.length).toFixed(2)}R/trade` : '—'}</span>
+        <span>Profit factor {paperProfitFactor === null ? '—' : Number.isFinite(paperProfitFactor) ? paperProfitFactor.toFixed(2) : '∞'}</span>
+      </div>
+      <div style={{ marginTop: 5, color: '#64748b' }}>Stored in this browser for this symbol/timeframe; survives refresh and Render restarts and uses no MongoDB space. Clearing browser site data will remove it. Results include the fee/slippage assumptions recorded with each trade.</div>
+    </div>
+    <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>Strategy test: {strategyVersion > 3 ? 'ALL VERSIONS PAUSED' : `V${strategyVersion} active`}; {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'WIN').length} wins / {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'LOSS').length} losses in saved journal. A net loss pauses that version and moves to stricter confluence rules.</div>
     <details style={{ borderTop: '1px solid #1f2937' }}>
       <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10 }}>Recent paper decision log · {journal.length}</summary>
       {journal.length ? <div style={{ padding: '0 12px 10px', fontSize: 10, color: '#94a3b8' }}>{journal.map((row, index) => <div key={`${row.closedAt}-${index}`} style={{ padding: '4px 0' }}>{new Date(row.closedAt).toLocaleString('en-IN')} · V{row.strategyVersion} · {row.side} · {fmt(row.entry)} → {fmt(row.exit)} · <b style={{ color: row.result === 'WIN' ? '#34d399' : row.result === 'LOSS' ? '#fb7185' : '#fbbf24' }}>{row.result} {row.pnlR.toFixed(2)}R</b> · {row.reason}</div>)}</div> : <div style={{ padding: '0 12px 10px', fontSize: 10, color: '#64748b' }}>No closed paper trades yet.</div>}
