@@ -1,7 +1,9 @@
 ﻿import http from 'node:http';
 import dns from 'node:dns';
 
+// Force IPv4 DNS lookup first to prevent connection dropouts on cloud hosts
 dns.setDefaultResultOrder('ipv4first');
+
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -37,14 +39,37 @@ import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoH
 import { runOrderFlowCouncil, analyzeTradeOutcomeWithAI, type AgentSnapshot } from './agents/orderFlowCouncil.js';
 import { sendTradeEntryAlert, sendTradeOutcomeAlert, sendTelegramMessage } from './services/telegramService.js';
 
+// --- ROBUST ENVIRONMENT & RENDER SECRET FILES LOADER ---
 function loadProjectEnv(): void {
-  const candidates = [resolve(process.cwd(), '.env'), resolve(process.cwd(), '..', '.env')];
-  const envPath = candidates.find((candidate) => existsSync(candidate));
-  if (!envPath) return;
-  for (const line of readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!match || process.env[match[1]] !== undefined) continue;
-    process.env[match[1]] = match[2].replace(/^(['"])(.*)\1$/, '$2');
+  const candidates = [
+    resolve('/etc/secrets/.env'),
+    resolve('/etc/secrets/env'),
+    resolve(process.cwd(), '.env'),
+    resolve(process.cwd(), '..', '.env'),
+    resolve(process.cwd(), 'backend', '.env')
+  ];
+
+  for (const envPath of candidates) {
+    if (!existsSync(envPath)) continue;
+    try {
+      const content = readFileSync(envPath, 'utf8');
+      for (const line of content.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)$/);
+        if (!match) continue;
+        const key = match[1];
+        let val = match[2];
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (process.env[key] === undefined) {
+          process.env[key] = val;
+        }
+      }
+    } catch {
+      // ignore read issues
+    }
   }
 }
 loadProjectEnv();
@@ -277,7 +302,7 @@ async function getThirtyDayOpenInterest(symbol: string): Promise<Array<{ openInt
   }
 }
 
-// --- LIVE AUTONOMOUS TRADING & TELEGRAM STATE ---
+// --- MULTI-COIN LIVE TRADING ENGINE ---
 interface LiveActiveTrade {
   symbol: string;
   decision: 'LONG' | 'SHORT';
@@ -292,7 +317,6 @@ interface LiveActiveTrade {
   enteredAt: number;
 }
 
-// Track active positions per symbol across all supported coins
 const liveActiveTrades = new Map<string, LiveActiveTrade>();
 const liveLearnedLessons: string[] = [];
 let liveCouncilInFlight = false;
@@ -300,28 +324,26 @@ let isAutoTradingEnabled = true;
 let lastQuotaAlertTime = 0;
 let lastMissingConfigLogAt = 0;
 
-// Agar Groq / Gemini quota limit reach kare to Telegram par turant alert bhejo aur auto-trade pause karo
 async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
   const now = Date.now();
-  if (now - lastQuotaAlertTime < 5 * 60_000) return; // 5 minute me 1 baar hi Telegram par notify karo
+  if (now - lastQuotaAlertTime < 5 * 60_000) return;
   lastQuotaAlertTime = now;
-  isAutoTradingEnabled = false; // System khud auto pause ho jayega taaki rate limits aur na bigde
+  isAutoTradingEnabled = false;
 
   const alertText = `⚠️ <b>FLOWTERMINAL ALERT: API QUOTA EXHAUSTED</b>
 ━━━━━━━━━━━━━━━━━━━━
-🚨 <b>Status:</b> Groq / AI Provider rate limit ya daily quota reach ho gaya hai!
+🚨 <b>Status:</b> Groq / AI Provider rate limit reached!
 🔍 <b>Error:</b> <code>${errorMsg.slice(0, 160)}</code>
 
 ⏸️ <b>Auto Trader ko temporarly PAUSE kar diya gaya hai.</b>
-👉 Groq keys update karne ke baad UI se "RESUME AUTO" daba kar wapas start kar sakte ho.
+👉 Groq keys verify karein, fir UI se "RESUME AUTO" daba kar dubara chalu karein.
 ━━━━━━━━━━━━━━━━━━━━`;
 
   await sendTelegramMessage(alertText);
 }
 
-// Create HTTP server for REST endpoints
+// Create HTTP Server
 const server = http.createServer(async (req, res) => {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -733,7 +755,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Serve static Frontend UI in production
+  // Serve Frontend UI in Production
   if ((req.method === 'GET' || req.method === 'HEAD') && !parsed.pathname?.startsWith('/api/')) {
     const frontendDirectory = [
       resolve(process.cwd(), 'frontend', 'dist'),
@@ -762,7 +784,7 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// Bind WebSocket Server to existing HTTP server
+// Bind WebSocket Server to HTTP server
 const wss = new WebSocketServer({ server });
 const selectedSymbolByClient = new WeakMap<WebSocket, string>();
 const gatewayPort = Number(process.env.PORT) || LOCAL_GATEWAY_PORT;
@@ -823,14 +845,13 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
   broadcast(statusMsg);
 }
 
-// --- LIVE BAR PROCESSING, AUTONOMOUS TRADING & POST-MORTEM LEARNING ---
+// --- MULTI-COIN LIVE BAR PROCESSING & LEARNING ---
 async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar): Promise<void> {
-  // Agar auto-trading user ne pause ki hui hai, to execution aage nahi badhegi
   if (!isAutoTradingEnabled) {
     return;
   }
 
-  // 1. Is symbol ki open trade ko monitor karna (Zero AI cost - Node.js local math)
+  // 1. Check open position for this specific symbol
   const currentTrade = liveActiveTrades.get(symbol);
   if (currentTrade) {
     currentTrade.barsHeld += 1;
@@ -919,7 +940,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     }
   }
 
-  // 2. Agar is specific symbol par koi open trade nahi hai aur AI busy nahi hai, naya setup evaluate karo
+  // 2. Evaluate new setup across coins when no trade is active for this symbol
   if (!liveActiveTrades.has(symbol) && !liveCouncilInFlight) {
     const pipeline = marketPipelines.get(symbol);
     if (!pipeline) return;
@@ -933,7 +954,6 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     const isDeltaSpike = Math.abs(bar.delta) >= 20;
     const isFiveMinBoundary = bar.time % 300 === 0;
 
-    // Faltu bars par AI trigger nahi karenge (Rate limit aur token bachane ke liye)
     if (!isLocalExtreme && !isDeltaSpike && !isFiveMinBoundary) {
       return;
     }
@@ -948,7 +968,6 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         close: b.close
       }));
 
-      // MongoDB se purane lessons bhi include karo
       let persistentLessons: string[] = [];
       if (mongoHistory.connected) {
         persistentLessons = await mongoHistory.getLearnedLessons(10);
@@ -1030,7 +1049,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         const now = Date.now();
         if (now - lastMissingConfigLogAt > 60_000) {
           lastMissingConfigLogAt = now;
-          console.warn('[Live Council Error]: No AI provider is configured. Please check your .env in backend/.env');
+          console.warn('[Live Council Error]: No AI provider is configured. Set your 4 role keys in .env, then restart the backend.');
         }
       } else {
         console.warn('[Live Council Error]:', msg);
@@ -1086,14 +1105,16 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
         lastTradeReceivedAt = Date.now();
         tradeHistory.save(trades);
         if (process.env.MONGO_PERSIST_RAW_TRADES === 'true') queueMongoTrades(trades);
-        
-        // Broadcast raw trades to UI
-        const tradeMsg: TradeGatewayMessage = {
-          type: 'TRADE',
-          data: trades,
-          timestamp: Date.now()
-        };
-        broadcast(tradeMsg);
+
+        // BANDWIDTH SAVER: Raw tick trades broadcast disabled on cloud hosts
+        if (process.env.BROADCAST_RAW_TRADES === 'true') {
+          const tradeMsg: TradeGatewayMessage = {
+            type: 'TRADE',
+            data: trades,
+            timestamp: Date.now()
+          };
+          broadcast(tradeMsg);
+        }
 
         // Process in Order Flow Aggregator
         for (const trade of trades) {
@@ -1328,7 +1349,7 @@ wss.on('connection', (ws: WebSocket) => {
       if (request.type !== 'SELECT_SYMBOL' || typeof request.symbol !== 'string' || !SUPPORTED_SYMBOLS.includes(request.symbol as typeof SUPPORTED_SYMBOLS[number])) return;
       selectedSymbolByClient.set(ws, request.symbol);
       sendSymbolState(request.symbol);
-    } catch { /* Ignore malformed local client messages. */ }
+    } catch { /* Ignore malformed client messages */ }
   });
 
   ws.on('error', (err: Error) => {
