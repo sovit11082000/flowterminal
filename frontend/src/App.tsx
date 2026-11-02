@@ -23,8 +23,6 @@ import IcebergSignals from './components/IcebergSignals.js';
 import AgentCouncilPanel from './components/AgentCouncilPanel.js';
 import GammaLevelsPanel, { type Snapshot as GammaSnapshot } from './components/GammaLevelsPanel.js';
 import { analyzeSmartMoney, drawSmartMoneyOverlay, type SmartMoneyAnalysis, type SmartMoneyFeatures } from './components/SmartMoneyOverlay.js';
-import { backtestMtfSmcIct, backtestMtfSmcIctV2, backtestOrderFlow, backtestSmcIct, drawBacktestMarkers, type BacktestCostAssumptions, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
-import { calculateVolumeProfile } from './components/VolumeProfileCalculator.js';
 import {
   Trade,
   NormalizedCandle,
@@ -62,9 +60,6 @@ const formatIndiaCrosshairTime = (time: Time): string => new Intl.DateTimeFormat
   timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
 }).format(toChartDate(time));
 const buildCandleChartData = (candles: CachedCandle[], _timeframe: CandleTimeframe) => {
-  // Do not insert WhitespaceData for missing timestamps. It creates visible
-  // empty candle slots and makes healthy bars look like a broken feed. Keep
-  // real exchange timestamps; the time labels will naturally skip missing data.
   const candleData: CandlestickData<UTCTimestamp>[] = [];
   const volumeData: HistogramData<UTCTimestamp>[] = [];
 
@@ -96,8 +91,6 @@ const findCandleRepairRanges = (candles: CachedCandle[], timeframe: CandleTimefr
   const ranges: CandleRepairRange[] = [];
   let active: CandleRepairRange | null = null;
   for (let time = earliestSec; time <= latestSec; time += intervalSec) {
-    // Always refresh the current and previous two bars, because the latest
-    // exchange candle may have changed while this browser was closed.
     const needsRepair = !present.has(time) || time >= latestSec - intervalSec * 2;
     if (needsRepair) {
       if (active && time === active.endSec + intervalSec) active.endSec = time;
@@ -111,29 +104,18 @@ const findCandleRepairRanges = (candles: CachedCandle[], timeframe: CandleTimefr
     }
   }
   if (active) ranges.push(active);
-  // Repair the newest bars first so a short catch-up request updates the live
-  // edge before older holes are filled.
   return ranges.sort((a, b) => b.startSec - a.startSec);
 };
+
+// Strictly Top 3 Coins
 const MARKETS = [
   { symbol: 'BTCUSDT', name: 'Bitcoin' },
   { symbol: 'ETHUSDT', name: 'Ethereum' },
   { symbol: 'SOLUSDT', name: 'Solana' }
 ] as const;
 
-const BACKTEST_COSTS_KEY = 'flowterminal_backtest_costs_v1';
-function loadBacktestCosts(): BacktestCostAssumptions {
-  try {
-    const saved = JSON.parse(localStorage.getItem(BACKTEST_COSTS_KEY) ?? 'null') as Partial<BacktestCostAssumptions> | null;
-    if (saved && Number.isFinite(saved.feeBpsPerSide) && Number.isFinite(saved.slippageBpsPerSide)) {
-      return { feeBpsPerSide: Math.max(0, saved.feeBpsPerSide!), slippageBpsPerSide: Math.max(0, saved.slippageBpsPerSide!) };
-    }
-  } catch { /* use the visible baseline assumptions below */ }
-  return { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 };
-}
-
 export default function App() {
-  const [gatewayConnected, setGatewayConnected] = useState<boolean>(false);
+  const [gatewayConnected, setGatewayConnected] = useState(false);
   const [marketStatus, setMarketStatus] = useState<ConnectionStatus>('DISCONNECTED');
   const [bestBid, setBestBid] = useState<number | null>(null);
   const [bestAsk, setBestAsk] = useState<number | null>(null);
@@ -145,15 +127,9 @@ export default function App() {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [heatmapSnapshot, setHeatmapSnapshot] = useState<{ samples: BookSample[]; trades: TradeDot[] }>({ samples: [], trades: [] });
   const [tradeReplayBars, setTradeReplayBars] = useState<SerializedFootprintBar[]>([]);
-  const [tradeReplayInfo, setTradeReplayInfo] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; sourceTradeCount: number; windowHours: number }>({ status: 'idle', sourceTradeCount: 0, windowHours: 48 });
-  const [historicalBookSamples, setHistoricalBookSamples] = useState<BookSample[]>([]);
-  const [historicalBookStatus, setHistoricalBookStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [derivativesSnapshot, setDerivativesSnapshot] = useState<DerivativesPayload | null>(null);
-  const [historicalOI, setHistoricalOI] = useState<OIHistoryPoint[]>([]);
-  const [historicalOIStatus, setHistoricalOIStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  const [backtestCosts, setBacktestCosts] = useState<BacktestCostAssumptions>(loadBacktestCosts);
   const [gammaSnapshot, setGammaSnapshot] = useState<GammaSnapshot | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('BTCUSDT');
+  const [selectedSymbol, setSelectedSymbol] = useState('BTCUSDT');
   const [selectedTimeframe, setSelectedTimeframe] = useState<CandleTimeframe>('1m');
   const supportsFootprint = selectedTimeframe === '1m' || selectedTimeframe === '5m';
   const [displayMode, setDisplayMode] = useState<ChartDisplayMode>('Candles');
@@ -177,8 +153,6 @@ export default function App() {
   orderBookBidsRef.current = orderBookBids;
   const orderBookAsksRef = useRef(orderBookAsks);
   orderBookAsksRef.current = orderBookAsks;
-  const backtestTradesRef = useRef<BacktestTrade[]>([]);
-  const liveSetupRef = useRef<TradeSetup | null>(null);
   const [fixedProfileRange, setFixedProfileRange] = useState<[number, number] | null>(null);
   const [profileRangeStart, setProfileRangeStart] = useState<number | null>(null);
   const [profileShelfX, setProfileShelfX] = useState(8);
@@ -210,18 +184,18 @@ export default function App() {
 
   // Persistence & Coverage States
   const [historySyncStatus, setHistorySyncStatus] = useState<'IDLE' | 'SYNCING' | 'SYNCED' | 'FAILED'>('IDLE');
-  const [totalCandlesCount, setTotalCandlesCount] = useState<number>(0);
-  const [historyRangeText, setHistoryRangeText] = useState<string>('Checking storage...');
+  const [totalCandlesCount, setTotalCandlesCount] = useState(0);
+  const [historyRangeText, setHistoryRangeText] = useState('Checking storage...');
   const [latestCandleTime, setLatestCandleTime] = useState<number | null>(null);
-  const [isDataDesynced, setIsDataDesynced] = useState<boolean>(false);
-  const [zoomWarning, setZoomWarning] = useState<boolean>(false);
+  const [isDataDesynced, setIsDataDesynced] = useState(false);
+  const [zoomWarning, setZoomWarning] = useState(false);
 
   // Jump to Date/Time state
-  const [targetDateTime, setTargetDateTime] = useState<string>('');
+  const [targetDateTime, setTargetDateTime] = useState('');
 
   // HUD / Crosshair State
   const [crosshairInfo, setCrosshairInfo] = useState<CrosshairBarInfo | null>(null);
-  const [isAutoScale, setIsAutoScale] = useState<boolean>(true);
+  const [isAutoScale, setIsAutoScale] = useState(true);
   const [drawingChartApi, setDrawingChartApi] = useState<IChartApi | null>(null);
   const [drawingCandleSeriesApi, setDrawingCandleSeriesApi] = useState<ISeriesApi<'Candlestick'> | null>(null);
   const lastTickerUiUpdateRef = useRef(0);
@@ -246,11 +220,13 @@ export default function App() {
   selectedTimeframeRef.current = selectedTimeframe;
   const selectedSymbolRef = useRef(selectedSymbol);
   selectedSymbolRef.current = selectedSymbol;
+
   useEffect(() => {
     if (gatewaySocketRef.current?.readyState === WebSocket.OPEN) {
       gatewaySocketRef.current.send(JSON.stringify({ type: 'SELECT_SYMBOL', symbol: selectedSymbol }));
     }
   }, [selectedSymbol]);
+
   const loadedSymbolRef = useRef(selectedSymbol);
   const latestCandleTimeRef = useRef<number | null>(null);
 
@@ -261,11 +237,17 @@ export default function App() {
   const profileViewModeRef = useRef(profileViewMode);
   profileViewModeRef.current = profileViewMode;
 
-  const candlesCacheRef = useRef<Record<CandleTimeframe, Map<number, CachedCandle>>>(Object.fromEntries(TIMEFRAMES.map((tf) => [tf, new Map()])) as Record<CandleTimeframe, Map<number, CachedCandle>>);
+  const candlesCacheRef = useRef<Record<CandleTimeframe, Map<number, CachedCandle>>>(
+    Object.fromEntries(TIMEFRAMES.map((tf) => [tf, new Map()])) as Record<CandleTimeframe, Map<number, CachedCandle>>
+  );
 
-  const footprintBarsRef = useRef<Record<CandleTimeframe, Map<number, SerializedFootprintBar>>>(Object.fromEntries(TIMEFRAMES.map((tf) => [tf, new Map()])) as Record<CandleTimeframe, Map<number, SerializedFootprintBar>>);
+  const footprintBarsRef = useRef<Record<CandleTimeframe, Map<number, SerializedFootprintBar>>>(
+    Object.fromEntries(TIMEFRAMES.map((tf) => [tf, new Map()])) as Record<CandleTimeframe, Map<number, SerializedFootprintBar>>
+  );
 
-  const latestLiveCandleRef = useRef<Record<CandleTimeframe, CachedCandle | null>>(Object.fromEntries(TIMEFRAMES.map((tf) => [tf, null])) as Record<CandleTimeframe, CachedCandle | null>);
+  const latestLiveCandleRef = useRef<Record<CandleTimeframe, CachedCandle | null>>(
+    Object.fromEntries(TIMEFRAMES.map((tf) => [tf, null])) as Record<CandleTimeframe, CachedCandle | null>
+  );
   const animationFrameIdRef = useRef<number | null>(null);
 
   // 1. Footprint Overlay Canvas Renderer
@@ -294,8 +276,6 @@ export default function App() {
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, displayWidth, displayHeight);
 
-    // Mark the selected fixed-profile candle range directly on the chart.
-    // The connector joins the close of the first clicked candle to the second.
     const selectionTimes = profileRangeClickOrderRef.current;
     const pendingStart = selectionTimes ? null : profileRangeStartRef.current;
     if (profileModeRef.current === 'Range' && (selectionTimes || pendingStart !== null)) {
@@ -361,42 +341,61 @@ export default function App() {
 
     const smc = smcFeaturesRef.current;
     if (smc.structure || smc.liquidity || smc.zones) {
-      drawSmartMoneyOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, candles: smcCandlesRef.current, features: smc, footprints: footprintBarsRef.current[currentTimeframe], analysis: smcAnalysisRef.current ?? undefined });
+      drawSmartMoneyOverlay({
+        ctx,
+        chart,
+        series: candleSeries,
+        width: displayWidth,
+        height: displayHeight,
+        candles: smcCandlesRef.current,
+        features: smc,
+        footprints: footprintBarsRef.current[currentTimeframe],
+        analysis: smcAnalysisRef.current ?? undefined
+      });
     }
 
     if (heatmapEnabledRef.current) {
-      drawOrderBookLiquidityOverlay({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, samples: heatmapSnapshotRef.current.samples, timeframeSeconds: TIMEFRAME_SECONDS[currentTimeframe], liveBids: orderBookBidsRef.current, liveAsks: orderBookAsksRef.current, currentCandleTime: latestCandleTimeRef.current });
+      drawOrderBookLiquidityOverlay({
+        ctx,
+        chart,
+        series: candleSeries,
+        width: displayWidth,
+        height: displayHeight,
+        samples: heatmapSnapshotRef.current.samples,
+        timeframeSeconds: TIMEFRAME_SECONDS[currentTimeframe],
+        liveBids: orderBookBidsRef.current,
+        liveAsks: orderBookAsksRef.current,
+        currentCandleTime: latestCandleTimeRef.current
+      });
     }
 
-    drawBacktestMarkers({ ctx, chart, series: candleSeries, width: displayWidth, height: displayHeight, trades: backtestTradesRef.current, liveSetup: liveSetupRef.current });
-
     const gamma = gammaSnapshotRef.current;
-      if (gamma && gamma.baseCoin === selectedSymbolRef.current.replace(/USDT$/, '')) {
-        const byStrike = new Map<number, { calls: number; puts: number; grossGamma: number }>();
-        for (const row of gamma.rows) {
-          const value = byStrike.get(row.strike) ?? { calls: 0, puts: 0, grossGamma: 0 };
-          if (row.optionType === 'CALL') value.calls += row.openInterest;
-          else value.puts += row.openInterest;
-          if (row.gamma !== null) value.grossGamma += row.gamma * row.openInterest;
-          byStrike.set(row.strike, value);
-        }
-        const levels = [...byStrike.entries()];
-        const callWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.calls > best[1] ? [strike, value.calls] : best, null);
-        const putWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.puts > best[1] ? [strike, value.puts] : best, null);
-        const gammaWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.grossGamma > best[1] ? [strike, value.grossGamma] : best, null);
-        const drawOptionLevel = (entry: [number, number] | null, label: string, color: string) => {
-          if (!entry || entry[1] <= 0) return;
-          const y = candleSeries.priceToCoordinate(entry[0]);
-          if (y === null || y < 0 || y > displayHeight) return;
-          ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.setLineDash([5, 4]);
-          ctx.beginPath(); ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(displayWidth - 4, Math.round(y) + 0.5); ctx.stroke();
-          ctx.setLineDash([]); ctx.font = '10px monospace'; ctx.textAlign = 'right';
-          ctx.fillText(`${label} ${entry[0].toLocaleString()} · ${gamma.source.split(' ')[0]}`, displayWidth - 8, Math.max(11, y - 3)); ctx.restore();
-        };
-        drawOptionLevel(callWall, 'CALL OI WALL', '#34d399');
-        drawOptionLevel(putWall, 'PUT OI WALL', '#fb7185');
-        drawOptionLevel(gammaWall, 'MAX Γ×OI', '#fbbf24');
+    if (gamma && gamma.baseCoin === selectedSymbolRef.current.replace(/USDT$/, '')) {
+      const byStrike = new Map<number, { calls: number; puts: number; grossGamma: number }>();
+      for (const row of gamma.rows) {
+        const value = byStrike.get(row.strike) ?? { calls: 0, puts: 0, grossGamma: 0 };
+        if (row.optionType === 'CALL') value.calls += row.openInterest;
+        else value.puts += row.openInterest;
+        if (row.gamma !== null) value.grossGamma += row.gamma * row.openInterest;
+        byStrike.set(row.strike, value);
       }
+      const levels = [...byStrike.entries()];
+      const callWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.calls > best[1] ? [strike, value.calls] : best, null);
+      const putWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.puts > best[1] ? [strike, value.puts] : best, null);
+      const gammaWall = levels.reduce<[number, number] | null>((best, [strike, value]) => !best || value.grossGamma > best[1] ? [strike, value.grossGamma] : best, null);
+      const drawOptionLevel = (entry: [number, number] | null, label: string, color: string) => {
+        if (!entry || entry[1] <= 0) return;
+        const y = candleSeries.priceToCoordinate(entry[0]);
+        if (y === null || y < 0 || y > displayHeight) return;
+        ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.setLineDash([5, 4]);
+        ctx.beginPath(); ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(displayWidth - 4, Math.round(y) + 0.5); ctx.stroke();
+        ctx.setLineDash([]); ctx.font = '10px monospace'; ctx.textAlign = 'right';
+        ctx.fillText(`${label} ${entry[0].toLocaleString()} · ${gamma.source.split(' ')[0]}`, displayWidth - 8, Math.max(11, y - 3)); ctx.restore();
+      };
+      drawOptionLevel(callWall, 'CALL OI WALL', '#34d399');
+      drawOptionLevel(putWall, 'PUT OI WALL', '#fb7185');
+      drawOptionLevel(gammaWall, 'MAX Γ×OI', '#fbbf24');
+    }
 
     if (currentMode === 'Candles') {
       setZoomWarning(false);
@@ -471,9 +470,6 @@ export default function App() {
         ctx.fillText(`Δ ${bar.delta > 0 ? '+' : ''}${bar.delta.toFixed(1)}`, xCoord, topY + 10);
       }
 
-      // At wide price ranges many 0.1-tick levels map to the same pixels. Combine
-      // them into screen-sized rows so volumes stay legible instead of painting
-      // thousands of fixed-height rectangles over one another.
       const rowHeight = Math.max(7, Math.min(18, Math.floor(barSpacing * 0.55)));
       const grouped = new Map<number, { y: number; bid: number; ask: number; hasPoc: boolean }>();
       for (const level of bar.priceLevels) {
@@ -492,6 +488,7 @@ export default function App() {
         bid: row.bid > 0 && row.bid >= row.ask * 3,
         ask: row.ask > 0 && row.ask >= row.bid * 3
       }));
+
       for (let index = 0; index < rows.length; index++) {
         const row = rows[index];
         const rowTop = row.y - rowHeight / 2;
@@ -814,13 +811,10 @@ export default function App() {
     scheduleOverlayRedraw();
   }, [displayMode, scheduleOverlayRedraw]);
 
-  // ANCHOR: Automatically scroll to live edge (Rightmost end) without wall-clock drift
   const scrollToLiveEdge = (totalBars: number) => {
     const latestTime = latestCandleTimeRef.current;
     if (!chartInstanceRef.current || totalBars === 0 || latestTime === null) return;
     const windowSize = displayModeRef.current === 'Footprint' ? 22 : 90;
-    // Logical indexes count actual candles and keep the initial view consistent
-    // even when the exchange history has missing timestamps.
     chartInstanceRef.current.timeScale().setVisibleLogicalRange({
       from: Math.max(0, totalBars - windowSize),
       to: totalBars + 8
@@ -885,7 +879,6 @@ export default function App() {
 
       // Step B: REST Historical Fetch
       try {
-        // Load captured trade-derived footprints independently of Bybit's candle service.
         try {
           const profileFootprintTimeframe = timeframe === '5m' ? '5m' : '1m';
           const footprintResponse = await fetch(apiUrl(`/api/footprint/history?symbol=${symbol}&timeframe=${profileFootprintTimeframe}`));
@@ -952,8 +945,6 @@ export default function App() {
             if (freshCandles.length) await saveCandlesToDB(symbol, timeframe, freshCandles);
             successfulRanges++;
 
-            // Paint after each range. Since ranges are newest-first, live bars
-            // appear as soon as their small repair request completes.
             const liveCandle = latestLiveCandleRef.current[timeframe];
             if (liveCandle) candlesCacheRef.current[timeframe].set(liveCandle.time, liveCandle);
             const mergedSorted = Array.from(candlesCacheRef.current[timeframe].values()).sort((a, b) => a.time - b.time);
@@ -1034,165 +1025,158 @@ export default function App() {
       };
 
       ws.onmessage = (event) => {
-      if (disposed || activeSocket !== ws) return;
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'STATUS') {
-          if (msg.symbol && msg.symbol !== selectedSymbolRef.current) return;
-          setMarketStatus(msg.status);
-          if ((msg.status === 'DISCONNECTED' || msg.status === 'DESYNCHRONIZED') &&
-            (!msg.symbol || msg.symbol === selectedSymbolRef.current)) {
-            setBestBid(null);
-            setBestAsk(null);
-          }
-        } else if (msg.type === 'TICKER') {
-          if (msg.data?.symbol === selectedSymbolRef.current) {
-            setLastTradeAt(Date.now());
-            if (Date.now() - lastTickerUiUpdateRef.current >= 500) {
-              lastTickerUiUpdateRef.current = Date.now();
-              setLiveTicker({ ...msg.data, timestamp: msg.timestamp });
+        if (disposed || activeSocket !== ws) return;
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'STATUS') {
+            if (msg.symbol && msg.symbol !== selectedSymbolRef.current) return;
+            setMarketStatus(msg.status);
+            if ((msg.status === 'DISCONNECTED' || msg.status === 'DESYNCHRONIZED') &&
+              (!msg.symbol || msg.symbol === selectedSymbolRef.current)) {
+              setBestBid(null);
+              setBestAsk(null);
             }
-          }
-        } else if (msg.type === 'TRADE') {
-          const selectedTrades = (msg.data as Trade[]).filter((trade) => trade.symbol === selectedSymbolRef.current);
-          if (selectedTrades.length) {
+          } else if (msg.type === 'TICKER') {
+            if (msg.data?.symbol === selectedSymbolRef.current) {
+              setLastTradeAt(Date.now());
+              if (Date.now() - lastTickerUiUpdateRef.current >= 500) {
+                lastTickerUiUpdateRef.current = Date.now();
+                setLiveTicker({ ...msg.data, timestamp: msg.timestamp });
+              }
+            }
+          } else if (msg.type === 'TRADE') {
+            const selectedTrades = (msg.data as Trade[]).filter((trade) => trade.symbol === selectedSymbolRef.current);
+            if (selectedTrades.length) {
+              setLastUpdateTs(msg.timestamp);
+              const newestExchangeTrade = Math.max(...selectedTrades.map((trade) => trade.timestamp));
+              setLastTradeAt((previous) => previous === null ? newestExchangeTrade : Math.max(previous, newestExchangeTrade));
+              setTrades((prev) => [...selectedTrades, ...prev].slice(0, 100));
+            }
+          } else if (msg.type === 'ORDERBOOK_SNAPSHOT' || msg.type === 'ORDERBOOK_DELTA') {
+            if (msg.data.symbol !== selectedSymbolRef.current) return;
+            const shouldUpdateBookUi = Date.now() - lastBookUiUpdateRef.current >= 100;
+            if (shouldUpdateBookUi) lastBookUiUpdateRef.current = Date.now();
+            if (shouldUpdateBookUi) setLastUpdateTs(msg.timestamp);
+            if (shouldUpdateBookUi && msg.data.bestBid !== undefined) setBestBid(msg.data.bestBid);
+            if (shouldUpdateBookUi && msg.data.bestAsk !== undefined) setBestAsk(msg.data.bestAsk);
+            if (shouldUpdateBookUi && Array.isArray(msg.data.bids)) setOrderBookBids(msg.data.bids as BookLevel[]);
+            if (shouldUpdateBookUi && Array.isArray(msg.data.asks)) setOrderBookAsks(msg.data.asks as BookLevel[]);
+
+            const latestLiveCandle = latestLiveCandleRef.current[selectedTimeframeRef.current];
+            if (latestLiveCandle && msg.data.bestBid && msg.data.bestAsk) {
+              const midpoint = (msg.data.bestBid + msg.data.bestAsk) / 2;
+              const diffPct = Math.abs(latestLiveCandle.close - midpoint) / midpoint;
+              setIsDataDesynced(diffPct > 0.015);
+            }
+          } else if (msg.type === 'CANDLE') {
+            const c: NormalizedCandle = msg.data;
+            if (c.symbol !== selectedSymbolRef.current) return;
             setLastUpdateTs(msg.timestamp);
-            // Show exchange event time, not local message arrival time. A delayed
-            // feed must not look live merely because an old packet just arrived.
-            const newestExchangeTrade = Math.max(...selectedTrades.map((trade) => trade.timestamp));
-            setLastTradeAt((previous) => previous === null ? newestExchangeTrade : Math.max(previous, newestExchangeTrade));
-            setTrades((prev) => [...selectedTrades, ...prev].slice(0, 100));
-          }
-        } else if (msg.type === 'LIQUIDATION') {
-          // Liquidation events remain available from the backend API, but they
-          // are not shown as execution bubbles: their reported price is bankruptcy price.
-        } else if (msg.type === 'ORDERBOOK_SNAPSHOT' || msg.type === 'ORDERBOOK_DELTA') {
-          if (msg.data.symbol !== selectedSymbolRef.current) return;
-          const shouldUpdateBookUi = Date.now() - lastBookUiUpdateRef.current >= 100;
-          if (shouldUpdateBookUi) lastBookUiUpdateRef.current = Date.now();
-          if (shouldUpdateBookUi) setLastUpdateTs(msg.timestamp);
-          if (shouldUpdateBookUi && msg.data.bestBid !== undefined) setBestBid(msg.data.bestBid);
-          if (shouldUpdateBookUi && msg.data.bestAsk !== undefined) setBestAsk(msg.data.bestAsk);
-          if (shouldUpdateBookUi && Array.isArray(msg.data.bids)) setOrderBookBids(msg.data.bids as BookLevel[]);
-          if (shouldUpdateBookUi && Array.isArray(msg.data.asks)) setOrderBookAsks(msg.data.asks as BookLevel[]);
+            setLastTradeAt(Date.now());
+            void saveCandlesToDB(c.symbol, c.timeframe, [{
+              time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume
+            }]);
 
-          const latestLiveCandle = latestLiveCandleRef.current[selectedTimeframeRef.current];
-          if (latestLiveCandle && msg.data.bestBid && msg.data.bestAsk) {
-            const midpoint = (msg.data.bestBid + msg.data.bestAsk) / 2;
-            const diffPct = Math.abs(latestLiveCandle.close - midpoint) / midpoint;
-            setIsDataDesynced(diffPct > 0.015);
-          }
-        } else if (msg.type === 'CANDLE') {
-          const c: NormalizedCandle = msg.data;
-          if (c.symbol !== selectedSymbolRef.current) return;
-          setLastUpdateTs(msg.timestamp);
-          void saveCandlesToDB(c.symbol, c.timeframe, [{
-            time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume
-          }]);
+            const updatedCandle: CachedCandle = {
+              time: c.time,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+              volume: c.volume
+            };
+            const previousChartTime = latestCandleTimeRef.current;
 
-          const updatedCandle: CachedCandle = {
-            time: c.time,
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-            volume: c.volume
-          };
-          const previousChartTime = latestCandleTimeRef.current;
+            const previousLatest = latestLiveCandleRef.current[c.timeframe];
+            if (!previousLatest || c.time >= previousLatest.time) {
+              latestLiveCandleRef.current[c.timeframe] = updatedCandle;
+            }
 
-          const previousLatest = latestLiveCandleRef.current[c.timeframe];
-          if (!previousLatest || c.time >= previousLatest.time) {
-            latestLiveCandleRef.current[c.timeframe] = updatedCandle;
-          }
+            const activeCache = candlesCacheRef.current[c.timeframe];
+            activeCache.set(c.time, updatedCandle);
+            if (c.timeframe === selectedTimeframeRef.current &&
+              (latestCandleTimeRef.current === null || c.time >= latestCandleTimeRef.current)) {
+              latestCandleTimeRef.current = c.time;
+              setLatestCandleTime(c.time);
+            }
 
-          const activeCache = candlesCacheRef.current[c.timeframe];
-          activeCache.set(c.time, updatedCandle);
-          if (c.timeframe === selectedTimeframeRef.current &&
-            (latestCandleTimeRef.current === null || c.time >= latestCandleTimeRef.current)) {
-            latestCandleTimeRef.current = c.time;
-            setLatestCandleTime(c.time);
-          }
-
-          if (c.timeframe === selectedTimeframeRef.current) {
-            if (candleSeriesRef.current) {
-              if (previousChartTime !== null && c.time < previousChartTime) {
-                const sorted = Array.from(activeCache.values()).sort((a, b) => a.time - b.time);
-                const chartData = buildCandleChartData(sorted, c.timeframe);
-                candleSeriesRef.current.setData(chartData.candleData);
-                volumeSeriesRef.current?.setData(chartData.volumeData);
-              } else {
-                candleSeriesRef.current.update({
+            if (c.timeframe === selectedTimeframeRef.current) {
+              if (candleSeriesRef.current) {
+                if (previousChartTime !== null && c.time < previousChartTime) {
+                  const sorted = Array.from(activeCache.values()).sort((a, b) => a.time - b.time);
+                  const chartData = buildCandleChartData(sorted, c.timeframe);
+                  candleSeriesRef.current.setData(chartData.candleData);
+                  volumeSeriesRef.current?.setData(chartData.volumeData);
+                } else {
+                  candleSeriesRef.current.update({
+                    time: c.time as UTCTimestamp,
+                    open: c.open,
+                    high: c.high,
+                    low: c.low,
+                    close: c.close
+                  });
+                }
+              }
+              if (volumeSeriesRef.current && (previousChartTime === null || c.time >= previousChartTime)) {
+                volumeSeriesRef.current.update({
                   time: c.time as UTCTimestamp,
-                  open: c.open,
-                  high: c.high,
-                  low: c.low,
-                  close: c.close
+                  value: c.volume,
+                  color: c.close >= c.open ? 'rgba(16, 185, 129, 0.4)' : 'rgba(239, 68, 68, 0.4)'
                 });
               }
             }
-            if (volumeSeriesRef.current && (previousChartTime === null || c.time >= previousChartTime)) {
-              volumeSeriesRef.current.update({
-                time: c.time as UTCTimestamp,
-                value: c.volume,
-                color: c.close >= c.open ? 'rgba(16, 185, 129, 0.4)' : 'rgba(239, 68, 68, 0.4)'
-              });
-            }
-            // The chart already shifts when a new bar arrives. Reapplying a
-            // time range for every trade made the live chart visibly jump and
-            // repeatedly reset the user's zoom.
-          }
+          } else if (msg.type === 'FOOTPRINT_BAR') {
+            setLastUpdateTs(msg.timestamp);
+            setLastTradeAt(Date.now());
+            const rawTf: unknown = msg.timeframe;
 
-        } else if (msg.type === 'FOOTPRINT_BAR') {
-          setLastUpdateTs(msg.timestamp);
-          const rawTf: unknown = msg.timeframe;
+            if (TIMEFRAMES.includes(rawTf as CandleTimeframe)) {
+              const tf = rawTf as CandleTimeframe;
+              const fp = msg.data as SerializedFootprintBar;
+              if (!fp || fp.symbol !== selectedSymbolRef.current) return;
+              if (typeof fp.time === 'number' && Array.isArray(fp.priceLevels)) {
+                const targetStore = footprintBarsRef.current[tf];
+                targetStore.set(fp.time, fp);
 
-          if (TIMEFRAMES.includes(rawTf as CandleTimeframe)) {
-            const tf = rawTf as CandleTimeframe;
-            const fp = msg.data as SerializedFootprintBar;
-            if (!fp || fp.symbol !== selectedSymbolRef.current) return;
-            if (typeof fp.time === 'number' && Array.isArray(fp.priceLevels)) {
-              const targetStore = footprintBarsRef.current[tf];
-              targetStore.set(fp.time, fp);
-
-              if (targetStore.size > 20_000) {
-                const oldestKey = targetStore.keys().next().value;
-                if (oldestKey !== undefined) {
-                  targetStore.delete(oldestKey);
+                if (targetStore.size > 20_000) {
+                  const oldestKey = targetStore.keys().next().value;
+                  if (oldestKey !== undefined) {
+                    targetStore.delete(oldestKey);
+                  }
                 }
-              }
 
-              if (tf === selectedTimeframeRef.current && deltaSeriesRef.current) {
-                const previousDeltaTime = Array.from(targetStore.keys()).reduce((latest, time) => Math.max(latest, time), 0);
-                if (fp.time < previousDeltaTime) {
-                  const ordered = Array.from(targetStore.values()).sort((a, b) => a.time - b.time);
-                  deltaSeriesRef.current.setData(ordered.map((bar) => ({
-                    time: bar.time as UTCTimestamp,
-                    value: bar.delta,
-                    color: bar.delta >= 0 ? '#10b981' : '#ef4444'
-                  })));
-                  cvdSeriesRef.current?.setData(ordered.map((bar) => ({
-                    time: bar.time as UTCTimestamp,
-                    value: bar.cumulativeDelta
-                  })));
-                } else {
-                  deltaSeriesRef.current.update({
-                    time: fp.time as UTCTimestamp,
-                    value: fp.delta,
-                    color: fp.delta >= 0 ? '#10b981' : '#ef4444'
-                  });
-                  cvdSeriesRef.current?.update({
-                    time: fp.time as UTCTimestamp,
-                    value: fp.cumulativeDelta
-                  });
+                if (tf === selectedTimeframeRef.current && deltaSeriesRef.current) {
+                  const previousDeltaTime = Array.from(targetStore.keys()).reduce((latest, time) => Math.max(latest, time), 0);
+                  if (fp.time < previousDeltaTime) {
+                    const ordered = Array.from(targetStore.values()).sort((a, b) => a.time - b.time);
+                    deltaSeriesRef.current.setData(ordered.map((bar) => ({
+                      time: bar.time as UTCTimestamp,
+                      value: bar.delta,
+                      color: bar.delta >= 0 ? '#10b981' : '#ef4444'
+                    })));
+                    cvdSeriesRef.current?.setData(ordered.map((bar) => ({
+                      time: bar.time as UTCTimestamp,
+                      value: bar.cumulativeDelta
+                    })));
+                  } else {
+                    deltaSeriesRef.current.update({
+                      time: fp.time as UTCTimestamp,
+                      value: fp.delta,
+                      color: fp.delta >= 0 ? '#10b981' : '#ef4444'
+                    });
+                    cvdSeriesRef.current?.update({
+                      time: fp.time as UTCTimestamp,
+                      value: fp.cumulativeDelta
+                    });
+                  }
                 }
+                if (tf === (selectedTimeframeRef.current === '5m' ? '5m' : '1m')) scheduleOverlayRedraw();
               }
-              if (tf === (selectedTimeframeRef.current === '5m' ? '5m' : '1m')) scheduleOverlayRedraw();
             }
           }
+        } catch (err) {
+          console.error('Failed to parse gateway message:', err);
         }
-      } catch (err) {
-        console.error('Failed to parse gateway message:', err);
-      }
       };
     };
 
@@ -1206,7 +1190,6 @@ export default function App() {
     };
   }, [scheduleOverlayRedraw]);
 
-  // Jump To Specific Historical Date & Time Action
   const handleJumpToDateTime = () => {
     if (!targetDateTime || !chartInstanceRef.current) return;
     const targetTimestampSec = Math.floor(new Date(targetDateTime).getTime() / 1000);
@@ -1248,28 +1231,6 @@ export default function App() {
     scheduleOverlayRedraw();
   };
 
-  const handleExportBacktestCandles = async () => {
-    try {
-      const response = await fetch(apiUrl('/api/history?symbol=BTCUSDT&timeframe=1m'));
-      if (!response.ok) throw new Error(`History request failed (${response.status})`);
-      const payload = await response.json();
-      const candles = Array.isArray(payload.candles) ? payload.candles : [];
-      if (!candles.length) throw new Error('No BTCUSDT 1m candles were returned.');
-      const rows = ['time,open,high,low,close,volume', ...candles.map((c: CachedCandle) =>
-        `${new Date(c.time * 1000).toISOString()},${c.open},${c.high},${c.low},${c.close},${c.volume}`)];
-      const blobUrl = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' }));
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = 'BTCUSDT_1m_backtest_candles.csv';
-      link.click();
-      URL.revokeObjectURL(blobUrl);
-      setHistoryRangeText(`Downloaded ${candles.length.toLocaleString()} BTCUSDT 1m candles`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      window.alert(`Candle download failed: ${message}`);
-    }
-  };
-
   const handleToggleAutoScale = () => {
     if (!chartInstanceRef.current) return;
     const nextState = !isAutoScale;
@@ -1300,107 +1261,23 @@ export default function App() {
   const activeLatestFp = activeLatestBar
     ? footprintBarsRef.current[selectedTimeframe].get(activeLatestBar.time)
     : undefined;
+
   const onHeatmapSnapshot = useCallback((snapshot: { samples: BookSample[]; trades: TradeDot[] }) => setHeatmapSnapshot(snapshot), []);
   const onDerivativesSnapshot = useCallback((snapshot: DerivativesPayload | null) => setDerivativesSnapshot(snapshot), []);
   const onGammaSnapshot = useCallback((snapshot: GammaSnapshot | null) => setGammaSnapshot(snapshot), []);
-  const selectedProfile = useMemo(() => fixedProfileRange
-    ? calculateVolumeProfile(footprintBarsRef.current[selectedTimeframe].values(), selectedSymbol, Math.min(...fixedProfileRange), Math.max(...fixedProfileRange))
-    : null, [fixedProfileRange, selectedTimeframe, selectedSymbol, lastUpdateTs]);
+
   const signalCandles = useMemo(() => Array.from(candlesCacheRef.current[selectedTimeframe].values())
     .sort((a, b) => a.time - b.time)
     .map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
-  [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
-  const oneMinuteSignalCandles = useMemo(() => Array.from(candlesCacheRef.current['1m'].values())
-    .sort((a, b) => a.time - b.time)
-    .map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
-  [selectedSymbol, selectedTimeframe, totalCandlesCount, latestCandleTime]);
+    [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
+
   const signalFootprints = useMemo(() => {
     const byTime = new Map<number, SerializedFootprintBar>();
     for (const bar of tradeReplayBars) if (bar.symbol === selectedSymbol && bar.timeframe === selectedTimeframe) byTime.set(bar.time, bar);
-    // Exchange-captured persistent bars replace reconstructed values where
-    // both sources overlap; the reconstructed raw-trade history fills older gaps.
     for (const bar of footprintBarsRef.current[selectedTimeframe].values()) byTime.set(bar.time, bar);
     return [...byTime.values()].sort((a, b) => a.time - b.time);
   }, [tradeReplayBars, selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
-  const replayOIHistory = useMemo(() => {
-    const points = new Map<string, OIHistoryPoint>();
-    for (const point of historicalOI) points.set(String(point.timestamp), point);
-    if (derivativesSnapshot?.symbol === selectedSymbol) {
-      for (const point of derivativesSnapshot.openInterest) points.set(String(point.timestamp), point);
-    }
-    return [...points.values()].sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
-  }, [historicalOI, derivativesSnapshot, selectedSymbol]);
-  const replayDerivativesSnapshot = useMemo(() => derivativesSnapshot?.symbol === selectedSymbol
-    ? { ...derivativesSnapshot, openInterest: replayOIHistory }
-    : replayOIHistory.length
-      ? { symbol: selectedSymbol, ticker: null, openInterest: replayOIHistory, fundingHistory: [], fetchedAt: Date.now() }
-      : null, [derivativesSnapshot, replayOIHistory, selectedSymbol]);
-  useEffect(() => {
-    if (!supportsFootprint) { setHistoricalOIStatus('idle'); return; }
-    let cancelled = false;
-    const load = async () => {
-      setHistoricalOIStatus('loading');
-      try {
-            const response = await fetch(apiUrl(`/api/derivatives/history?symbol=${encodeURIComponent(selectedSymbol)}`));
-        if (!response.ok) throw new Error('Historical OI unavailable');
-        const payload = await response.json() as { symbol: string; openInterest?: OIHistoryPoint[] };
-        if (!cancelled && payload.symbol === selectedSymbol && Array.isArray(payload.openInterest)) {
-          setHistoricalOI(payload.openInterest);
-          setHistoricalOIStatus('ready');
-        }
-      } catch {
-        if (!cancelled) setHistoricalOIStatus('error');
-      }
-    };
-    setHistoricalOI([]);
-    void load();
-    // A full 30-day cursor scan is intentionally one-shot per symbol. The
-    // minute derivatives snapshot is merged above for the freshest points.
-    return () => { cancelled = true; };
-  }, [selectedSymbol, supportsFootprint]);
-  useEffect(() => {
-    if (!supportsFootprint) {
-      setTradeReplayBars([]);
-      setTradeReplayInfo({ status: 'idle', sourceTradeCount: 0, windowHours: 48 });
-      return;
-    }
-    let cancelled = false;
-    const timeframe = selectedTimeframe as '1m' | '5m';
-    setTradeReplayBars([]);
-    setTradeReplayInfo({ status: 'loading', sourceTradeCount: 0, windowHours: 48 });
-    void fetch(apiUrl(`/api/footprint/replay?symbol=${encodeURIComponent(selectedSymbol)}&timeframe=${timeframe}&hours=48`))
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Mongo raw-trade replay unavailable');
-        return await response.json() as { symbol: string; timeframe: string; windowHours: number; sourceTradeCount: number; bars: SerializedFootprintBar[] };
-      })
-      .then((payload) => {
-        if (cancelled || payload.symbol !== selectedSymbol || payload.timeframe !== timeframe) return;
-        setTradeReplayBars(Array.isArray(payload.bars) ? payload.bars : []);
-        setTradeReplayInfo({ status: 'ready', sourceTradeCount: Number(payload.sourceTradeCount) || 0, windowHours: payload.windowHours });
-      })
-      .catch(() => { if (!cancelled) setTradeReplayInfo({ status: 'error', sourceTradeCount: 0, windowHours: 48 }); });
-    return () => { cancelled = true; };
-  }, [selectedSymbol, selectedTimeframe, supportsFootprint]);
-  useEffect(() => {
-    if (!supportsFootprint) { setHistoricalBookSamples([]); setHistoricalBookStatus('idle'); return; }
-    let cancelled = false;
-    const end = Date.now();
-    const start = end - 24 * 60 * 60_000;
-    setHistoricalBookSamples([]);
-    setHistoricalBookStatus('loading');
-    void fetch(apiUrl(`/api/orderbook/history?symbol=${encodeURIComponent(selectedSymbol)}&start=${start}&end=${end}&limit=10000`))
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Saved order-book history unavailable');
-        return await response.json() as { symbol: string; samples: BookSample[] };
-      })
-      .then((payload) => {
-        if (cancelled || payload.symbol !== selectedSymbol) return;
-        setHistoricalBookSamples(Array.isArray(payload.samples) ? payload.samples : []);
-        setHistoricalBookStatus('ready');
-      })
-      .catch(() => { if (!cancelled) setHistoricalBookStatus('error'); });
-    return () => { cancelled = true; };
-  }, [selectedSymbol, supportsFootprint]);
+
   const structureCandles = useMemo(() => {
     const interval = TIMEFRAME_SECONDS[selectedTimeframe];
     const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
@@ -1408,25 +1285,11 @@ export default function App() {
       .filter((candle) => candle.time >= cutoff && candle.time + interval <= Math.floor(Date.now() / 1000))
       .sort((a, b) => a.time - b.time);
   }, [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
+
   smcCandlesRef.current = structureCandles;
   const smartMoneyAnalysis = useMemo(() => analyzeSmartMoney(structureCandles), [structureCandles]);
   smcAnalysisRef.current = smartMoneyAnalysis;
-  const publishActivePaperSetup = useCallback((setup: TradeSetup | null) => {
-    liveSetupRef.current = setup;
-    scheduleOverlayRedraw();
-  }, [scheduleOverlayRedraw]);
-  const backtestTrades = useMemo(() => backtestSmcIct(signalCandles, TIMEFRAME_SECONDS[selectedTimeframe], backtestCosts),
-    [signalCandles, selectedTimeframe, backtestCosts]);
-  const mtfBacktestTrades = useMemo(() => backtestMtfSmcIct(oneMinuteSignalCandles, backtestCosts),
-    [oneMinuteSignalCandles, backtestCosts]);
-  const mtfV2BacktestTrades = useMemo(() => backtestMtfSmcIctV2(oneMinuteSignalCandles, backtestCosts),
-    [oneMinuteSignalCandles, backtestCosts]);
-  const orderFlowBacktestTrades = useMemo(() => signalFootprints.some((bar) => bar.isClosed)
-    ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200, backtestCosts, historicalBookSamples)
-    : [], [signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe, backtestCosts, historicalBookSamples]);
-  useEffect(() => { localStorage.setItem(BACKTEST_COSTS_KEY, JSON.stringify(backtestCosts)); }, [backtestCosts]);
-  backtestTradesRef.current = backtestTrades;
-  useEffect(() => { scheduleOverlayRedraw(); }, [backtestTrades, scheduleOverlayRedraw]);
+
   useEffect(() => { scheduleOverlayRedraw(); }, [smartMoneyAnalysis, scheduleOverlayRedraw]);
 
   return (
@@ -1560,11 +1423,11 @@ export default function App() {
                 color: '#fff', border: 'none', padding: '4px 10px', borderRadius: '4px',
                 cursor: 'pointer', fontSize: '12px', marginLeft: '4px'
               }}
-              title="Show bid/ask liquidity bands and persistent walls directly on the candle chart"
+              title="Show bid/ask liquidity bands directly on the candle chart"
             >
               Heatmap {heatmapEnabled ? 'ON' : 'OFF'}
             </button>
-            {heatmapEnabled && <span style={{ fontSize: 9, color: '#64748b' }}><span style={{ color: '#22d3ee' }}>■ BID</span> · <span style={{ color: '#c084fc' }}>■ ASK</span> · dotted = persistent wall</span>}
+            {heatmapEnabled && <span style={{ fontSize: 9, color: '#64748b' }}><span style={{ color: '#22d3ee' }}>■ BID</span> · <span style={{ color: '#c084fc' }}>■ ASK</span></span>}
 
             <div style={{ position: 'relative', display: 'inline-flex' }}>
               <button
@@ -1581,13 +1444,6 @@ export default function App() {
                 ] as const).map(([key, label]) => <label key={key} style={{ display: 'flex', gap: 7, alignItems: 'center', margin: '8px 2px', fontSize: 10, cursor: 'pointer' }}>
                   <input type="checkbox" checked={smcFeatures[key]} onChange={(event) => setSmcFeatures((current) => ({ ...current, [key]: event.target.checked }))} />{label}
                 </label>)}
-                <div style={{ margin: '8px 2px 1px', fontSize: 9, lineHeight: 1.6 }}>
-                  <div><span style={{ color: '#60a5fa' }}>BOS</span> · <span style={{ color: '#fbbf24' }}>CHoCH</span> · <span style={{ color: '#c084fc' }}>MSS</span></div>
-                  <div><span style={{ color: '#f97316' }}>Inducement</span> · <span style={{ color: '#22d3ee' }}>FVG</span> · <span style={{ color: '#a855f7' }}>Order block</span></div>
-                  <div><span style={{ color: '#fbbf24' }}>PDH / PDL</span> · prior-day range; midpoint separates premium and discount</div>
-                  <div><span style={{ color: '#cbd5e1' }}>PO3 ACC</span> → <span style={{ color: '#f97316' }}>MANIP</span> → <span style={{ color: '#34d399' }}>DIST</span> only after sequence confirms</div>
-                  <div style={{ color: '#64748b', marginTop: 4 }}>BOS/CHoCH lines run from the confirmed swing to the break candle. EQH/EQL needs 2+ confirmed touches and a pullback. Structure is closed-candle only; inducement is labeled after its confirming break.</div>
-                </div>
               </div>}
             </div>
 
@@ -1604,9 +1460,6 @@ export default function App() {
                     {mode === 'Range' ? 'Select candle range' : 'Off · hide profile'}
                   </button>
                 ))}
-                {profileMode === 'Range' && <div style={{ margin: '4px 2px 10px', color: '#c4b5fd', fontSize: 10, lineHeight: 1.5 }}>
-                  {profileRangeStart !== null ? 'Step 2/2 · click the ending candle. Click the same candle again for its full profile.' : fixedProfileRange ? 'Range selected · choose Select candle range again to change it.' : 'Click the starting candle, then the ending candle. For one candle, click it twice.'}
-                </div>}
                 {profileMode !== 'Off' && <>
                   <label style={{ display: 'block', fontSize: 10, color: '#94a3b8', fontWeight: 700, margin: '8px 2px 5px' }}>PROFILE DISPLAY</label>
                   <select value={profileViewMode} onChange={(event) => setProfileViewMode(event.target.value as VolumeProfileViewMode)} style={{ width: '100%', padding: 6, color: '#e2e8f0', background: '#172033', border: '1px solid #475569', borderRadius: 4, fontSize: 11 }}>
@@ -1615,7 +1468,6 @@ export default function App() {
                     <option value="Net Delta">Net delta · red / green</option>
                   </select>
                 </>}
-                <div style={{ margin: '8px 2px 1px', color: '#64748b', fontSize: 9, lineHeight: 1.45 }}>Works on every chart interval. Profile uses locally recorded trades; a range with missing recording will be marked partial.</div>
               </div>}
             </div>
 
@@ -1623,14 +1475,10 @@ export default function App() {
               Coverage: {historyRangeText}
             </span>
             <span style={{ fontSize: '11px', color: '#38bdf8', marginLeft: '6px' }}>
-              Latest candle: {latestCandleTime !== null ? new Date(latestCandleTime * 1000).toLocaleString() : 'waiting for data'}
+              Latest: {latestCandleTime !== null ? new Date(latestCandleTime * 1000).toLocaleTimeString() : 'waiting'}
             </span>
             <span style={{ fontSize: '11px', color: '#a5b4fc', marginLeft: '6px' }}>
-              Bybit last: {tickerForSelected?.lastPrice?.toFixed(2) ?? '—'}
-              {tickerForSelected?.markPrice ? ` · Mark: ${tickerForSelected.markPrice.toFixed(2)}` : ''}
-              {activeLatestBar && tickerForSelected?.lastPrice ? ` · chart diff: ${(activeLatestBar.close - tickerForSelected.lastPrice).toFixed(2)}` : ''}
-              {tickerForSelected ? ` · ${Math.max(0, Math.round((Date.now() - tickerForSelected.timestamp) / 1000))}s` : ' · waiting for Bybit ticker'}
-              {` · trades ${lastTradeAt === null ? 'waiting' : `${Math.max(0, Math.round((Date.now() - lastTradeAt) / 1000))}s ago`}`}
+              Price: {tickerForSelected?.lastPrice?.toFixed(2) ?? activeLatestBar?.close?.toFixed(2) ?? '—'}
             </span>
 
             {zoomWarning && displayMode !== 'Candles' && (
@@ -1670,13 +1518,6 @@ export default function App() {
               Go to Live
             </button>
             <button
-              onClick={handleExportBacktestCandles}
-              style={{ background: '#1e293b', color: '#a7f3d0', border: '1px solid #334155', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px', fontWeight: 'bold' }}
-              title="Download the available BTCUSDT 1-minute candle history as CSV"
-            >
-              Download 1m Backtest Data
-            </button>
-            <button
               onClick={handleToggleAutoScale}
               style={{ background: isAutoScale ? '#1e293b' : '#374151', color: isAutoScale ? '#10b981' : '#9ca3af', border: '1px solid #334155', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px' }}
             >
@@ -1691,15 +1532,30 @@ export default function App() {
           </div>
         </div>
 
-        <div aria-label="Select market for candle chart and heatmap" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 5, margin: '0 0 8px', padding: '6px 8px', border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019' }}>
-          <span style={{ marginRight: 4, color: '#94a3b8', fontSize: 10, fontWeight: 700 }}>CHART + HEATMAP</span>
-          {MARKETS.map((market) => <button
-            key={market.symbol}
-            aria-pressed={selectedSymbol === market.symbol}
-            title={`${market.name} · ${market.symbol}`}
-            onClick={() => setSelectedSymbol(market.symbol)}
-            style={{ background: selectedSymbol === market.symbol ? '#1d4ed8' : '#172033', color: selectedSymbol === market.symbol ? '#fff' : '#cbd5e1', border: `1px solid ${selectedSymbol === market.symbol ? '#3b82f6' : '#334155'}`, borderRadius: 4, padding: '4px 7px', cursor: 'pointer', fontFamily: 'monospace', fontSize: 10, fontWeight: selectedSymbol === market.symbol ? 800 : 600 }}
-          >{market.symbol}</button>)}
+        {/* TOP 3 MARKETS SELECTOR */}
+        <div aria-label="Select market for candle chart and heatmap" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, margin: '0 0 8px', padding: '6px 8px', border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019' }}>
+          <span style={{ marginRight: 6, color: '#94a3b8', fontSize: 10, fontWeight: 700 }}>SELECT MARKET:</span>
+          {MARKETS.map((market) => (
+            <button
+              key={market.symbol}
+              aria-pressed={selectedSymbol === market.symbol}
+              title={`${market.name} · ${market.symbol}`}
+              onClick={() => setSelectedSymbol(market.symbol)}
+              style={{
+                background: selectedSymbol === market.symbol ? '#1d4ed8' : '#172033',
+                color: selectedSymbol === market.symbol ? '#fff' : '#cbd5e1',
+                border: `1px solid ${selectedSymbol === market.symbol ? '#3b82f6' : '#334155'}`,
+                borderRadius: 4,
+                padding: '4px 12px',
+                cursor: 'pointer',
+                fontFamily: 'monospace',
+                fontSize: 11,
+                fontWeight: selectedSymbol === market.symbol ? 800 : 600
+              }}
+            >
+              {market.symbol} ({market.name})
+            </button>
+          ))}
         </div>
 
         {/* OHLCV & Footprint Delta HUD Strip */}
@@ -1802,35 +1658,41 @@ export default function App() {
           />
         </div>
 
-        {/* Order-flow pane is backed by captured trade clusters for 1m/5m only. */}
-        {supportsFootprint ? <div style={{ marginTop: '8px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', fontSize: '11px', color: '#94a3b8' }}>
-            <span style={{ fontWeight: 'bold' }}>DELTA BARS + CVD</span>
-            <span>Delta: green = buyers, red = sellers · Book liquidity is overlaid on candles when Heatmap is ON</span>
+        {supportsFootprint ? (
+          <div style={{ marginTop: '8px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', fontSize: '11px', color: '#94a3b8' }}>
+              <span style={{ fontWeight: 'bold' }}>DELTA BARS + CVD</span>
+              <span>Delta: green = buyers, red = sellers · Book liquidity is overlaid on candles when Heatmap is ON</span>
+            </div>
+            <div ref={deltaContainerRef} style={{ width: '100%', height: '140px' }} />
           </div>
-          <div ref={deltaContainerRef} style={{ width: '100%', height: '140px' }} />
-        </div> : <div style={{ marginTop: 8, color: '#64748b', fontSize: 11 }}>
-          Delta, CVD and footprint data are available on 1m and 5m intervals.
-        </div>}
+        ) : (
+          <div style={{ marginTop: 8, color: '#64748b', fontSize: 11 }}>
+            Delta, CVD and footprint data are available on 1m and 5m intervals.
+          </div>
+        )}
       </section>
 
       <OrderBookHeatmap symbol={selectedSymbol} enabled={heatmapEnabled} renderPanel={false} onSnapshot={onHeatmapSnapshot} />
 
       <AlertManager symbol={selectedSymbol} price={activeLatestBar?.close ?? null} delta={activeLatestFp?.delta ?? null} />
-      {supportsFootprint && <AgentCouncilPanel
-        symbol={selectedSymbol}
-        timeframe={selectedTimeframe === '5m' ? '5m' : '1m'}
-        feedStatus={marketStatus}
-        lastTradeAt={lastTradeAt}
-        price={tickerForSelected?.lastPrice ?? activeLatestBar?.close ?? null}
-        candles={signalCandles}
-        footprints={signalFootprints}
-        trades={trades}
-        bids={orderBookBids}
-        asks={orderBookAsks}
-        analysis={smartMoneyAnalysis}
-      />}
-      
+
+      {/* Autonomous Multi-Agent Council & Real-Time Trading Engine */}
+      {supportsFootprint && (
+        <AgentCouncilPanel
+          symbol={selectedSymbol}
+          timeframe={selectedTimeframe === '5m' ? '5m' : '1m'}
+          feedStatus={marketStatus}
+          lastTradeAt={lastTradeAt}
+          price={tickerForSelected?.lastPrice ?? activeLatestBar?.close ?? null}
+          candles={signalCandles}
+          footprints={signalFootprints}
+          trades={trades}
+          bids={orderBookBids}
+          asks={orderBookAsks}
+          analysis={smartMoneyAnalysis}
+        />
+      )}
 
       <section style={{ marginTop: 16 }}>
         <DOMLadder symbol={selectedSymbol} bids={orderBookBids} asks={orderBookAsks} />
@@ -1840,7 +1702,7 @@ export default function App() {
       <GammaLevelsPanel symbol={selectedSymbol} onSnapshot={onGammaSnapshot} />
 
       {/* Verified Trades Stream Table */}
-      <section>
+      <section style={{ marginTop: 16 }}>
         <h3 style={{ margin: '0 0 8px 0', fontSize: '14px' }}>Verified Public Trades Stream</h3>
         <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '12px' }}>
           <thead>
