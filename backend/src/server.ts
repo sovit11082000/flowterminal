@@ -1,4 +1,7 @@
 ﻿import http from 'node:http';
+import dns from 'node:dns';
+
+dns.setDefaultResultOrder('ipv4first');
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -12,10 +15,12 @@ import {
   OrderBookDeltaGatewayMessage,
   CandleGatewayMessage,
   FootprintBarGatewayMessage,
+  SerializedFootprintBar,
   CandleTimeframe,
   FootprintTimeframe,
   NormalizedLiquidation,
-  NormalizedCandle
+  NormalizedCandle,
+  NormalizedTrade
 } from './types/market.js';
 import { parsePublicTradePayload } from './normalizers/tradeNormalizer.js';
 import { OrderBookState } from './normalizers/orderbookNormalizer.js';
@@ -29,7 +34,8 @@ import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
 import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoHistoryStore.js';
-import { runOrderFlowCouncil, type AgentSnapshot } from './agents/orderFlowCouncil.js';
+import { runOrderFlowCouncil, analyzeTradeOutcomeWithAI, type AgentSnapshot } from './agents/orderFlowCouncil.js';
+import { sendTradeEntryAlert, sendTradeOutcomeAlert } from './services/telegramService.js';
 
 function loadProjectEnv(): void {
   const candidates = [resolve(process.cwd(), '.env'), resolve(process.cwd(), '..', '.env')];
@@ -69,8 +75,37 @@ const marketPipelines = new Map<string, MarketPipeline>(SUPPORTED_SYMBOLS.map((s
   }
 }]));
 
-const restService = new BybitRestService();
-const optionsService = new BybitOptionsService();
+const BYBIT_REST_BASE = (process.env.BYBIT_REST_URL?.trim() || 'https://api.bytick.com').replace(/\/+$/, '');
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 6500): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchBybitRest(endpoint: string, init?: RequestInit): Promise<Response> {
+  const mirrors = [
+    BYBIT_REST_BASE,
+    BYBIT_REST_BASE.includes('bytick') ? 'https://api.bybit.com' : 'https://api.bytick.com'
+  ];
+  let lastError: unknown;
+  for (const base of mirrors) {
+    try {
+      const res = await fetchWithTimeout(`${base}${endpoint}`, init, 6500);
+      if (res.ok) return res;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Bybit REST unreachable for ${endpoint}`);
+}
+
+const restService = new BybitRestService({ baseUrl: BYBIT_REST_BASE });
+const optionsService = new BybitOptionsService(BYBIT_REST_BASE);
 const binanceOptionsService = new BinanceOptionsService();
 const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
@@ -78,11 +113,18 @@ const liquidationHistory = new LiquidationHistoryStore();
 const mongoHistory = new MongoHistoryStore();
 type MongoWriteTask = { label: string; priority: number; write: () => Promise<void> };
 const mongoWriteQueue: MongoWriteTask[] = [];
-const MAX_PENDING_MONGO_WRITES = 128;
-const MAX_ACTIVE_MONGO_WRITES = 3;
+const MAX_PENDING_MONGO_WRITES = 1024;
+const MAX_ACTIVE_MONGO_WRITES = 12;
+const MONGO_TRADE_FLUSH_MS = 1_500;
+const MAX_BUFFERED_MONGO_TRADES = 25_000;
+const MAX_TRADES_PER_MONGO_BATCH = 5_000;
+const lastOrderBookPersistAtBySymbol = new Map<string, number>();
+const ORDERBOOK_MONGO_SAMPLE_MS = 15_000;
 let activeMongoWrites = 0;
 let lastMongoQueueWarningAt = 0;
 const droppedMongoWrites: Record<string, number> = {};
+const bufferedMongoTrades: NormalizedTrade[] = [];
+let mongoTradeFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
 function mongoWritePriority(label: string): number {
   if (label === 'footprint bar') return 3;
@@ -138,6 +180,29 @@ function persistToMongo(label: string, write: () => Promise<void>): void {
   drainMongoWriteQueue();
 }
 
+function flushBufferedMongoTrades(): void {
+  if (mongoTradeFlushTimer) clearTimeout(mongoTradeFlushTimer);
+  mongoTradeFlushTimer = null;
+  if (!bufferedMongoTrades.length) return;
+  const batch = bufferedMongoTrades.splice(0, MAX_TRADES_PER_MONGO_BATCH);
+  persistToMongo('trades', () => mongoHistory.saveTrades(batch));
+  if (bufferedMongoTrades.length) mongoTradeFlushTimer = setTimeout(flushBufferedMongoTrades, 0);
+}
+
+function queueMongoTrades(trades: NormalizedTrade[]): void {
+  bufferedMongoTrades.push(...trades);
+  if (bufferedMongoTrades.length > MAX_BUFFERED_MONGO_TRADES) {
+    const excess = bufferedMongoTrades.length - MAX_BUFFERED_MONGO_TRADES;
+    bufferedMongoTrades.splice(0, excess);
+    recordDroppedMongoWrite('trades');
+  }
+  if (bufferedMongoTrades.length >= MAX_TRADES_PER_MONGO_BATCH) {
+    flushBufferedMongoTrades();
+  } else if (!mongoTradeFlushTimer) {
+    mongoTradeFlushTimer = setTimeout(flushBufferedMongoTrades, MONGO_TRADE_FLUSH_MS);
+  }
+}
+
 async function waitForMongoWrites(maxWaitMs = 20_000): Promise<void> {
   const deadline = Date.now() + maxWaitMs;
   while ((mongoWriteQueue.length > 0 || activeMongoWrites > 0) && Date.now() < deadline) {
@@ -160,6 +225,7 @@ const liveTickerBySymbol = new Map<string, { lastPrice: number | null; markPrice
 const latestExchangeCandles = new Map<string, NormalizedCandle>();
 const firstFootprintBarByKey = new Map<string, number>();
 const derivativesHistoryCache = new Map<string, { expiresAt: number; points: Array<{ openInterest: string; timestamp: string }> }>();
+const liveDerivativesCache = new Map<string, { expiresAt: number; data: any }>();
 const derivativesHistoryPending = new Map<string, Promise<Array<{ openInterest: string; timestamp: string }>>>();
 
 async function loadThirtyDayOpenInterest(symbol: string): Promise<Array<{ openInterest: string; timestamp: string }>> {
@@ -167,20 +233,25 @@ async function loadThirtyDayOpenInterest(symbol: string): Promise<Array<{ openIn
   const startTime = now - 30 * 24 * 60 * 60 * 1000;
   const collected = new Map<string, { openInterest: string; timestamp: string }>();
   let cursor: string | undefined;
-  for (let page = 0; page < 60; page++) {
+  for (let page = 0; page < 25; page++) {
     const query = new URLSearchParams({ category: 'linear', symbol, intervalTime: '5min', startTime: String(startTime), endTime: String(now), limit: '200' });
     if (cursor) query.set('cursor', cursor);
-    const response = await fetch(`https://api.bybit.com/v5/market/open-interest?${query}`);
-    if (!response.ok) throw new Error('Bybit OI history endpoint unavailable.');
-    const payload = await response.json() as { retCode?: number; result?: { list?: Array<{ openInterest: string; timestamp: string }>; nextPageCursor?: string } };
-    if (payload.retCode !== 0 || !payload.result) throw new Error('Bybit returned invalid OI history.');
-    for (const point of payload.result.list ?? []) {
-      const timestamp = Number(point.timestamp);
-      if (Number.isFinite(timestamp) && timestamp >= startTime && timestamp <= now) collected.set(String(timestamp), point);
+    try {
+      const response = await fetchBybitRest(`/v5/market/open-interest?${query}`);
+      if (!response.ok) break;
+      const payload = await response.json() as { retCode?: number; result?: { list?: Array<{ openInterest: string; timestamp: string }>; nextPageCursor?: string } };
+      if (payload.retCode !== 0 || !payload.result) break;
+      for (const point of payload.result.list ?? []) {
+        const timestamp = Number(point.timestamp);
+        if (Number.isFinite(timestamp) && timestamp >= startTime && timestamp <= now) collected.set(String(timestamp), point);
+      }
+      const next = payload.result.nextPageCursor;
+      if (!next || next === cursor || !(payload.result.list?.length)) break;
+      cursor = next;
+    } catch {
+      if (collected.size > 0) break;
+      throw new Error('Bybit OI history endpoint timed out.');
     }
-    const next = payload.result.nextPageCursor;
-    if (!next || next === cursor || !(payload.result.list?.length)) break;
-    cursor = next;
   }
   return [...collected.values()].sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
 }
@@ -427,28 +498,57 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Unsupported symbol.' }));
       return;
     }
-    try {
-      const base = 'https://api.bybit.com/v5/market';
-      const requests = [
-        fetch(`${base}/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`),
-        fetch(`${base}/open-interest?category=linear&symbol=${encodeURIComponent(symbol)}&intervalTime=5min&limit=200`),
-        fetch(`${base}/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=200`)
-      ];
-      const responses = await Promise.all(requests);
-      if (responses.some((response) => !response.ok)) throw new Error('Bybit derivatives endpoint unavailable.');
-      const [tickerPayload, oiPayload, fundingPayload] = await Promise.all(responses.map((response) => response.json())) as any[];
-      const payloads = [tickerPayload, oiPayload, fundingPayload];
-      if (payloads.some((payload) => payload.retCode !== 0)) throw new Error('Bybit returned an invalid derivatives response.');
+    const cached = liveDerivativesCache.get(symbol);
+    if (cached && cached.expiresAt > Date.now()) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
+      res.end(JSON.stringify(cached.data));
+      return;
+    }
+    try {
+      const [tickerRes, oiRes, fundingRes] = await Promise.allSettled([
+        fetchBybitRest(`/v5/market/tickers?category=linear&symbol=${encodeURIComponent(symbol)}`),
+        fetchBybitRest(`/v5/market/open-interest?category=linear&symbol=${encodeURIComponent(symbol)}&intervalTime=5min&limit=200`),
+        fetchBybitRest(`/v5/market/funding/history?category=linear&symbol=${encodeURIComponent(symbol)}&limit=200`)
+      ]);
+      const parseSafe = async (settled: PromiseSettledResult<Response>) => {
+        if (settled.status !== 'fulfilled' || !settled.value.ok) return null;
+        try {
+          const json = await settled.value.json() as { retCode?: number; result?: { list?: any[] } };
+          return json.retCode === 0 ? (json.result?.list ?? null) : null;
+        } catch {
+          return null;
+        }
+      };
+      const [tickerList, oiList, fundingList] = await Promise.all([
+        parseSafe(tickerRes),
+        parseSafe(oiRes),
+        parseSafe(fundingRes)
+      ]);
+      if (!tickerList && !oiList && !fundingList) {
+        if (cached) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(cached.data));
+          return;
+        }
+        throw new Error('Bybit derivatives endpoints timed out.');
+      }
+      const data = {
         symbol,
-        ticker: tickerPayload.result?.list?.[0] ?? null,
-        openInterest: oiPayload.result?.list ?? [],
-        fundingHistory: fundingPayload.result?.list ?? [],
+        ticker: tickerList?.[0] ?? cached?.data.ticker ?? null,
+        openInterest: oiList ?? cached?.data.openInterest ?? [],
+        fundingHistory: fundingList ?? cached?.data.fundingHistory ?? [],
         fetchedAt: Date.now()
-      }));
+      };
+      liveDerivativesCache.set(symbol, { expiresAt: Date.now() + 30_000, data });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
     } catch (error) {
-      console.warn('[Derivatives] Bybit request failed:', error);
+      if (cached) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(cached.data));
+        return;
+      }
+      console.warn('[Derivatives] Bybit request failed:', error instanceof Error ? error.message : error);
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Could not load current Bybit derivatives data.' }));
     }
@@ -552,6 +652,7 @@ const server = http.createServer(async (req, res) => {
       memory: { heapUsedMb: Math.round(memory.heapUsed / 1_048_576), rssMb: Math.round(memory.rss / 1_048_576) },
       mongoWriteQueue: {
         pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES,
+        bufferedTrades: bufferedMongoTrades.length,
         dropped: { ...droppedMongoWrites },
         pendingByType: mongoWriteQueue.reduce<Record<string, number>>((counts, task) => {
           counts[task.label] = (counts[task.label] ?? 0) + 1;
@@ -658,6 +759,209 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
   broadcast(statusMsg);
 }
 
+
+// --- LIVE AUTONOMOUS TRADING & TELEGRAM ALERT ENGINE ---
+interface LiveActiveTrade {
+  symbol: string;
+  decision: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  targetR: number;
+  reasons: string[];
+  strategies: string[];
+  summary: string;
+  barsHeld: number;
+  enteredAt: number;
+}
+
+let liveActiveTrade: LiveActiveTrade | null = null;
+const liveLearnedLessons: string[] = [];
+let liveCouncilInFlight = false;
+
+async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar): Promise<void> {
+  // 1. Monitor open trade outcome in real-time (Node.js does this with zero AI cost)
+  if (liveActiveTrade && liveActiveTrade.symbol === symbol) {
+    liveActiveTrade.barsHeld += 1;
+    let outcome: 'WIN' | 'LOSS' | 'OPEN' = 'OPEN';
+    let exitPrice = bar.close;
+
+    if (liveActiveTrade.decision === 'LONG') {
+      if (bar.low <= liveActiveTrade.stopPrice) {
+        outcome = 'LOSS';
+        exitPrice = liveActiveTrade.stopPrice;
+      } else if (bar.high >= liveActiveTrade.targetPrice) {
+        outcome = 'WIN';
+        exitPrice = liveActiveTrade.targetPrice;
+      }
+    } else {
+      if (bar.high >= liveActiveTrade.stopPrice) {
+        outcome = 'LOSS';
+        exitPrice = liveActiveTrade.stopPrice;
+      } else if (bar.low <= liveActiveTrade.targetPrice) {
+        outcome = 'WIN';
+        exitPrice = liveActiveTrade.targetPrice;
+      }
+    }
+
+    if (outcome !== 'OPEN' || liveActiveTrade.barsHeld >= 15) {
+      const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN'
+        ? outcome
+        : (liveActiveTrade.decision === 'LONG' ? (exitPrice >= liveActiveTrade.entryPrice ? 'WIN' : 'LOSS') : (exitPrice <= liveActiveTrade.entryPrice ? 'WIN' : 'LOSS'));
+
+      const risk = Math.abs(liveActiveTrade.entryPrice - liveActiveTrade.stopPrice) || 1;
+      const diff = liveActiveTrade.decision === 'LONG' ? exitPrice - liveActiveTrade.entryPrice : liveActiveTrade.entryPrice - exitPrice;
+      const pnlR = Number((diff / risk).toFixed(2));
+      const finishedTrade = { ...liveActiveTrade };
+      liveActiveTrade = null;
+
+      console.log(`[Live Trade Resolved] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
+
+      const forwardContext = resolvedOutcome === 'WIN'
+        ? `Target reached at $${exitPrice.toFixed(1)} within ${finishedTrade.barsHeld} bars with strong order-flow continuation.`
+        : `Stop loss hit at $${exitPrice.toFixed(1)} within ${finishedTrade.barsHeld} bars.`;
+
+      void analyzeTradeOutcomeWithAI(
+        {
+          decision: finishedTrade.decision,
+          entryPrice: finishedTrade.entryPrice,
+          stopPrice: finishedTrade.stopPrice,
+          targetPrice: finishedTrade.targetPrice,
+          reasons: finishedTrade.reasons,
+          summary: finishedTrade.summary
+        },
+        {
+          outcome: resolvedOutcome,
+          exitPrice,
+          exitReason: resolvedOutcome === 'WIN' ? 'Hit Target (+2R)' : 'Hit Stop Loss (-1R)',
+          marketContext: forwardContext
+        }
+      ).then(async (insight) => {
+        if (resolvedOutcome === 'LOSS') {
+          liveLearnedLessons.push(insight);
+          console.log(`[Live AI Post-Mortem Rule]: "${insight}"`);
+        } else {
+          console.log(`[Live AI Win Signature]: "${insight}"`);
+        }
+
+        await sendTradeOutcomeAlert({
+          symbol,
+          decision: finishedTrade.decision,
+          outcome: resolvedOutcome,
+          entryPrice: finishedTrade.entryPrice,
+          exitPrice,
+          pnlR,
+          barsHeld: finishedTrade.barsHeld,
+          lessonLearned: insight
+        });
+      }).catch((e) => console.warn('[Live AI Learning Warning]:', e instanceof Error ? e.message : e));
+
+      return;
+    }
+  }
+
+  // 2. If no active trade is open, run smart market trigger
+  if (!liveActiveTrade && !liveCouncilInFlight) {
+    const pipeline = marketPipelines.get(symbol);
+    if (!pipeline) return;
+
+    const recentBars = pipeline.footprints['1m'].getRecentBars(15);
+    if (recentBars.length < 6) return;
+
+    const lookback = recentBars.slice(-6);
+    const isLocalExtreme = bar.high >= Math.max(...lookback.map((b) => b.high)) ||
+                           bar.low <= Math.min(...lookback.map((b) => b.low));
+    const isDeltaSpike = Math.abs(bar.delta) >= 20;
+    const isFiveMinBoundary = bar.time % 300 === 0;
+
+    if (!isLocalExtreme && !isDeltaSpike && !isFiveMinBoundary) {
+      return;
+    }
+
+    liveCouncilInFlight = true;
+    try {
+      const candles1m = pipeline.footprints['1m'].getRecentBars(40).map((b) => ({
+        time: b.time,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close
+      }));
+
+      const snapshot: AgentSnapshot = {
+        symbol,
+        timeframe: '1m',
+        feedStatus: currentMarketStatus,
+        lastTradeAt: lastTradeReceivedAt,
+        latestPrice: bar.close,
+        profile: {
+          poc: bar.pocPrice,
+          vah: Math.max(...recentBars.map((b) => b.high)),
+          val: Math.min(...recentBars.map((b) => b.low)),
+          capturedBars: recentBars.length
+        },
+        candles: candles1m,
+        footprints: recentBars.map((b) => pipeline.footprints['1m'].serializeBar(b)),
+        trades: [],
+        bids: pipeline.orderBook.getSortedBids(5),
+        asks: pipeline.orderBook.getSortedAsks(5),
+        paperPerformance: {
+          resolved: 0,
+          wins: 0,
+          losses: 0,
+          expired: 0,
+          winRate: null,
+          averageR: null,
+          recent: [],
+          learnedLessons: [...liveLearnedLessons]
+        }
+      };
+
+      const councilResult = await runOrderFlowCouncil(snapshot);
+      const plan = councilResult.plan;
+
+      if (plan.decision !== 'WAIT') {
+        console.log(`\n🚨 [LIVE TRADE TRIGGERED]: ${plan.decision} @ $${plan.entryPrice}`);
+        console.log(`   SL: $${plan.stopPrice} | TP: $${plan.targetPrice} (${plan.targetR}R)`);
+
+        liveActiveTrade = {
+          symbol,
+          decision: plan.decision,
+          entryPrice: plan.entryPrice!,
+          stopPrice: plan.stopPrice!,
+          targetPrice: plan.targetPrice!,
+          targetR: plan.targetR || 2,
+          reasons: plan.reasons,
+          strategies: plan.strategyNames || [],
+          summary: plan.summary,
+          barsHeld: 0,
+          enteredAt: Date.now()
+        };
+
+        void sendTradeEntryAlert({
+          symbol,
+          decision: plan.decision,
+          entryPrice: plan.entryPrice!,
+          stopPrice: plan.stopPrice!,
+          targetPrice: plan.targetPrice!,
+          targetR: plan.targetR || 2,
+          reasons: plan.reasons,
+          strategies: plan.strategyNames || [],
+          summary: plan.summary
+        }).catch((e) => console.warn('[Telegram Entry Alert Error]:', e instanceof Error ? e.message : e));
+
+        if (mongoHistory.connected) {
+          void mongoHistory.saveAgentDecision(snapshot, councilResult).catch((e) => console.warn('[MongoDB Save Error]:', e));
+        }
+      }
+    } catch (err) {
+      console.warn('[Live Council Error]:', err instanceof Error ? err.message : err);
+    } finally {
+      liveCouncilInFlight = false;
+    }
+  }
+}
+
 const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
   onStatusChange: (status: ConnectionStatus, message?: string) => {
     updateMarketStatus(status, message);
@@ -705,7 +1009,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       if (trades.length > 0) {
         lastTradeReceivedAt = Date.now();
         tradeHistory.save(trades);
-        persistToMongo('trades', () => mongoHistory.saveTrades(trades));
+        if (process.env.MONGO_PERSIST_RAW_TRADES === 'true') queueMongoTrades(trades);
         // 1. Broadcast Raw Normalized Trades
         const tradeMsg: TradeGatewayMessage = {
           type: 'TRADE',
@@ -740,6 +1044,9 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                   data: serialized,
                   timestamp: Date.now()
                 });
+
+                // Live Autonomous AI Council & Telegram alerts
+                void handleLiveBarAutonomousTrading(trade.symbol, serialized);
               }
             }
 
@@ -819,13 +1126,18 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       if (raw.type === 'snapshot') {
         const ok = pipeline.orderBook.processSnapshot(payload);
         if (ok) {
-          const sample = {
-            symbol,
-            time: Date.now(),
-            bids: pipeline.orderBook.getSortedBids(20),
-            asks: pipeline.orderBook.getSortedAsks(20)
-          };
-          if (orderBookHistory.save(sample)) persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
+          const nowMs = Date.now();
+          const lastSaved = lastOrderBookPersistAtBySymbol.get(symbol) ?? 0;
+          if (nowMs - lastSaved >= ORDERBOOK_MONGO_SAMPLE_MS) {
+            lastOrderBookPersistAtBySymbol.set(symbol, nowMs);
+            const sample = {
+              symbol,
+              time: nowMs,
+              bids: pipeline.orderBook.getSortedBids(20),
+              asks: pipeline.orderBook.getSortedAsks(20)
+            };
+            if (orderBookHistory.save(sample) && process.env.MONGO_PERSIST_ORDERBOOK === 'true') persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
+          }
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_SNAPSHOT',
@@ -849,13 +1161,18 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       } else if (raw.type === 'delta') {
         const ok = pipeline.orderBook.processDelta(payload);
         if (ok) {
-          const sample = {
-            symbol,
-            time: Date.now(),
-            bids: pipeline.orderBook.getSortedBids(20),
-            asks: pipeline.orderBook.getSortedAsks(20)
-          };
-          if (orderBookHistory.save(sample)) persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
+          const nowMs = Date.now();
+          const lastSaved = lastOrderBookPersistAtBySymbol.get(symbol) ?? 0;
+          if (nowMs - lastSaved >= ORDERBOOK_MONGO_SAMPLE_MS) {
+            lastOrderBookPersistAtBySymbol.set(symbol, nowMs);
+            const sample = {
+              symbol,
+              time: nowMs,
+              bids: pipeline.orderBook.getSortedBids(20),
+              asks: pipeline.orderBook.getSortedAsks(20)
+            };
+            if (orderBookHistory.save(sample) && process.env.MONGO_PERSIST_ORDERBOOK === 'true') persistToMongo('order-book sample', () => mongoHistory.saveOrderBook(sample));
+          }
           const status = pipeline.orderBook.getStatus();
           broadcast({
             type: 'ORDERBOOK_DELTA',
@@ -955,6 +1272,7 @@ function gracefulShutdown(): void {
   isShuttingDown = true;
   console.log('[FlowTerminal Gateway] Initiating graceful shutdown...');
   bybitClient.disconnect();
+  flushBufferedMongoTrades();
   updateMarketStatus('DISCONNECTED', 'Gateway shutting down');
 
   for (const client of wss.clients) {

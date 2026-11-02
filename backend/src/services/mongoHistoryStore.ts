@@ -4,16 +4,24 @@ import type { OrderBookSample } from './orderBookHistoryStore.js';
 import type { CouncilResult, AgentSnapshot } from '../agents/orderFlowCouncil.js';
 
 type Stored<T> = T & { _id: string; expiresAt: Date };
-const FOOTPRINT_RETENTION_MS = 24 * 60 * 60 * 1000;
-const OTHER_DATA_RETENTION_MS = 48 * 60 * 60 * 1000;
-const ORDER_BOOK_RETENTION_MS = 24 * 60 * 60 * 1000;
+const FOOTPRINT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const OTHER_DATA_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const ORDER_BOOK_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 const ORDER_BOOK_PERSIST_INTERVAL_MS = 15_000;
 const ORDER_BOOK_LEVELS_PER_SIDE = 5;
-const RETENTION_POLICY_ID = 'retention-policy-1d-footprints-1d-orderbook-48h-other-v3';
+const RETENTION_POLICY_ID = 'retention-policy-7d-footprints-3d-orderbook-7d-other-v4';
 const PREVIOUS_RETENTION_POLICY_IDS = [
+  'retention-policy-1d-footprints-1d-orderbook-48h-other-v3',
   'retention-policy-1d-footprints-48h-other-v2',
   'retention-policy-5d-footprints-48h-other-v1'
 ];
+
+const DEFAULT_TICK_SIZES: Record<string, number> = {
+  BTCUSDT: 0.1, ETHUSDT: 0.01, SOLUSDT: 0.01, XRPUSDT: 0.0001,
+  BNBUSDT: 0.01, DOGEUSDT: 0.00001, ADAUSDT: 0.0001, LINKUSDT: 0.001,
+  AVAXUSDT: 0.01, XAUTUSDT: 0.1
+};
+
 export interface AgentPaperPerformance {
   resolved: number;
   wins: number;
@@ -24,7 +32,7 @@ export interface AgentPaperPerformance {
   recent: Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }>;
 }
 
-/** MongoDB persistence for records captured after the service connects. It never imports local JSONL files. */
+/** MongoDB persistence for records captured after the service connects. */
 export class MongoHistoryStore {
   private readonly client: MongoClient | null;
   private readonly databaseName: string;
@@ -34,6 +42,7 @@ export class MongoHistoryStore {
   } as const;
   private lastCapCheckAt = new Map<string, number>();
   private readonly lastOrderBookSavedAt = new Map<string, number>();
+  private readonly backfillInFlight = new Set<string>();
 
   constructor(uri = process.env.MONGODB_URI, databaseName = process.env.MONGODB_DATABASE || 'flowterminal') {
     this.client = uri ? new MongoClient(uri, { serverSelectionTimeoutMS: 10_000, maxPoolSize: 5 }) : null;
@@ -66,9 +75,9 @@ export class MongoHistoryStore {
     try {
       await this.applyRetentionPolicy();
     } catch (error) {
-      console.warn('[MongoDB] Could not apply retention cleanup; new footprints will still expire after 24 hours:', error);
+      console.warn('[MongoDB] Could not apply retention cleanup:', error);
     }
-    console.log(`[MongoDB] Connected to database "${this.databaseName}". Existing local files were not imported.`);
+    console.log(`[MongoDB] Connected to database "${this.databaseName}" (7-day footprint & trade retention active).`);
   }
 
   async close(): Promise<void> { await this.client?.close(); this.db = null; }
@@ -80,7 +89,7 @@ export class MongoHistoryStore {
       { symbol: bar.symbol, timeframe: bar.timeframe, time: bar.time },
       { ...bar, expiresAt }, { upsert: true }
     );
-    await this.enforceCap('footprints', 100_000);
+    await this.enforceCap('footprints', 150_000);
   }
 
   async saveTrades(trades: NormalizedTrade[]): Promise<void> {
@@ -93,7 +102,7 @@ export class MongoHistoryStore {
         upsert: true
       }
     })), { ordered: false });
-    await this.enforceCap('trades', 500_000);
+    await this.enforceCap('trades', 600_000);
   }
 
   async saveOrderBook(sample: OrderBookSample): Promise<void> {
@@ -123,6 +132,11 @@ export class MongoHistoryStore {
     await this.enforceCap('liquidations', 100_000);
   }
 
+  /**
+   * Reads saved footprints from MongoDB. If the footprints collection is empty for
+   * this symbol/timeframe (e.g., after an older 24h TTL expiry) but raw trades exist
+   * in the `trades` collection, automatically reconstructs and persists the footprints!
+   */
   async getFootprints(options: { symbol: string; timeframe: string; startTimeMs?: number; endTimeMs?: number }): Promise<SerializedFootprintBar[]> {
     const query: Document = { symbol: options.symbol, timeframe: options.timeframe };
     const time: Document = {};
@@ -130,7 +144,49 @@ export class MongoHistoryStore {
     if (options.endTimeMs !== undefined) time.$lte = Math.floor(options.endTimeMs / 1000);
     if (Object.keys(time).length) query.time = time;
     const docs = await this.collection('footprints').find(query).sort({ time: 1 }).limit(20_000).toArray();
-    return docs.map((doc) => this.clean<SerializedFootprintBar>(doc));
+    if (docs.length > 0) {
+      return docs.map((doc) => this.clean<SerializedFootprintBar>(doc));
+    }
+
+    if (options.timeframe === '1m' || options.timeframe === '5m') {
+      const key = `${options.symbol}:${options.timeframe}`;
+      const endTimeMs = options.endTimeMs ?? Date.now();
+      const startTimeMs = options.startTimeMs ?? (endTimeMs - 7 * 24 * 60 * 60_000);
+      const tickSize = DEFAULT_TICK_SIZES[options.symbol] ?? 0.1;
+      try {
+        const rebuilt = await this.reconstructFootprintsFromTrades({
+          symbol: options.symbol,
+          timeframe: options.timeframe,
+          startTimeMs,
+          endTimeMs,
+          tickSize
+        });
+        const closedBars = rebuilt.bars.filter((bar) => bar.isClosed);
+        if (closedBars.length > 0 && !this.backfillInFlight.has(key)) {
+          this.backfillInFlight.add(key);
+          void this.collection('footprints').bulkWrite(
+            closedBars.map((bar) => ({
+              updateOne: {
+                filter: { symbol: bar.symbol, timeframe: bar.timeframe, time: bar.time },
+                update: { $set: { ...bar, expiresAt: new Date(bar.time * 1000 + FOOTPRINT_RETENTION_MS) } },
+                upsert: true
+              }
+            })),
+            { ordered: false }
+          ).then(() => {
+            console.log(`[MongoDB] Backfilled ${closedBars.length} ${options.timeframe} footprint bars for ${options.symbol} from ${rebuilt.trades} raw trades.`);
+          }).catch((err) => {
+            console.warn('[MongoDB] Footprint backfill warning:', err);
+          }).finally(() => {
+            this.backfillInFlight.delete(key);
+          });
+        }
+        return rebuilt.bars;
+      } catch (err) {
+        console.warn('[MongoDB] Could not auto-reconstruct footprints from trades:', err);
+      }
+    }
+    return [];
   }
 
   async getTrades(options: { symbol: string; startTimeMs?: number; endTimeMs?: number; limit: number }): Promise<NormalizedTrade[]> {
@@ -151,7 +207,7 @@ export class MongoHistoryStore {
       this.collection('trades').aggregate([
         { $match: match }, { $sort: { timestamp: 1 } }, { $addFields: { bucket: bucket } },
         { $group: { _id: '$bucket', open: { $first: '$price' }, close: { $last: '$price' }, high: { $max: '$price' }, low: { $min: '$price' }, totalVolume: { $sum: '$size' }, buyVolume: { $sum: { $cond: [{ $eq: ['$side', 'Buy'] }, '$size', 0] } }, sellVolume: { $sum: { $cond: [{ $eq: ['$side', 'Sell'] }, '$size', 0] } }, tradesCount: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $limit: 3000 }
+        { $sort: { _id: 1 } }, { $limit: 5000 }
       ], { allowDiskUse: true }).toArray(),
       this.collection('trades').aggregate([
         { $match: match },
@@ -174,7 +230,7 @@ export class MongoHistoryStore {
     let cumulativeDelta = 0;
     const bars = ohlcRows.map((row) => {
       const time = Number(row._id);
-      const priceLevels = levelsByTime.get(time) ?? [];
+      const priceLevels = (levelsByTime.get(time) ?? []).sort((a, b) => b.price - a.price);
       const totalVolume = Number(row.totalVolume);
       const buyVolume = Number(row.buyVolume);
       const sellVolume = Number(row.sellVolume);
@@ -281,7 +337,6 @@ export class MongoHistoryStore {
       }
       const stopHit = side === 'LONG' ? candle.low <= stop : candle.high >= stop;
       const targetHit = side === 'LONG' ? candle.high >= target : candle.low <= target;
-      // OHLC cannot establish which level traded first; score the stop first.
       if (stopHit) await collection.updateOne({ _id: record._id, status: 'OPEN' }, { $set: { status: 'LOSS', resolvedAt: candleTimeMs, pnlR: -1 } });
       else if (targetHit) await collection.updateOne({ _id: record._id, status: 'OPEN' }, { $set: { status: 'WIN', resolvedAt: candleTimeMs, pnlR: Number(record.targetR) } });
     }
@@ -326,35 +381,12 @@ export class MongoHistoryStore {
     return record as T;
   }
 
-  /** Convert existing TTL dates once, then let MongoDB's TTL monitor prune them. */
   private async applyRetentionPolicy(): Promise<void> {
     if (!this.db) return;
     const settings = this.db.collection<{ _id: string; appliedAt?: Date }>('settings');
     if (await settings.findOne({ _id: RETENTION_POLICY_ID })) return;
 
-    const previousPolicy = await settings.findOne({ _id: { $in: PREVIOUS_RETENTION_POLICY_IDS } });
-    if (previousPolicy) {
-      // Prior policies already assigned 48-hour TTLs to trades and decisions.
-      // Shorten footprints and order-book snapshots; delete expired rows first
-      // to reclaim space before refreshing the TTL dates of retained rows.
-      const now = Date.now();
-      const footprintCutoff = Math.floor((now - FOOTPRINT_RETENTION_MS) / 1000);
-      const orderBookCutoff = now - ORDER_BOOK_RETENTION_MS;
-      await Promise.all([
-        this.collection('footprints').deleteMany({ time: { $lte: footprintCutoff } }),
-        this.collection('orderBooks').deleteMany({ time: { $lte: orderBookCutoff } })
-      ]);
-      await this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]);
-      await this.collection('orderBooks').updateMany({}, [{ $set: {
-        expiresAt: { $toDate: { $add: ['$time', ORDER_BOOK_RETENTION_MS] } },
-        bids: { $slice: ['$bids', ORDER_BOOK_LEVELS_PER_SIDE] },
-        asks: { $slice: ['$asks', ORDER_BOOK_LEVELS_PER_SIDE] }
-      } }]);
-      await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: new Date() } }, { upsert: true });
-      return;
-    }
-
-    const migrations = [
+    await Promise.all([
       this.collection('footprints').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: [{ $multiply: ['$time', 1000] }, FOOTPRINT_RETENTION_MS] } } } }]),
       this.collection('trades').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
       this.collection('orderBooks').updateMany({}, [{ $set: {
@@ -364,17 +396,8 @@ export class MongoHistoryStore {
       } }]),
       this.collection('liquidations').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$timestamp', OTHER_DATA_RETENTION_MS] } } } }]),
       this.collection('agent_decisions').updateMany({}, [{ $set: { expiresAt: { $toDate: { $add: ['$generatedAt', OTHER_DATA_RETENTION_MS] } } } }])
-    ];
-    await Promise.all(migrations);
-    const expired = new Date();
-    await Promise.all([
-      this.collection('footprints').deleteMany({ expiresAt: { $lte: expired } }),
-      this.collection('trades').deleteMany({ expiresAt: { $lte: expired } }),
-      this.collection('orderBooks').deleteMany({ expiresAt: { $lte: expired } }),
-      this.collection('liquidations').deleteMany({ expiresAt: { $lte: expired } }),
-      this.collection('agent_decisions').deleteMany({ expiresAt: { $lte: expired } })
     ]);
-    await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: expired } }, { upsert: true });
+    await settings.updateOne({ _id: RETENTION_POLICY_ID }, { $set: { appliedAt: new Date() } }, { upsert: true });
   }
 
   private async enforceCap(name: keyof typeof this.collectionNames | 'agent_decisions', cap: number): Promise<void> {

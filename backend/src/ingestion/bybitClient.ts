@@ -34,6 +34,8 @@ export class BybitWebSocketClient {
   private readonly topicResubscribeTimers = new Map<string, NodeJS.Timeout>();
   private readonly lastTopicResubscribeAt = new Map<string, number>();
   private readonly lastPublicTradeAtBySymbol = new Map<string, number>();
+  private readonly lastTradeEventAtBySymbol = new Map<string, number>();
+  private readonly lastTradeMessageAtBySymbol = new Map<string, number>();
   private readonly lastTickerAtBySymbol = new Map<string, number>();
   private readonly lastKlineAtByTopic = new Map<string, number>();
 
@@ -169,7 +171,18 @@ export class BybitWebSocketClient {
     if (typeof msg.topic === 'string') {
       this.lastMarketDataAt = Date.now();
       if (msg.topic.startsWith('publicTrade.')) {
-        this.lastPublicTradeAtBySymbol.set(msg.topic.slice('publicTrade.'.length), this.lastMarketDataAt);
+        const symbol = msg.topic.slice('publicTrade.'.length);
+        this.lastPublicTradeAtBySymbol.set(symbol, this.lastMarketDataAt);
+        const rows = Array.isArray(msg.data) ? msg.data as Array<Record<string, unknown>> : [];
+        const latestTradeTime = rows.reduce((latest, row) => {
+          const tradeTime = Number(row.T);
+          return Number.isFinite(tradeTime) && tradeTime > latest ? tradeTime : latest;
+        }, 0);
+        if (latestTradeTime > 0) {
+          this.lastTradeEventAtBySymbol.set(symbol, latestTradeTime);
+          const messageTime = Number(msg.ts);
+          if (Number.isFinite(messageTime) && messageTime > 0) this.lastTradeMessageAtBySymbol.set(symbol, messageTime);
+        }
       } else if (msg.topic.startsWith('tickers.')) {
         this.lastTickerAtBySymbol.set(msg.topic.slice('tickers.'.length), this.lastMarketDataAt);
       } else if (msg.topic.startsWith('kline.')) {
@@ -232,7 +245,10 @@ export class BybitWebSocketClient {
         const tickerAt = this.lastTickerAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         const tradeAt = this.lastPublicTradeAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         if (now - tickerAt >= 45_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
-        if (now - tradeAt >= 60_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
+        // The UI pauses paper analysis after 15 seconds without a trade for
+        // the selected symbol. Recover that topic on the same cadence instead
+        // of waiting 60 seconds while the overall multi-symbol socket stays LIVE.
+        if (now - tradeAt >= 15_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
         for (const interval of ['1', '3', '5', '15', '30', '60', '240', 'D'] as const) {
           const topic = TOPIC_KLINE(interval, symbol);
           const lastAt = this.lastKlineAtByTopic.get(topic) ?? this.lastMarketDataAt;
@@ -267,6 +283,8 @@ export class BybitWebSocketClient {
     socket: 'CONNECTING' | 'OPEN' | 'CLOSING' | 'CLOSED' | 'DISCONNECTED';
     lastMarketDataAt: number | null;
     lastTradeAtBySymbol: Record<string, number | null>;
+    lastTradeEventAtBySymbol: Record<string, number | null>;
+    lastTradeMessageAtBySymbol: Record<string, number | null>;
     lastTickerAtBySymbol: Record<string, number | null>;
     lastKlineAtBySymbol: Record<string, Record<string, number | null>>;
   } {
@@ -280,6 +298,8 @@ export class BybitWebSocketClient {
       socket,
       lastMarketDataAt: this.lastMarketDataAt || null,
       lastTradeAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastPublicTradeAtBySymbol.get(symbol) ?? null])),
+      lastTradeEventAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastTradeEventAtBySymbol.get(symbol) ?? null])),
+      lastTradeMessageAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastTradeMessageAtBySymbol.get(symbol) ?? null])),
       lastTickerAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [symbol, this.lastTickerAtBySymbol.get(symbol) ?? null])),
       lastKlineAtBySymbol: Object.fromEntries(this.symbols.map((symbol) => [
         symbol,
