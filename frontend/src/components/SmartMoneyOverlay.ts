@@ -11,7 +11,7 @@ export interface StructureCandle {
 
 export type StructureEventType = 'BOS' | 'CHOCH' | 'MSS' | 'INDUCEMENT' | 'BSL SWEEP' | 'SSL SWEEP';
 export interface StructureEvent { type: StructureEventType; time: number; price: number; bullish: boolean; fromTime?: number; }
-export interface PriceZone { startTime: number; endTime: number; top: number; bottom: number; bullish: boolean; kind: 'FVG' | 'OB'; }
+export interface PriceZone { startTime: number; endTime: number; createdTime?: number; top: number; bottom: number; bullish: boolean; kind: 'FVG' | 'OB'; }
 export interface LiquidityLevel { time: number; price: number; label: 'EQH' | 'EQL'; swept: boolean; endTime?: number; }
 export interface PO3Marker { time: number; endTime: number; label: 'ACC' | 'MANIP' | 'DIST'; top: number; bottom: number; bullish?: boolean; }
 export interface SmartMoneyAnalysis { events: StructureEvent[]; zones: PriceZone[]; liquidity: LiquidityLevel[]; po3: PO3Marker[]; dailyRanges: Map<number, { high: number; low: number }>; bias: 'Bullish' | 'Bearish' | 'Neutral'; }
@@ -157,7 +157,7 @@ export function analyzeSmartMoney(candles: StructureCandle[]): SmartMoneyAnalysi
       for (let j = i - 1; j >= Math.max(0, i - 8); j--) {
         const prior = bars[j];
         if ((bullish && prior.close < prior.open) || (!bullish && prior.close > prior.open)) {
-          const zone: PriceZone = { startTime: prior.time, endTime: bar.time, top: prior.high, bottom: prior.low, bullish, kind: 'OB' };
+          const zone: PriceZone = { startTime: prior.time, endTime: bar.time, createdTime: bar.time, top: prior.high, bottom: prior.low, bullish, kind: 'OB' };
           allZones.push(zone); activeZones.push({ zone, createdIndex: i });
           break;
         }
@@ -169,10 +169,10 @@ export function analyzeSmartMoney(candles: StructureCandle[]): SmartMoneyAnalysi
     if (i >= 2) {
       const first = bars[i - 2];
       if (bar.low > first.high) {
-        const zone: PriceZone = { startTime: first.time, endTime: bar.time, top: bar.low, bottom: first.high, bullish: true, kind: 'FVG' };
+        const zone: PriceZone = { startTime: first.time, endTime: bar.time, createdTime: bar.time, top: bar.low, bottom: first.high, bullish: true, kind: 'FVG' };
         allZones.push(zone); activeZones.push({ zone, createdIndex: i });
       } else if (bar.high < first.low) {
-        const zone: PriceZone = { startTime: first.time, endTime: bar.time, top: first.low, bottom: bar.high, bullish: false, kind: 'FVG' };
+        const zone: PriceZone = { startTime: first.time, endTime: bar.time, createdTime: bar.time, top: first.low, bottom: bar.high, bullish: false, kind: 'FVG' };
         allZones.push(zone); activeZones.push({ zone, createdIndex: i });
       }
       if (allZones.length > 12_000) allZones.splice(0, allZones.length - 12_000);

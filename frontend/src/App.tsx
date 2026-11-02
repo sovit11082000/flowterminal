@@ -24,7 +24,7 @@ import EntryExitSignals from './components/EntryExitSignals.js';
 import AgentCouncilPanel from './components/AgentCouncilPanel.js';
 import GammaLevelsPanel, { type Snapshot as GammaSnapshot } from './components/GammaLevelsPanel.js';
 import { analyzeSmartMoney, drawSmartMoneyOverlay, type SmartMoneyAnalysis, type SmartMoneyFeatures } from './components/SmartMoneyOverlay.js';
-import { backtestOrderFlow, drawBacktestMarkers, type BacktestCostAssumptions, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
+import { backtestMtfSmcIct, backtestMtfSmcIctV2, backtestOrderFlow, backtestSmcIct, drawBacktestMarkers, type BacktestCostAssumptions, type BacktestTrade, type OIHistoryPoint, type TradeSetup } from './components/EntryExitSignalEngine.js';
 import { calculateVolumeProfile } from './components/VolumeProfileCalculator.js';
 import {
   Trade,
@@ -149,6 +149,8 @@ export default function App() {
   const [heatmapSnapshot, setHeatmapSnapshot] = useState<{ samples: BookSample[]; trades: TradeDot[] }>({ samples: [], trades: [] });
   const [tradeReplayBars, setTradeReplayBars] = useState<SerializedFootprintBar[]>([]);
   const [tradeReplayInfo, setTradeReplayInfo] = useState<{ status: 'idle' | 'loading' | 'ready' | 'error'; sourceTradeCount: number; windowHours: number }>({ status: 'idle', sourceTradeCount: 0, windowHours: 48 });
+  const [historicalBookSamples, setHistoricalBookSamples] = useState<BookSample[]>([]);
+  const [historicalBookStatus, setHistoricalBookStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [derivativesSnapshot, setDerivativesSnapshot] = useState<DerivativesPayload | null>(null);
   const [historicalOI, setHistoricalOI] = useState<OIHistoryPoint[]>([]);
   const [historicalOIStatus, setHistoricalOIStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -1246,6 +1248,28 @@ export default function App() {
     scheduleOverlayRedraw();
   };
 
+  const handleExportBacktestCandles = async () => {
+    try {
+      const response = await fetch(apiUrl('/api/history?symbol=BTCUSDT&timeframe=1m'));
+      if (!response.ok) throw new Error(`History request failed (${response.status})`);
+      const payload = await response.json();
+      const candles = Array.isArray(payload.candles) ? payload.candles : [];
+      if (!candles.length) throw new Error('No BTCUSDT 1m candles were returned.');
+      const rows = ['time,open,high,low,close,volume', ...candles.map((c: CachedCandle) =>
+        `${new Date(c.time * 1000).toISOString()},${c.open},${c.high},${c.low},${c.close},${c.volume}`)];
+      const blobUrl = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' }));
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = 'BTCUSDT_1m_backtest_candles.csv';
+      link.click();
+      URL.revokeObjectURL(blobUrl);
+      setHistoryRangeText(`Downloaded ${candles.length.toLocaleString()} BTCUSDT 1m candles`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(`Candle download failed: ${message}`);
+    }
+  };
+
   const handleToggleAutoScale = () => {
     if (!chartInstanceRef.current) return;
     const nextState = !isAutoScale;
@@ -1286,6 +1310,10 @@ export default function App() {
     .sort((a, b) => a.time - b.time)
     .map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
   [selectedTimeframe, selectedSymbol, totalCandlesCount, latestCandleTime]);
+  const oneMinuteSignalCandles = useMemo(() => Array.from(candlesCacheRef.current['1m'].values())
+    .sort((a, b) => a.time - b.time)
+    .map(({ time, open, high, low, close }) => ({ time, open, high, low, close })),
+  [selectedSymbol, selectedTimeframe, totalCandlesCount, latestCandleTime]);
   const signalFootprints = useMemo(() => {
     const byTime = new Map<number, SerializedFootprintBar>();
     for (const bar of tradeReplayBars) if (bar.symbol === selectedSymbol && bar.timeframe === selectedTimeframe) byTime.set(bar.time, bar);
@@ -1353,6 +1381,26 @@ export default function App() {
       .catch(() => { if (!cancelled) setTradeReplayInfo({ status: 'error', sourceTradeCount: 0, windowHours: 48 }); });
     return () => { cancelled = true; };
   }, [selectedSymbol, selectedTimeframe, supportsFootprint]);
+  useEffect(() => {
+    if (!supportsFootprint) { setHistoricalBookSamples([]); setHistoricalBookStatus('idle'); return; }
+    let cancelled = false;
+    const end = Date.now();
+    const start = end - 24 * 60 * 60_000;
+    setHistoricalBookSamples([]);
+    setHistoricalBookStatus('loading');
+    void fetch(apiUrl(`/api/orderbook/history?symbol=${encodeURIComponent(selectedSymbol)}&start=${start}&end=${end}&limit=10000`))
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Saved order-book history unavailable');
+        return await response.json() as { symbol: string; samples: BookSample[] };
+      })
+      .then((payload) => {
+        if (cancelled || payload.symbol !== selectedSymbol) return;
+        setHistoricalBookSamples(Array.isArray(payload.samples) ? payload.samples : []);
+        setHistoricalBookStatus('ready');
+      })
+      .catch(() => { if (!cancelled) setHistoricalBookStatus('error'); });
+    return () => { cancelled = true; };
+  }, [selectedSymbol, supportsFootprint]);
   const structureCandles = useMemo(() => {
     const interval = TIMEFRAME_SECONDS[selectedTimeframe];
     const cutoff = Math.floor(Date.now() / 1000) - 30 * 86400;
@@ -1367,9 +1415,15 @@ export default function App() {
     liveSetupRef.current = setup;
     scheduleOverlayRedraw();
   }, [scheduleOverlayRedraw]);
-  const backtestTrades = useMemo(() => supportsFootprint
-    ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200, backtestCosts)
-    : [], [supportsFootprint, signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe, backtestCosts]);
+  const backtestTrades = useMemo(() => backtestSmcIct(signalCandles, TIMEFRAME_SECONDS[selectedTimeframe], backtestCosts),
+    [signalCandles, selectedTimeframe, backtestCosts]);
+  const mtfBacktestTrades = useMemo(() => backtestMtfSmcIct(oneMinuteSignalCandles, backtestCosts),
+    [oneMinuteSignalCandles, backtestCosts]);
+  const mtfV2BacktestTrades = useMemo(() => backtestMtfSmcIctV2(oneMinuteSignalCandles, backtestCosts),
+    [oneMinuteSignalCandles, backtestCosts]);
+  const orderFlowBacktestTrades = useMemo(() => signalFootprints.some((bar) => bar.isClosed)
+    ? backtestOrderFlow(signalCandles, signalFootprints, replayOIHistory, selectedSymbol, TIMEFRAME_SECONDS[selectedTimeframe], 1, 43_200, backtestCosts, historicalBookSamples)
+    : [], [signalCandles, signalFootprints, replayOIHistory, selectedSymbol, selectedTimeframe, backtestCosts, historicalBookSamples]);
   useEffect(() => { localStorage.setItem(BACKTEST_COSTS_KEY, JSON.stringify(backtestCosts)); }, [backtestCosts]);
   backtestTradesRef.current = backtestTrades;
   useEffect(() => { scheduleOverlayRedraw(); }, [backtestTrades, scheduleOverlayRedraw]);
@@ -1616,6 +1670,13 @@ export default function App() {
               Go to Live
             </button>
             <button
+              onClick={handleExportBacktestCandles}
+              style={{ background: '#1e293b', color: '#a7f3d0', border: '1px solid #334155', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px', fontWeight: 'bold' }}
+              title="Download the available BTCUSDT 1-minute candle history as CSV"
+            >
+              Download 1m Backtest Data
+            </button>
+            <button
               onClick={handleToggleAutoScale}
               style={{ background: isAutoScale ? '#1e293b' : '#374151', color: isAutoScale ? '#10b981' : '#9ca3af', border: '1px solid #334155', padding: '4px 10px', borderRadius: '4px', cursor: 'pointer', fontSize: '11px' }}
             >
@@ -1781,6 +1842,10 @@ export default function App() {
         lastTradeAt={lastTradeAt}
         context={{ profile: selectedProfile, heatmap: heatmapSnapshot, derivatives: replayDerivativesSnapshot, gamma: gammaSnapshot?.baseCoin === selectedSymbol.replace(/USDT$/, '') ? gammaSnapshot : null }}
         backtestTrades={backtestTrades}
+        mtfBacktestTrades={mtfBacktestTrades}
+        mtfV2BacktestTrades={mtfV2BacktestTrades}
+        orderFlowBacktestTrades={orderFlowBacktestTrades}
+        bookReplayInfo={{ status: historicalBookStatus, samples: historicalBookSamples.length, firstTime: historicalBookSamples[0]?.time ?? null, lastTime: historicalBookSamples[historicalBookSamples.length - 1]?.time ?? null }}
         costs={backtestCosts}
         onCostsChange={setBacktestCosts}
         tradeReplayInfo={{ ...tradeReplayInfo, barsCount: tradeReplayBars.length }}

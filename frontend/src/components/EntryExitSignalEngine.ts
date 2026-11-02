@@ -47,13 +47,19 @@ export interface BacktestCostAssumptions {
   slippageBpsPerSide: number;
 }
 
+export interface HistoricalBookSample {
+  time: number;
+  bids: [number, number][];
+  asks: [number, number][];
+}
+
 /**
  * Replays the live entry rules using only candles/footprints available at each
  * signal bar. Future candles are consulted only to score the completed trade.
  * DOM and manual profile are deliberately excluded because historical snapshots
  * for those inputs are not retained consistently.
  */
-export function backtestOrderFlow(candles: SignalCandle[], footprints: SerializedFootprintBar[], oiHistory: OIHistoryPoint[], symbol: string, barSeconds: number, strategyVersion = 1, maxBars = 43_200, costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
+export function backtestOrderFlow(candles: SignalCandle[], footprints: SerializedFootprintBar[], oiHistory: OIHistoryPoint[], symbol: string, barSeconds: number, strategyVersion = 1, maxBars = 43_200, costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }, bookSamples: HistoricalBookSample[] = []): BacktestTrade[] {
   const closedFootprints = footprints.filter((bar) => bar.isClosed).sort((a, b) => a.time - b.time);
   const latestClosedTime = closedFootprints[closedFootprints.length - 1]?.time ?? 0;
   // Do not score against the currently-forming candle. The latest closed
@@ -64,6 +70,7 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
   const normalizedOI = normalizeOIHistory(oiHistory);
   const dailyRanges = aggregateDailyRanges(history);
   const footprintsByTime = new Map(recorded.map((bar) => [bar.time, bar]));
+  const sortedBookSamples = bookSamples.filter((sample) => Number.isFinite(sample.time)).sort((a, b) => a.time - b.time);
   const results: BacktestTrade[] = [];
   let blockedThroughIndex = -1;
   let replayVersion = Math.max(1, strategyVersion);
@@ -82,7 +89,8 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
     // Let the setup engine build structure/ICT context from this timestamp's
     // closed prefix only. A full-history analysis here leaks later pivots and
     // PO3 distribution markers into earlier decisions.
-    const setup = findOrderFlowSetup(history, recorded, [], [], replayVersion, oiHistory, symbol, barSeconds, undefined, normalizedOI, dailyRanges, candle.time, footprintsByTime);
+    const book = latestBookAtOrBefore(sortedBookSamples, (candle.time + barSeconds) * 1000);
+    const setup = findOrderFlowSetup(history, recorded, book?.bids ?? [], book?.asks ?? [], replayVersion, oiHistory, symbol, barSeconds, undefined, normalizedOI, dailyRanges, candle.time, footprintsByTime, true);
     if (!setup || setup.time !== candle.time) continue;
     const risk = Math.abs(setup.entry - setup.stop);
     if (!Number.isFinite(risk) || risk <= 0) continue;
@@ -185,6 +193,348 @@ export function backtestOrderFlow(candles: SignalCandle[], footprints: Serialize
   return results;
 }
 
+function latestBookAtOrBefore(samples: HistoricalBookSample[], timeMs: number): HistoricalBookSample | null {
+  let low = 0; let high = samples.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (samples[mid].time <= timeMs) low = mid + 1; else high = mid;
+  }
+  const sample = samples[low - 1];
+  return sample && timeMs - sample.time <= 60_000 ? sample : null;
+}
+
+/**
+ * Multi-timeframe SMC/ICT experiment: 4h/1h swing range for location and bias,
+ * 15m/5m structure alignment, then a fresh 1m structure break for entry.
+ * Every higher-timeframe input is restricted to bars fully closed by entry.
+ */
+export function backtestMtfSmcIct(oneMinuteCandles: SignalCandle[], costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
+  return backtestMtfSmcIctCore(oneMinuteCandles, costs, { stopTimeframeSeconds: 60, stopLookback: 5, maxEstimatedCostR: Infinity, maxHoldMinutes: 30 });
+}
+
+/** V2 uses a completed 5m structure stop, a 60m time limit, and skips entries whose estimated round-trip cost exceeds 0.5R. */
+export function backtestMtfSmcIctV2(oneMinuteCandles: SignalCandle[], costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
+  return backtestMtfSmcIctCore(oneMinuteCandles, costs, { stopTimeframeSeconds: 300, stopLookback: 5, maxEstimatedCostR: 0.5, maxHoldMinutes: 60, requirePo3SweepRetest: false });
+}
+
+/** V3 adds a confirmed daily PO3 sequence, same-direction liquidity sweep, and fresh 1m FVG/OB retest. */
+export function backtestMtfSmcIctV3(oneMinuteCandles: SignalCandle[], costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
+  return backtestMtfSmcIctCore(oneMinuteCandles, costs, { stopTimeframeSeconds: 300, stopLookback: 5, maxEstimatedCostR: 0.5, maxHoldMinutes: 60, requirePo3SweepRetest: true });
+}
+
+function backtestMtfSmcIctCore(oneMinuteCandles: SignalCandle[], costs: BacktestCostAssumptions, options: { stopTimeframeSeconds: 60 | 300; stopLookback: number; maxEstimatedCostR: number; maxHoldMinutes: number; requirePo3SweepRetest: boolean }): BacktestTrade[] {
+  const history = oneMinuteCandles.filter((bar) => Number.isFinite(bar.time) && [bar.open, bar.high, bar.low, bar.close].every(Number.isFinite))
+    .sort((a, b) => a.time - b.time);
+  if (history.length < 4 * 60 * 24) return [];
+
+  const fiveMinute = aggregateCandles(history, 300);
+  const fifteenMinute = aggregateCandles(history, 900);
+  const oneHour = aggregateCandles(history, 3600);
+  const fourHour = aggregateCandles(history, 14_400);
+  const analysis1m = analyzeSmartMoney(history);
+  const analysis5m = analyzeSmartMoney(fiveMinute);
+  const analysis15m = analyzeSmartMoney(fifteenMinute);
+  const analysis1h = analyzeSmartMoney(oneHour);
+  for (const analysis of [analysis1m, analysis5m, analysis15m, analysis1h]) analysis.events.sort((a, b) => a.time - b.time);
+  const validationStartIndex = Math.floor(history.length * 0.7);
+  const results: BacktestTrade[] = [];
+  let blockedThroughIndex = -1;
+
+  for (let i = 4 * 60 * 24; i < history.length; i++) {
+    if (i <= blockedThroughIndex) continue;
+    const current = history[i];
+    const entryTime = current.time + 60;
+    const range4h = confirmedSwingRange(fourHour, 14_400, entryTime, 30);
+    const range1h = confirmedSwingRange(oneHour, 3600, entryTime, 36);
+    if (!range4h || !range1h) continue;
+    const longLocation = current.close <= (range4h.high + range4h.low) / 2 && current.close <= (range1h.high + range1h.low) / 2;
+    const shortLocation = current.close >= (range4h.high + range4h.low) / 2 && current.close >= (range1h.high + range1h.low) / 2;
+
+    const bias1h = latestStructure(analysis1h, 3600, entryTime, 24);
+    const confirm15m = latestStructure(analysis15m, 900, entryTime, 8);
+    const confirm5m = latestStructure(analysis5m, 300, entryTime, 12);
+    const trigger1m = latestStructure(analysis1m, 60, entryTime, 3);
+    if (!bias1h || !confirm15m || !confirm5m || !trigger1m) continue;
+    const side: SignalSide = bias1h.bullish ? 'LONG' : 'SHORT';
+    if (confirm15m.bullish !== bias1h.bullish || confirm5m.bullish !== bias1h.bullish || trigger1m.bullish !== bias1h.bullish) continue;
+    if (side === 'LONG' ? !longLocation : !shortLocation) continue;
+    const po3RetestEvidence = options.requirePo3SweepRetest
+      ? confirmedPo3SweepZoneRetest(analysis1m, history, i, entryTime, side === 'LONG', trigger1m.time)
+      : null;
+    if (options.requirePo3SweepRetest && !po3RetestEvidence) continue;
+
+    const entry = current.close;
+    let stopCandles: SignalCandle[];
+    if (options.stopTimeframeSeconds === 300) {
+      const closedFiveMinuteEnd = upperBoundCandleTime(fiveMinute, entryTime - 300);
+      stopCandles = fiveMinute.slice(Math.max(0, closedFiveMinuteEnd - options.stopLookback), closedFiveMinuteEnd);
+      if (stopCandles.length < options.stopLookback) continue;
+    } else {
+      stopCandles = history.slice(i - options.stopLookback + 1, i + 1);
+    }
+    const stop = side === 'LONG' ? Math.min(...stopCandles.map((bar) => bar.low)) : Math.max(...stopCandles.map((bar) => bar.high));
+    const risk = Math.abs(entry - stop);
+    if (!Number.isFinite(risk) || risk <= 0) continue;
+    const direction = side === 'LONG' ? 1 : -1;
+    const estimatedRoundTripCostR = entry * 2 * (Math.max(0, costs.feeBpsPerSide) + Math.max(0, costs.slippageBpsPerSide)) / 10_000 / risk;
+    if (estimatedRoundTripCostR > options.maxEstimatedCostR) continue;
+    const target1 = entry + direction * risk;
+    const target2 = entry + direction * risk * 2;
+    const horizon = Math.min(history.length - 1, i + options.maxHoldMinutes);
+    const fullHorizonAvailable = i + options.maxHoldMinutes < history.length;
+    if (i < validationStartIndex && horizon >= validationStartIndex) continue;
+
+    let outcome: BacktestTrade['outcome'] = 'OPEN';
+    let exitTime: number | null = null;
+    let exitPrice: number | null = null;
+    let pnlR: number | null = null;
+    let target1Hit = false;
+    let target2Hit = false;
+    let maxAdverseR = 0;
+    let maxFavorableR = 0;
+    for (let j = i + 1; j <= horizon; j++) {
+      const bar = history[j];
+      maxAdverseR = Math.max(maxAdverseR, side === 'LONG' ? (entry - bar.low) / risk : (bar.high - entry) / risk);
+      maxFavorableR = Math.max(maxFavorableR, side === 'LONG' ? (bar.high - entry) / risk : (entry - bar.low) / risk);
+      const stopHit = side === 'LONG' ? bar.low <= stop : bar.high >= stop;
+      const target1Reached = side === 'LONG' ? bar.high >= target1 : bar.low <= target1;
+      const target2Reached = side === 'LONG' ? bar.high >= target2 : bar.low <= target2;
+      if (stopHit) { outcome = target1Hit ? 'BREAKEVEN' : 'LOSS'; pnlR = target1Hit ? 0 : -1; exitTime = bar.time; exitPrice = target1Hit ? (target1 + stop) / 2 : stop; break; }
+      if (target2Reached) { target1Hit = true; target2Hit = true; outcome = 'WIN'; pnlR = 1.5; exitTime = bar.time; exitPrice = (target1 + target2) / 2; break; }
+      if (target1Reached) target1Hit = true;
+    }
+    if (outcome === 'OPEN' && fullHorizonAvailable) {
+      const exitBar = history[horizon];
+      const unrealizedR = (side === 'LONG' ? exitBar.close - entry : entry - exitBar.close) / risk;
+      outcome = 'TIME'; exitTime = exitBar.time; exitPrice = target1Hit ? (target1 + exitBar.close) / 2 : exitBar.close;
+      pnlR = target1Hit ? 0.5 + 0.5 * unrealizedR : unrealizedR;
+    }
+    const exitIndex = exitTime === null ? horizon : history.findIndex((bar) => bar.time === exitTime);
+    blockedThroughIndex = Math.max(i, exitIndex);
+    const costR = pnlR !== null && exitPrice !== null
+      ? ((entry + exitPrice) * (Math.max(0, costs.feeBpsPerSide) + Math.max(0, costs.slippageBpsPerSide)) / 10_000) / risk
+      : null;
+    const netPnlR = pnlR !== null && costR !== null ? pnlR - costR : null;
+    const phase = i >= validationStartIndex ? 'VALIDATION' : 'TRAIN';
+    const lossReview = outcome === 'LOSS'
+      ? `1m ${trigger1m.type} entry aligned with 5m/15m/1h ${side.toLowerCase()} structure; stop hit first. Favorable ${maxFavorableR.toFixed(2)}R, adverse ${maxAdverseR.toFixed(2)}R. Observed path, not proven cause.`
+      : null;
+    results.push({
+      side, time: current.time, entry, stop, target1, target2, targetR: 2, score: 4, maxScore: 4, strategyVersion: 1,
+      reasons: [`4h range ${side === 'LONG' ? 'discount' : 'premium'} ${range4h.low.toFixed(2)}–${range4h.high.toFixed(2)}`,
+        `1h ${bias1h.type} ${side.toLowerCase()} bias`, `15m ${confirm15m.type} + 5m ${confirm5m.type} aligned`, `1m ${trigger1m.type} entry`, ...(po3RetestEvidence ?? [])],
+      agentReads: [
+        { agent: 'SMC', bias: side, strength: 3, findings: [`1h ${bias1h.type}; 15m ${confirm15m.type}; 5m ${confirm5m.type}; 1m trigger ${trigger1m.type}`] },
+        { agent: 'ICT', bias: side, strength: 2, findings: [`4h and 1h range location confirms ${side === 'LONG' ? 'discount' : 'premium'}`] },
+        { agent: 'ORDER FLOW', bias: 'WAIT', strength: 0, findings: ['Not used in this candle-only MTF experiment'] }
+      ],
+      phase, outcome, exitTime, exitPrice, pnlR, costR, netPnlR, target1Hit, target2Hit, lossReview
+    });
+  }
+  return results;
+}
+
+function confirmedPo3SweepZoneRetest(
+  analysis: SmartMoneyAnalysis,
+  candles: SignalCandle[],
+  candleIndex: number,
+  entryTime: number,
+  bullish: boolean,
+  triggerTime: number
+): string[] | null {
+  const current = candles[candleIndex];
+  const dayStart = Math.floor(current.time / 86400) * 86400;
+  const dayMarkers = analysis.po3.filter((marker) => Math.floor(marker.time / 86400) * 86400 === dayStart);
+  const accumulation = dayMarkers.find((marker) => marker.label === 'ACC');
+  if (!accumulation) return null;
+  const manipulations = dayMarkers.filter((marker) => marker.label === 'MANIP' && marker.bullish === bullish && marker.time >= accumulation.endTime && marker.time < entryTime);
+  const distribution = dayMarkers.find((marker) => marker.label === 'DIST' && marker.bullish === bullish && marker.time < entryTime);
+  if (!distribution || triggerTime < distribution.time) return null;
+  const manipulation = manipulations.find((marker) => marker.time < distribution.time);
+  if (!manipulation) return null;
+
+  const sweepType = bullish ? 'SSL SWEEP' : 'BSL SWEEP';
+  const sweep = [...analysis.events].reverse().find((event) => event.type === sweepType && event.bullish === bullish &&
+    event.time >= accumulation.endTime && event.time <= manipulation.time && event.time < entryTime);
+  if (!sweep) return null;
+
+  const zones = analysis.zones;
+  for (let z = zones.length - 1; z >= 0; z--) {
+    const zone = zones[z];
+    const createdTime = zone.createdTime;
+    if (createdTime === undefined || createdTime >= current.time) continue;
+    if (createdTime < distribution.time) break;
+    if (zone.bullish !== bullish || (zone.kind !== 'FVG' && zone.kind !== 'OB')) continue;
+    const createdIndex = upperBoundCandleTime(candles, createdTime) - 1;
+    if (createdIndex < 0 || createdIndex >= candleIndex) continue;
+    let invalidated = false;
+    let alreadyRetested = false;
+    for (let j = createdIndex + 1; j < candleIndex; j++) {
+      const bar = candles[j];
+      if (zone.kind === 'FVG' ? (bullish ? bar.low <= zone.bottom : bar.high >= zone.top)
+        : (bullish ? bar.close < zone.bottom : bar.close > zone.top)) { invalidated = true; break; }
+      if (bar.high >= zone.bottom && bar.low <= zone.top) { alreadyRetested = true; break; }
+    }
+    if (invalidated || alreadyRetested) continue;
+    const retests = current.high >= zone.bottom && current.low <= zone.top;
+    const rejectionClose = bullish ? current.close > current.open && current.close >= zone.top
+      : current.close < current.open && current.close <= zone.bottom;
+    if (retests && rejectionClose) {
+      return [`${sweepType} then confirmed PO3 ACC → MANIP → DIST`, `Fresh ${zone.kind} retest with ${bullish ? 'bullish' : 'bearish'} 1m close`];
+    }
+  }
+  return null;
+}
+
+function aggregateCandles(oneMinute: SignalCandle[], periodSeconds: number): SignalCandle[] {
+  const groups = new Map<number, { time: number; open: number; high: number; low: number; close: number; count: number; lastTime: number }>();
+  for (const candle of oneMinute) {
+    const bucket = Math.floor(candle.time / periodSeconds) * periodSeconds;
+    const group = groups.get(bucket);
+    if (group) { group.high = Math.max(group.high, candle.high); group.low = Math.min(group.low, candle.low); if (candle.time > group.lastTime) { group.close = candle.close; group.lastTime = candle.time; } group.count++; }
+    else groups.set(bucket, { time: bucket, open: candle.open, high: candle.high, low: candle.low, close: candle.close, count: 1, lastTime: candle.time });
+  }
+  const expected = periodSeconds / 60;
+  return [...groups.values()].filter((group) => group.count === expected && group.lastTime === group.time + periodSeconds - 60)
+    .map(({ count: _count, lastTime: _lastTime, ...candle }) => candle).sort((a, b) => a.time - b.time);
+}
+
+function latestStructure(analysis: SmartMoneyAnalysis, periodSeconds: number, closedAt: number, maxAgeBars: number): SmartMoneyAnalysis['events'][number] | null {
+  const events = analysis.events;
+  for (let i = upperBoundEventTime(events, closedAt) - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.time + periodSeconds > closedAt) continue;
+    if (closedAt - (event.time + periodSeconds) > maxAgeBars * periodSeconds) break;
+    if (event.type === 'BOS' || event.type === 'CHOCH' || event.type === 'MSS') return event;
+  }
+  return null;
+}
+
+function confirmedSwingRange(candles: SignalCandle[], periodSeconds: number, closedAt: number, lookback: number): { high: number; low: number } | null {
+  let end = upperBoundCandleTime(candles, closedAt - periodSeconds);
+  while (end > 0 && candles[end - 1].time + periodSeconds > closedAt) end--;
+  const closed = candles.slice(Math.max(0, end - lookback), end);
+  if (closed.length < 5) return null;
+  const highs: number[] = []; const lows: number[] = [];
+  for (let i = 2; i < closed.length - 2; i++) {
+    const bar = closed[i];
+    if (bar.high > closed[i - 1].high && bar.high > closed[i - 2].high && bar.high > closed[i + 1].high && bar.high > closed[i + 2].high) highs.push(bar.high);
+    if (bar.low < closed[i - 1].low && bar.low < closed[i - 2].low && bar.low < closed[i + 1].low && bar.low < closed[i + 2].low) lows.push(bar.low);
+  }
+  if (!highs.length || !lows.length) return null;
+  return { high: Math.max(...highs), low: Math.min(...lows) };
+}
+
+/** Candle-only SMC + ICT replay for the longer retained candle history. */
+export function backtestSmcIct(candles: SignalCandle[], barSeconds: number, costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
+  const history = candles.filter((bar) => Number.isFinite(bar.time) && [bar.open, bar.high, bar.low, bar.close].every(Number.isFinite)).sort((a, b) => a.time - b.time);
+  if (history.length < 40) return [];
+  const analysis = analyzeSmartMoney(history);
+  const validationStartIndex = Math.floor(history.length * 0.7);
+  const results: BacktestTrade[] = [];
+  const usedSignalKeys = new Set<string>();
+  let blockedThroughIndex = -1;
+
+  for (let i = 30; i < history.length; i++) {
+    if (i <= blockedThroughIndex) continue;
+    const current = history[i];
+    const dayStart = Math.floor(current.time / 86400) * 86400;
+    const previousDay = analysis.dailyRanges.get(dayStart - 86400);
+    if (!previousDay) continue;
+    const midpoint = (previousDay.high + previousDay.low) / 2;
+    let structure: SmartMoneyAnalysis['events'][number] | undefined;
+    for (let eventIndex = upperBoundEventTime(analysis.events, current.time) - 1; eventIndex >= 0; eventIndex--) {
+      const event = analysis.events[eventIndex];
+      if (event.time < current.time - barSeconds * 4) break;
+      if (['BOS', 'CHOCH', 'MSS'].includes(event.type)) { structure = event; break; }
+    }
+    if (!structure) continue;
+    const side: SignalSide = structure.bullish ? 'LONG' : 'SHORT';
+    const locationAligned = side === 'LONG' ? current.close <= midpoint : current.close >= midpoint;
+    if (!locationAligned) continue;
+    let distribution: SmartMoneyAnalysis['po3'][number] | undefined;
+    for (let markerIndex = analysis.po3.length - 1; markerIndex >= 0; markerIndex--) {
+      const marker = analysis.po3[markerIndex];
+      if (marker.time > current.time) continue;
+      if (Math.floor(marker.time / 86400) < dayStart / 86400) break;
+      if (marker.label === 'DIST' && Math.floor(marker.time / 86400) === dayStart / 86400) { distribution = marker; break; }
+    }
+    if (!distribution || distribution.bullish !== (side === 'LONG')) continue;
+    const signalKey = `${structure.time}:${distribution.time}:${side}`;
+    if (usedSignalKeys.has(signalKey)) continue;
+    usedSignalKeys.add(signalKey);
+
+    const entry = current.close;
+    const recent = history.slice(i - 4, i + 1);
+    const stop = side === 'LONG' ? Math.min(...recent.map((bar) => bar.low)) : Math.max(...recent.map((bar) => bar.high));
+    const risk = Math.abs(entry - stop);
+    if (!Number.isFinite(risk) || risk <= 0) continue;
+    const direction = side === 'LONG' ? 1 : -1;
+    const target1 = entry + direction * risk;
+    const target2 = entry + direction * risk * 2;
+    const horizon = Math.min(history.length - 1, i + 30);
+    const fullHorizonAvailable = i + 30 < history.length;
+    if (i < validationStartIndex && horizon >= validationStartIndex) continue;
+
+    let outcome: BacktestTrade['outcome'] = 'OPEN';
+    let exitTime: number | null = null;
+    let exitPrice: number | null = null;
+    let pnlR: number | null = null;
+    let target1Hit = false;
+    let target2Hit = false;
+    let maxAdverseR = 0;
+    let maxFavorableR = 0;
+    for (let j = i + 1; j <= horizon; j++) {
+      const bar = history[j];
+      maxAdverseR = Math.max(maxAdverseR, side === 'LONG' ? (entry - bar.low) / risk : (bar.high - entry) / risk);
+      maxFavorableR = Math.max(maxFavorableR, side === 'LONG' ? (bar.high - entry) / risk : (entry - bar.low) / risk);
+      const stopHit = side === 'LONG' ? bar.low <= stop : bar.high >= stop;
+      const target1Reached = side === 'LONG' ? bar.high >= target1 : bar.low <= target1;
+      const target2Reached = side === 'LONG' ? bar.high >= target2 : bar.low <= target2;
+      if (stopHit) {
+        outcome = target1Hit ? 'BREAKEVEN' : 'LOSS'; pnlR = target1Hit ? 0 : -1;
+        exitTime = bar.time; exitPrice = target1Hit ? (target1 + stop) / 2 : stop;
+        break;
+      }
+      if (target2Reached) {
+        target1Hit = true; target2Hit = true; outcome = 'WIN'; pnlR = 1.5;
+        exitTime = bar.time; exitPrice = (target1 + target2) / 2;
+        break;
+      }
+      if (target1Reached) target1Hit = true;
+    }
+    if (outcome === 'OPEN' && fullHorizonAvailable) {
+      const exitBar = history[horizon];
+      const unrealizedR = (side === 'LONG' ? exitBar.close - entry : entry - exitBar.close) / risk;
+      outcome = 'TIME'; exitTime = exitBar.time;
+      exitPrice = target1Hit ? (target1 + exitBar.close) / 2 : exitBar.close;
+      pnlR = target1Hit ? 0.5 + 0.5 * unrealizedR : unrealizedR;
+    }
+    const exitIndex = exitTime === null ? horizon : history.findIndex((bar) => bar.time === exitTime);
+    blockedThroughIndex = Math.max(i, exitIndex);
+    const phase = i >= validationStartIndex ? 'VALIDATION' : 'TRAIN';
+    const costR = pnlR !== null && exitPrice !== null
+      ? ((entry + exitPrice) * (Math.max(0, costs.feeBpsPerSide) + Math.max(0, costs.slippageBpsPerSide)) / 10_000) / risk
+      : null;
+    const netPnlR = pnlR !== null && costR !== null ? pnlR - costR : null;
+    const lossReview = outcome === 'LOSS'
+      ? `Candle-only replay: ${structure.type} and PO3 agreed, but stop was reached before TP1; maximum favorable ${Math.max(0, maxFavorableR).toFixed(2)}R and adverse ${Math.max(0, maxAdverseR).toFixed(2)}R. This describes the path, not a proven cause.`
+      : null;
+    results.push({
+      side, time: current.time, entry, stop, target1, target2, targetR: 2, score: 2, maxScore: 2,
+      reasons: [`SMC ${structure.type} confirmed at ${structure.price.toFixed(2)}`, `ICT PO3 ${side.toLowerCase()} distribution`, side === 'LONG' ? 'Previous-day discount' : 'Previous-day premium'],
+      strategyVersion: 1,
+      agentReads: [
+        { agent: 'SMC', bias: side, strength: 1, findings: [`${structure.type} confirmed by candle close`] },
+        { agent: 'ICT', bias: side, strength: 1, findings: [`PO3 distribution aligned; ${side === 'LONG' ? 'discount' : 'premium'} location`] },
+        { agent: 'ORDER FLOW', bias: 'WAIT', strength: 0, findings: ['Excluded from candle-only historical replay'] }
+      ],
+      phase, outcome, exitTime, exitPrice, pnlR, costR, netPnlR, target1Hit, target2Hit, lossReview
+    });
+  }
+  return results;
+}
+
 export function drawBacktestMarkers(args: {
   ctx: CanvasRenderingContext2D; chart: IChartApi; series: ISeriesApi<'Candlestick'>;
   width: number; height: number; trades: BacktestTrade[]; liveSetup?: TradeSetup | null;
@@ -267,7 +617,7 @@ export function drawBacktestMarkers(args: {
 }
 
 /** Transparent, bar-close order-flow rules. This is a study aid, not a profitability claim. */
-export function findOrderFlowSetup(candles: SignalCandle[], footprints: SerializedFootprintBar[], bids: [number, number][], asks: [number, number][], strategyVersion = 1, oiHistory: OIHistoryPoint[] = [], symbol = 'BTCUSDT', barSeconds = 60, smartAnalysis?: SmartMoneyAnalysis, normalizedOI?: NormalizedOIPoint[], dailyRanges?: DailyPriceRanges, signalTime?: number, footprintsByTime?: ReadonlyMap<number, SerializedFootprintBar>): TradeSetup | null {
+export function findOrderFlowSetup(candles: SignalCandle[], footprints: SerializedFootprintBar[], bids: [number, number][], asks: [number, number][], strategyVersion = 1, oiHistory: OIHistoryPoint[] = [], symbol = 'BTCUSDT', barSeconds = 60, smartAnalysis?: SmartMoneyAnalysis, normalizedOI?: NormalizedOIPoint[], dailyRanges?: DailyPriceRanges, signalTime?: number, footprintsByTime?: ReadonlyMap<number, SerializedFootprintBar>, allowMissingOI = false): TradeSetup | null {
   const candleLimit = upperBoundCandleTime(candles, signalTime ?? candles[candles.length - 1]?.time ?? 0);
   const recentCandles = candles.slice(Math.max(0, candleLimit - 8), candleLimit);
   const wantedTimes = new Set(recentCandles.map((bar) => bar.time));
@@ -294,7 +644,8 @@ export function findOrderFlowSetup(candles: SignalCandle[], footprints: Serializ
   const oiNow = oiIndex >= 0 ? oiRows[oiIndex] : null;
   const oiBefore = oiIndex > 0 ? oiRows[oiIndex - 1] : null;
   const oiRecent = !!oiNow && barCloseMs - oiNow.timeMs <= 10 * 60_000;
-  if (!oiBefore || !oiRecent) return null;
+  const oiAvailable = !!oiBefore && oiRecent;
+  if (!oiAvailable && !allowMissingOI) return null;
   const previous = bars.slice(-6, -1);
   const priorHigh = Math.max(...previous.map((bar) => bar.high));
   const priorLow = Math.min(...previous.map((bar) => bar.low));
@@ -345,8 +696,8 @@ export function findOrderFlowSetup(candles: SignalCandle[], footprints: Serializ
   const rollingProfileLong = !!rollingProfile && current.close > rollingProfile.poc;
   const rollingProfileShort = !!rollingProfile && current.close < rollingProfile.poc;
 
-  const oiExpansion = oiBefore.oi > 0 && (oiNow!.oi - oiBefore.oi) / oiBefore.oi >= minimumOiIncrease;
-  const previousOiSec = oiBefore.timeMs / 1000;
+  const oiExpansion = oiAvailable && oiBefore!.oi > 0 && (oiNow!.oi - oiBefore!.oi) / oiBefore!.oi >= minimumOiIncrease;
+  const previousOiSec = oiBefore?.timeMs ? oiBefore.timeMs / 1000 : current.time;
   const priceAtPreviousOi = candles[upperBoundCandleTime(candles, Math.min(previousOiSec, current.time)) - 1];
   const oiPriceUp = !!priceAtPreviousOi && current.close > priceAtPreviousOi.close;
   const oiPriceDown = !!priceAtPreviousOi && current.close < priceAtPreviousOi.close;
@@ -358,8 +709,10 @@ export function findOrderFlowSetup(candles: SignalCandle[], footprints: Serializ
   // Reject bars that fail the order-flow prerequisites before running the
   // structure/ICT replay. This keeps causal prefix analysis practical on a
   // month of minute bars while ensuring later candles never affect a decision.
-  const preAnalysisLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLong && breakoutLong && discountLong;
-  const preAnalysisShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShort && breakoutShort && premiumShort;
+  const oiLongPass = !oiAvailable || oiLong;
+  const oiShortPass = !oiAvailable || oiShort;
+  const preAnalysisLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLongPass && breakoutLong && discountLong;
+  const preAnalysisShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShortPass && breakoutShort && premiumShort;
   if (!preAnalysisLong && !preAnalysisShort) return null;
   const analysis = smartAnalysis ?? analyzeSmartMoney(candles.slice(0, candleLimit));
   const events = analysis.events;
@@ -388,21 +741,21 @@ export function findOrderFlowSetup(candles: SignalCandle[], footprints: Serializ
   const depthLong = depthAvailable && bidDepth >= askDepth * 1.5;
   const depthShort = depthAvailable && askDepth >= bidDepth * 1.5;
 
-  const longChecks = [stackedLong, deltaLong, cvdLong, rollingProfileLong, oiLong, structureLong, breakoutLong, po3Long, discountLong, ...(depthAvailable ? [depthLong] : [])];
-  const shortChecks = [stackedShort, deltaShort, cvdShort, rollingProfileShort, oiShort, structureShort, breakoutShort, po3Short, premiumShort, ...(depthAvailable ? [depthShort] : [])];
+  const longChecks = [stackedLong, deltaLong, cvdLong, rollingProfileLong, ...(oiAvailable ? [oiLong] : []), structureLong, breakoutLong, po3Long, discountLong, ...(depthAvailable ? [depthLong] : [])];
+  const shortChecks = [stackedShort, deltaShort, cvdShort, rollingProfileShort, ...(oiAvailable ? [oiShort] : []), structureShort, breakoutShort, po3Short, premiumShort, ...(depthAvailable ? [depthShort] : [])];
   const longScore = longChecks.filter(Boolean).length;
   const shortScore = shortChecks.filter(Boolean).length;
-  const mandatoryLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLong && structureLong && breakoutLong && po3Long && discountLong;
-  const mandatoryShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShort && structureShort && breakoutShort && po3Short && premiumShort;
+  const mandatoryLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLongPass && structureLong && breakoutLong && po3Long && discountLong;
+  const mandatoryShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShortPass && structureShort && breakoutShort && po3Short && premiumShort;
   const smcBias: SignalSide | null = structureLong ? 'LONG' : structureShort ? 'SHORT' : null;
   const ictBias: SignalSide | null = po3Long && discountLong ? 'LONG' : po3Short && premiumShort ? 'SHORT' : null;
-  const orderFlowLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLong;
-  const orderFlowShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShort;
+  const orderFlowLong = stackedLong && deltaLong && cvdLong && rollingProfileLong && oiLongPass;
+  const orderFlowShort = stackedShort && deltaShort && cvdShort && rollingProfileShort && oiShortPass;
   const orderFlowBias: SignalSide | null = orderFlowLong ? 'LONG' : orderFlowShort ? 'SHORT' : null;
   const agentReads: BacktestAgentRead[] = [
     { agent: 'SMC', bias: smcBias ?? 'WAIT', strength: smcBias ? 3 : 0, findings: [recentStructure ? `${recentStructure.type} break confirmed at ${recentStructure.price.toFixed(2)}` : 'No flow-confirmed BOS/CHoCH/MSS at this bar', recentSweep ? `${recentSweep.type} seen before setup` : 'No recent confirmed sweep'] },
     { agent: 'ICT', bias: ictBias ?? 'WAIT', strength: ictBias ? 3 : 0, findings: [po3Distribution ? `PO3 distribution ${po3Distribution.bullish ? 'up' : 'down'} confirmed` : 'No confirmed PO3 distribution', priorDayMidpoint !== null ? `Previous-day midpoint ${priorDayMidpoint.toFixed(2)}; price is ${discountLong ? 'discount' : premiumShort ? 'premium' : 'near midpoint'}` : 'Previous-day range unavailable'] },
-    { agent: 'ORDER FLOW', bias: orderFlowBias ?? 'WAIT', strength: orderFlowBias ? 3 : Math.min(3, [stackedLong || stackedShort, deltaLong || deltaShort, cvdLong || cvdShort, !!rollingProfile, oiExpansion].filter(Boolean).length), findings: [`Footprint stack ${Math.max(bestAskStack, bestBidStack)} levels; delta ${fp.delta.toFixed(3)}; CVD ${fp.cumulativeDelta.toFixed(3)}`, `Rolling POC ${rollingProfile?.poc.toFixed(2) ?? 'unavailable'}; OI ${oiExpansion ? 'expanding with price' : 'not confirmed'}`] }
+    { agent: 'ORDER FLOW', bias: orderFlowBias ?? 'WAIT', strength: orderFlowBias ? 3 : Math.min(3, [stackedLong || stackedShort, deltaLong || deltaShort, cvdLong || cvdShort, !!rollingProfile, oiAvailable && oiExpansion].filter(Boolean).length), findings: [`Footprint stack ${Math.max(bestAskStack, bestBidStack)} levels; delta ${fp.delta.toFixed(3)}; CVD ${fp.cumulativeDelta.toFixed(3)}`, `Rolling POC ${rollingProfile?.poc.toFixed(2) ?? 'unavailable'}; ${oiAvailable ? `OI ${oiExpansion ? 'expanding with price' : 'not confirmed'}` : 'OI unavailable · omitted from historical checks'}`] }
   ];
   const allAgentsAgreeLong = agentReads.every((agent) => agent.bias === 'LONG');
   const allAgentsAgreeShort = agentReads.every((agent) => agent.bias === 'SHORT');
@@ -437,7 +790,7 @@ export function findOrderFlowSetup(candles: SignalCandle[], footprints: Serializ
     side === 'LONG' ? `Ask imbalance: ${bestAskStack} consecutive levels at ${imbalanceRatio}:1 or stronger` : `Bid imbalance: ${bestBidStack} consecutive levels at ${imbalanceRatio}:1 or stronger`,
     `CVD moved ${side === 'LONG' ? 'up' : 'down'} on the closed bar`,
     `Trailing 30-bar volume profile accepted ${side === 'LONG' ? 'above' : 'below'} POC ${rollingProfile?.poc.toFixed(2) ?? '—'}`,
-    `OI expanded ${(oiBefore && oiNow ? ((oiNow.oi - oiBefore.oi) / oiBefore.oi * 100) : 0).toFixed(3)}% while price moved in the same direction`,
+    ...(oiAvailable ? [`OI expanded ${((oiNow!.oi - oiBefore!.oi) / oiBefore!.oi * 100).toFixed(3)}% while price moved in the same direction`] : ['OI unavailable; omitted from historical checks']),
     ...(recentStructure ? [`Recent confirmed ${recentStructure.type} aligns with ${side}`] : []),
     `PO3 distribution confirmed ${side === 'LONG' ? 'up' : 'down'} after manipulation`,
     `Previous-day ${side === 'LONG' ? 'discount' : 'premium'} accepted around ${priorDayMidpoint?.toFixed(2) ?? '—'}`,

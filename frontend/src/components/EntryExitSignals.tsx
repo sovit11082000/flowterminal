@@ -21,11 +21,15 @@ const keyFor = (symbol: string, timeframe: string) => `flowterminal_signal_${sym
 const fmt = (value: number) => value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 const intervalSeconds: Record<string, number> = { '1m': 60, '3m': 180, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
 
-export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, costs, onCostsChange, historicalOIStatus, tradeReplayInfo, onLiveSetupChange }: {
+export default function EntryExitSignals({ symbol, timeframe, candles, footprints, bids, asks, price, feedStatus, lastTradeAt, context, backtestTrades, mtfBacktestTrades, mtfV2BacktestTrades, orderFlowBacktestTrades, bookReplayInfo, costs, onCostsChange, historicalOIStatus, tradeReplayInfo, onLiveSetupChange }: {
   symbol: string; timeframe: string; candles: SignalCandle[]; footprints: SerializedFootprintBar[];
   bids: [number, number][]; asks: [number, number][]; price: number | null; feedStatus: string; lastTradeAt: number | null;
   context: ConfluenceContext;
   backtestTrades: BacktestTrade[];
+  mtfBacktestTrades: BacktestTrade[];
+  mtfV2BacktestTrades: BacktestTrade[];
+  orderFlowBacktestTrades: BacktestTrade[];
+  bookReplayInfo: { status: 'idle' | 'loading' | 'ready' | 'error'; samples: number; firstTime: number | null; lastTime: number | null };
   costs: BacktestCostAssumptions;
   onCostsChange: (costs: BacktestCostAssumptions) => void;
   tradeReplayInfo: { status: 'idle' | 'loading' | 'ready' | 'error'; sourceTradeCount: number; windowHours: number; barsCount: number };
@@ -102,7 +106,18 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     setJournal((current) => [row, ...current].slice(0, 200));
     if (result === 'LOSS' && position.strategyVersion === strategyVersion) setStrategyVersion((version) => Math.min(4, version + 1));
     setPosition(null);
-    setNotice(`Paper ${position.side.toLowerCase()} ${result} · ${pnlR.toFixed(2)}R · ${reason}. ${result === 'LOSS' ? 'That rule version is paused; the next stricter version will be evaluated.' : ''}`);
+    const nextStep = result !== 'LOSS' ? '' : position.strategyVersion < 3
+      ? ` V${position.strategyVersion + 1} stricter rules will be evaluated.`
+      : ' All three versions are now paused; start a new V1 paper cycle when ready.';
+    setNotice(`Paper ${position.side.toLowerCase()} ${result} · ${pnlR.toFixed(2)}R · ${reason}.${nextStep}`);
+  };
+
+  const restartPaperCycle = () => {
+    if (position) return;
+    setStrategyVersion(1);
+    // Keep the last signal key so a reset cannot immediately reopen the same bar.
+    // The next eligible, newly closed signal can start the new cycle.
+    setNotice('New V1 paper cycle ready. Existing journal is preserved; waiting for the next fresh signal.');
   };
 
   useEffect(() => {
@@ -173,7 +188,23 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   const paperLossR = journal.reduce((sum, row) => sum + Math.min(0, row.pnlR), 0);
   const paperProfitFactor = paperLossR < 0 ? paperWinR / Math.abs(paperLossR) : paperWinR > 0 ? Infinity : null;
   const completedBacktests = backtestTrades.filter((trade) => trade.outcome !== 'OPEN');
-  const reviewedLosses = backtestTrades.filter((trade) => (trade.netPnlR ?? 0) < 0 && trade.lossReview).slice(-5).reverse();
+  const completedMtfBacktests = mtfBacktestTrades.filter((trade) => trade.outcome !== 'OPEN');
+  const mtfNetWins = completedMtfBacktests.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
+  const mtfNetLosses = completedMtfBacktests.filter((trade) => (trade.netPnlR ?? 0) < 0).length;
+  const mtfNetR = completedMtfBacktests.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const mtfWinRate = completedMtfBacktests.length ? mtfNetWins / completedMtfBacktests.length * 100 : null;
+  const mtfValidation = completedMtfBacktests.filter((trade) => trade.phase === 'VALIDATION');
+  const mtfValidationNetR = mtfValidation.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const completedMtfV2Backtests = mtfV2BacktestTrades.filter((trade) => trade.outcome !== 'OPEN');
+  const mtfV2NetWins = completedMtfV2Backtests.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
+  const mtfV2NetLosses = completedMtfV2Backtests.filter((trade) => (trade.netPnlR ?? 0) < 0).length;
+  const mtfV2NetR = completedMtfV2Backtests.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const mtfV2Validation = completedMtfV2Backtests.filter((trade) => trade.phase === 'VALIDATION');
+  const mtfV2ValidationNetR = mtfV2Validation.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const backtestTradeLog = [...backtestTrades].reverse();
+  const backtestGrossWins = completedBacktests.filter((trade) => (trade.pnlR ?? 0) > 0).length;
+  const backtestGrossLosses = completedBacktests.filter((trade) => (trade.pnlR ?? 0) < 0).length;
+  const grossWinsErasedByCosts = completedBacktests.filter((trade) => (trade.pnlR ?? 0) > 0 && (trade.netPnlR ?? 0) <= 0).length;
   const backtestWins = completedBacktests.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
   const backtestLosses = completedBacktests.filter((trade) => (trade.netPnlR ?? 0) < 0).length;
   const backtestBreakeven = completedBacktests.filter((trade) => trade.outcome === 'BREAKEVEN').length;
@@ -181,6 +212,34 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
   const backtestOpen = backtestTrades.filter((trade) => trade.outcome === 'OPEN').length;
   const netBacktestR = completedBacktests.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
   const backtestWinRate = completedBacktests.length ? backtestWins / completedBacktests.length * 100 : null;
+  const setupTypeBreakdown = ['BOS', 'CHOCH', 'MSS'].map((type) => {
+    const trades = completedBacktests.filter((trade) => trade.reasons.some((reason) => reason.startsWith(`SMC ${type} `)));
+    const validation = trades.filter((trade) => trade.phase === 'VALIDATION');
+    return {
+      type,
+      trades: trades.length,
+      wins: trades.filter((trade) => (trade.netPnlR ?? 0) > 0).length,
+      losses: trades.filter((trade) => (trade.netPnlR ?? 0) < 0).length,
+      netR: trades.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0),
+      validationTrades: validation.length,
+      validationNetR: validation.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0)
+    };
+  });
+  const sideBreakdown = (['LONG', 'SHORT'] as const).map((side) => {
+    const trades = completedBacktests.filter((trade) => trade.side === side);
+    return {
+      side, trades: trades.length,
+      wins: trades.filter((trade) => (trade.netPnlR ?? 0) > 0).length,
+      losses: trades.filter((trade) => (trade.netPnlR ?? 0) < 0).length,
+      netR: trades.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0)
+    };
+  });
+  const withoutBosTrades = completedBacktests.filter((trade) => !trade.reasons.some((reason) => reason.startsWith('SMC BOS ')));
+  const withoutBosWins = withoutBosTrades.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
+  const withoutBosLosses = withoutBosTrades.filter((trade) => (trade.netPnlR ?? 0) < 0).length;
+  const withoutBosNetR = withoutBosTrades.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const withoutBosValidation = withoutBosTrades.filter((trade) => trade.phase === 'VALIDATION');
+  const withoutBosValidationNetR = withoutBosValidation.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
   const validationWinsR = validationTrades.reduce((sum, trade) => sum + Math.max(0, trade.netPnlR ?? 0), 0);
   const validationLossesR = validationTrades.reduce((sum, trade) => sum + Math.min(0, trade.netPnlR ?? 0), 0);
   const validationProfitFactor = validationLossesR < 0 ? validationWinsR / Math.abs(validationLossesR) : validationWinsR > 0 ? Infinity : null;
@@ -191,8 +250,16 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
     validationMaxDrawdownR = Math.max(validationMaxDrawdownR, validationPeakR - validationEquityR);
   }
   const replaySpanDays = signalCandleSpanDays(candles);
-  const replayVersions = [1, 2, 3].map((version) => ({ version, count: backtestTrades.filter((trade) => trade.strategyVersion === version).length }));
   const latestAgentReads = backtestTrades[backtestTrades.length - 1]?.agentReads ?? [];
+  const closedFootprintBars = footprints.filter((bar) => bar.isClosed);
+  const orderFlowCompleted = orderFlowBacktestTrades.filter((trade) => trade.outcome !== 'OPEN');
+  const orderFlowNetR = orderFlowCompleted.reduce((sum, trade) => sum + (trade.netPnlR ?? 0), 0);
+  const orderFlowNetWins = orderFlowCompleted.filter((trade) => (trade.netPnlR ?? 0) > 0).length;
+  const orderFlowNetLosses = orderFlowCompleted.filter((trade) => (trade.netPnlR ?? 0) < 0).length;
+  const orderFlowWinRate = orderFlowCompleted.length ? orderFlowNetWins / orderFlowCompleted.length * 100 : null;
+  const orderFlowGrossWins = orderFlowCompleted.filter((trade) => (trade.pnlR ?? 0) > 0).length;
+  const orderFlowBookFirst = bookReplayInfo.firstTime === null ? '—' : new Date(bookReplayInfo.firstTime).toLocaleString('en-IN');
+  const orderFlowBookLast = bookReplayInfo.lastTime === null ? '—' : new Date(bookReplayInfo.lastTime).toLocaleString('en-IN');
 
   return <section style={{ marginTop: 12, border: '1px solid #263449', borderRadius: 6, background: '#0b0e14', color: '#cbd5e1', overflow: 'hidden' }}>
     <header style={{ padding: '10px 12px', borderBottom: '1px solid #1f2937', display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
@@ -207,26 +274,95 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <ContextCell label="OPTIONS GAMMA CONTEXT" value={topGamma ? `${context.gamma?.source ?? 'Options'} max Γ×OI` : 'Unavailable'} detail={topGamma ? `Strike ${fmt(topGamma[0])} · not dealer net-GEX` : 'No valid option Gamma snapshot'} />
     </div>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', padding: '9px 12px', borderBottom: '1px solid #1f2937', background: '#0a1019', fontSize: 10 }}>
-      <b style={{ color: '#cbd5e1' }}>HISTORICAL REPLAY · {timeframe}</b>
+      <b style={{ color: '#cbd5e1' }}>SMC + ICT HISTORICAL REPLAY · {timeframe}</b>
       <span style={{ color: '#94a3b8' }}>{backtestTrades.length} entries · {replaySpanDays.toFixed(1)}d candles</span>
-      <span style={{ color: tradeReplayInfo.status === 'ready' ? '#67e8f9' : '#fbbf24' }}>Raw trade replay: {tradeReplayInfo.status === 'ready' ? `${tradeReplayInfo.sourceTradeCount.toLocaleString()} ${symbol} fills → ${tradeReplayInfo.barsCount} ${tradeReplayInfo.windowHours}h bars` : tradeReplayInfo.status === 'loading' ? 'aggregating retained fills…' : tradeReplayInfo.status === 'error' ? 'unavailable · using saved footprints' : 'not requested'}</span>
+      <span style={{ color: '#67e8f9' }}>Candle-only replay · order-flow is excluded</span>
+      <span style={{ color: tradeReplayInfo.status === 'ready' ? '#67e8f9' : '#fbbf24' }}>Live paper order-flow fills: {tradeReplayInfo.status === 'ready' ? `${tradeReplayInfo.sourceTradeCount.toLocaleString()} ${symbol} fills captured` : tradeReplayInfo.status === 'loading' ? 'loading recent fills…' : tradeReplayInfo.status === 'error' ? 'unavailable · saved footprints remain available' : 'not loaded'}</span>
+      <span style={{ color: '#34d399' }}>Gross wins {backtestGrossWins}</span>
+      <span style={{ color: '#fb7185' }}>Gross losses {backtestGrossLosses}</span>
       <span style={{ color: '#34d399' }}>Net wins {backtestWins}</span>
       <span style={{ color: '#fb7185' }}>Net losses {backtestLosses}</span>
-      <span style={{ color: '#fbbf24' }}>Breakeven {backtestBreakeven}</span>
-      <span style={{ color: '#94a3b8' }}>Timed {backtestTimed}</span>
+      <span style={{ color: grossWinsErasedByCosts ? '#fbbf24' : '#94a3b8' }}>Gross wins turned net-negative by costs {grossWinsErasedByCosts}</span>
+      <span style={{ color: '#fbbf24' }}>Gross breakeven exits {backtestBreakeven} · may be net losses after costs</span>
+      <span style={{ color: '#94a3b8' }}>Timed exits {backtestTimed} · included in net wins/losses</span>
       <span style={{ color: '#fbbf24' }}>Open {backtestOpen}</span>
       <span style={{ color: '#cbd5e1' }}>Win rate {backtestWinRate === null ? '—' : `${backtestWinRate.toFixed(1)}%`}</span>
       <span style={{ color: netBacktestR >= 0 ? '#34d399' : '#fb7185' }}>Net after estimated costs {netBacktestR >= 0 ? '+' : ''}{netBacktestR.toFixed(1)}R</span>
       <span style={{ color: validationReady ? '#34d399' : '#fbbf24' }}>Holdout {validationTrades.length} closed · {validationReady ? 'positive sample' : 'not validated'}</span>
-      <span style={{ color: '#64748b' }}>SMC + ICT + Order Flow must agree; manager plans entry, SL, TP1 and final 2R–4R target</span>
+      <span style={{ color: '#64748b' }}>Historical entries require candle-confirmed SMC + ICT agreement; fixed 2R target, estimated costs included</span>
     </div>
-    {historicalOIStatus === 'error' && <div style={{ padding: '0 12px 8px', color: '#fbbf24', fontSize: 10 }}>30-day Bybit OI history could not be loaded; historical order-flow replay may have fewer valid setups.</div>}
+    {historicalOIStatus === 'error' && <div style={{ padding: '0 12px 8px', color: '#fbbf24', fontSize: 10 }}>30-day Bybit OI history could not be loaded. It is not used in this candle-only SMC + ICT replay.</div>}
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>
       <span>Out-of-sample (last 30%) · expectancy {validationTrades.length ? `${(validationNetR / validationTrades.length >= 0 ? '+' : '')}${(validationNetR / validationTrades.length).toFixed(2)}R/trade` : '—'}</span>
       <span>Profit factor {validationProfitFactor === null ? '—' : Number.isFinite(validationProfitFactor) ? validationProfitFactor.toFixed(2) : '∞'}</span>
       <span>Max drawdown {validationMaxDrawdownR.toFixed(2)}R</span>
       <span>Estimated round-trip costs · {costs.feeBpsPerSide.toFixed(2)} bps fee + {costs.slippageBpsPerSide.toFixed(2)} bps slippage per side · funding/gap fills excluded</span>
     </div>
+    <details open style={{ borderTop: '1px solid #1f2937', borderBottom: '1px solid #1f2937', marginBottom: 8 }}>
+      <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10, color: '#fbbf24' }}>Loss breakdown by SMC trigger and trade side</summary>
+      <div style={{ padding: '0 12px 9px', fontSize: 9, color: '#94a3b8' }}>
+        These are trigger types inside the same combined SMC + ICT ruleset, not three independently tested strategies. Net results include estimated fees and slippage.
+        <div style={{ overflowX: 'auto', marginTop: 6 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', whiteSpace: 'nowrap' }}>
+            <thead><tr style={{ textAlign: 'left', color: '#64748b' }}>{['Trigger', 'Closed trades', 'Net wins', 'Net losses', 'Net result', 'Holdout trades', 'Holdout net'].map((label) => <th key={label} style={{ padding: '5px 7px', borderBottom: '1px solid #263449' }}>{label}</th>)}</tr></thead>
+            <tbody>{[
+              ...setupTypeBreakdown.map((row) => ({ label: row.type, ...row })),
+              ...sideBreakdown.map((row) => ({ label: row.side, ...row, validationTrades: 0, validationNetR: null as number | null }))
+            ].map((row) => <tr key={row.label} style={{ borderBottom: '1px solid #172033' }}>
+              <td style={{ padding: '5px 7px', color: '#cbd5e1' }}>{row.label}</td><td style={{ padding: '5px 7px' }}>{row.trades}</td>
+              <td style={{ padding: '5px 7px', color: '#34d399' }}>{row.wins}</td><td style={{ padding: '5px 7px', color: '#fb7185' }}>{row.losses}</td>
+              <td style={{ padding: '5px 7px', color: row.netR >= 0 ? '#34d399' : '#fb7185' }}>{row.netR >= 0 ? '+' : ''}{row.netR.toFixed(2)}R</td>
+              <td style={{ padding: '5px 7px' }}>{row.validationTrades}</td><td style={{ padding: '5px 7px' }}>{row.validationNetR === null ? '—' : `${row.validationNetR >= 0 ? '+' : ''}${row.validationNetR.toFixed(2)}R`}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+        <div style={{ marginTop: 7, color: '#fbbf24' }}>
+          BOS removed · same-data what-if only: {withoutBosTrades.length} trades · {withoutBosWins} net wins / {withoutBosLosses} net losses · {withoutBosNetR >= 0 ? '+' : ''}{withoutBosNetR.toFixed(2)}R; holdout {withoutBosValidation.length} trades · {withoutBosValidationNetR >= 0 ? '+' : ''}{withoutBosValidationNetR.toFixed(2)}R. This does not change paper/live rules and is not a fresh validation.
+        </div>
+      </div>
+    </details>
+    <details open style={{ border: '1px solid #164e63', margin: '0 12px 9px', borderRadius: 4, background: '#08131b' }}>
+      <summary style={{ cursor: 'pointer', padding: '8px 10px', color: '#67e8f9', fontSize: 10 }}>MTF V2 EXPERIMENT · 5m structure stop · 60m max hold · cost-risk filter ≤ 0.5R</summary>
+      <div style={{ padding: '0 10px 9px', fontSize: 10, color: '#94a3b8' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+          <span>Closed {completedMtfV2Backtests.length}</span><span>Net wins {mtfV2NetWins}</span><span>Net losses {mtfV2NetLosses}</span>
+          <span style={{ color: mtfV2NetR >= 0 ? '#34d399' : '#fb7185' }}>Net {mtfV2NetR >= 0 ? '+' : ''}{mtfV2NetR.toFixed(2)}R</span>
+          <span>Holdout {mtfV2Validation.length} · {mtfV2ValidationNetR >= 0 ? '+' : ''}{mtfV2ValidationNetR.toFixed(2)}R</span>
+        </div>
+        <div style={{ marginTop: 5 }}>Stop comes from the last five fully closed 5m candles; time exit is 60 minutes. A setup is skipped when estimated round-trip costs exceed half the initial stop risk. Research-only candidate; it does not change paper or live rules.</div>
+        {mtfV2BacktestTrades.length > 0 && <details style={{ marginTop: 6 }}>
+          <summary style={{ cursor: 'pointer', color: '#67e8f9' }}>V2 trade log · {mtfV2BacktestTrades.length}</summary>
+          <div style={{ overflowX: 'auto', marginTop: 5 }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, whiteSpace: 'nowrap' }}>
+            <thead><tr style={{ color: '#64748b', textAlign: 'left' }}>{['Signal', 'Side · phase', 'Entry', 'SL', 'TP1 / TP2', 'Net result', 'Reason'].map((label) => <th key={label} style={{ padding: 5, borderBottom: '1px solid #263449' }}>{label}</th>)}</tr></thead>
+            <tbody>{[...mtfV2BacktestTrades].reverse().map((trade, index) => <tr key={`${trade.time}-${index}`} style={{ borderBottom: '1px solid #172033' }}>
+              <td style={{ padding: 5 }}>{new Date(trade.time * 1000).toLocaleString('en-IN')}</td><td style={{ padding: 5 }}>{trade.side} · {trade.phase}</td><td style={{ padding: 5 }}>{fmt(trade.entry)}</td><td style={{ padding: 5 }}>{fmt(trade.stop)}</td><td style={{ padding: 5 }}>{fmt(trade.target1)} / {fmt(trade.target2)}</td><td style={{ padding: 5, color: (trade.netPnlR ?? 0) < 0 ? '#fb7185' : '#34d399' }}>{trade.netPnlR === null ? '—' : `${trade.netPnlR >= 0 ? '+' : ''}${trade.netPnlR.toFixed(2)}R`}</td><td style={{ padding: 5, whiteSpace: 'normal', minWidth: 300 }}>{trade.lossReview ?? trade.reasons.join(' · ')}</td>
+            </tr>)}</tbody>
+          </table></div>
+        </details>}
+      </div>
+    </details>
+    <details open style={{ border: '1px solid #164e63', margin: '0 12px 9px', borderRadius: 4, background: '#08131b' }}>
+      <summary style={{ cursor: 'pointer', padding: '8px 10px', color: '#67e8f9', fontSize: 10 }}>MTF SMC + ICT CANDIDATE · 4h/1h range · 15m/5m structure · 1m entry</summary>
+      <div style={{ padding: '0 10px 9px', fontSize: 10, color: '#94a3b8' }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+          <span>Trades {mtfBacktestTrades.length} · closed {completedMtfBacktests.length}</span>
+          <span>Net wins {mtfNetWins}</span><span>Net losses {mtfNetLosses}</span>
+          <span>Net win rate {mtfWinRate === null ? '— · no closed trades' : `${mtfWinRate.toFixed(1)}%`}</span>
+          <span style={{ color: mtfNetR >= 0 ? '#34d399' : '#fb7185' }}>Net {mtfNetR >= 0 ? '+' : ''}{mtfNetR.toFixed(2)}R</span>
+          <span>Holdout {mtfValidation.length} · {mtfValidationNetR >= 0 ? '+' : ''}{mtfValidationNetR.toFixed(2)}R</span>
+        </div>
+        <div style={{ marginTop: 5 }}>4h/1h confirmed swing highs-lows set premium/discount and 1h structure bias. 15m and 5m BOS/CHOCH/MSS must agree; a fresh 1m BOS/CHOCH/MSS triggers entry. Higher-timeframe bars are used only after their close. This is a candidate comparison, not an approved live rule; its historical window has already been viewed, so forward paper validation is still needed.</div>
+        {mtfBacktestTrades.length > 0 && <details style={{ marginTop: 6 }}>
+          <summary style={{ cursor: 'pointer', color: '#67e8f9' }}>MTF trade log · {mtfBacktestTrades.length} · newest first</summary>
+          <div style={{ overflowX: 'auto', marginTop: 5 }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, whiteSpace: 'nowrap' }}>
+            <thead><tr style={{ color: '#64748b', textAlign: 'left' }}>{['Signal', 'Side', 'Entry', 'SL', 'TP1 / TP2', 'Exit', 'Net', 'MTF evidence / review'].map((label) => <th key={label} style={{ padding: 5, borderBottom: '1px solid #263449' }}>{label}</th>)}</tr></thead>
+            <tbody>{[...mtfBacktestTrades].reverse().map((trade, index) => <tr key={`${trade.time}-${index}`} style={{ borderBottom: '1px solid #172033' }}>
+              <td style={{ padding: 5 }}>{new Date(trade.time * 1000).toLocaleString('en-IN')}</td><td style={{ padding: 5 }}>{trade.side} · {trade.phase}</td><td style={{ padding: 5 }}>{fmt(trade.entry)}</td><td style={{ padding: 5 }}>{fmt(trade.stop)}</td><td style={{ padding: 5 }}>{fmt(trade.target1)} / {fmt(trade.target2)}</td><td style={{ padding: 5 }}>{trade.exitTime === null ? 'Open' : new Date(trade.exitTime * 1000).toLocaleString('en-IN')}</td><td style={{ padding: 5, color: (trade.netPnlR ?? 0) < 0 ? '#fb7185' : '#34d399' }}>{trade.netPnlR === null ? '—' : `${trade.netPnlR >= 0 ? '+' : ''}${trade.netPnlR.toFixed(2)}R`}</td><td style={{ padding: 5, whiteSpace: 'normal', minWidth: 300 }}>{trade.lossReview ?? trade.reasons.join(' · ')}</td>
+            </tr>)}</tbody>
+          </table></div>
+        </details>}
+      </div>
+    </details>
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>
       <span>Cost assumptions (saved in this browser; update fee to match your Bybit account):</span>
       <label>Perp taker fee bps/side <input aria-label="Perp taker fee basis points per side" type="number" min="0" max="100" step="0.1" value={costs.feeBpsPerSide} onChange={(event) => onCostsChange({ ...costs, feeBpsPerSide: Math.min(100, Math.max(0, Number(event.target.value) || 0)) })} style={costInputStyle} /></label>
@@ -234,21 +370,70 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       <span>Bybit VIP 0 perp taker baseline is 5.5 bps; slippage 2 bps is only an editable estimate.</span>
     </div>
     <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>{flowHistoryLabel}</div>
-    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Each backtest entry is a strategy-generated setup from candles plus recorded/reconstructed trade-side footprints and OI—not one win/loss per raw fill. Raw fills are aggregated into 1m/5m bars from the retained 48h window; persistent order-book wall confirmation is required for live paper plans, and historical book coverage is too short for a book-based long-period result.</div>
-    {reviewedLosses.length > 0 && <details style={{ borderTop: '1px solid #1f2937', borderBottom: '1px solid #1f2937', marginBottom: 8 }}>
-      <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10, color: '#fda4af' }}>Backtest loss review · latest {reviewedLosses.length}</summary>
-      <div style={{ padding: '0 12px 9px', fontSize: 10, color: '#94a3b8' }}>{reviewedLosses.map((trade) => <div key={`${trade.time}-${trade.strategyVersion}`} style={{ padding: '6px 0', borderTop: '1px solid #172033' }}>
-        <b style={{ color: trade.side === 'LONG' ? '#34d399' : '#fb7185' }}>{new Date(trade.time * 1000).toLocaleString('en-IN')} · {trade.side} · V{trade.strategyVersion} · {trade.phase}</b>
-        <div style={{ marginTop: 3 }}>{trade.lossReview}</div>
-      </div>)}</div>
+    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Historical replay entries use candle-only SMC + ICT rules. Footprints, recent fills and order-book context are reserved for live paper order-flow analysis; no raw fill is counted as a strategy trade.</div>
+    {backtestTradeLog.length > 0 && <details style={{ borderTop: '1px solid #1f2937', borderBottom: '1px solid #1f2937', marginBottom: 8 }}>
+      <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10, color: '#fda4af' }}>Backtest trade log · {backtestTradeLog.length} entries · newest first</summary>
+      <div style={{ overflowX: 'auto', padding: '0 8px 9px' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, whiteSpace: 'nowrap' }}>
+          <thead><tr style={{ color: '#64748b', textAlign: 'left' }}>
+            {['Signal date / time', 'Side · split', 'Entry', 'SL', 'TP1 / TP2', 'Exit date / time', 'Exit price', 'Gross outcome · net result', 'Loss notes'].map((label) => <th key={label} style={{ padding: '6px 7px', borderBottom: '1px solid #263449' }}>{label}</th>)}
+          </tr></thead>
+          <tbody>{backtestTradeLog.map((trade, index) => {
+            const resultColor = trade.netPnlR === null ? '#94a3b8' : trade.netPnlR < 0 ? '#fb7185' : '#34d399';
+            return <tr key={`${trade.time}-${index}`} style={{ borderBottom: '1px solid #172033', verticalAlign: 'top' }}>
+              <td style={{ padding: '6px 7px' }}>{new Date(trade.time * 1000).toLocaleString('en-IN')}</td>
+              <td style={{ padding: '6px 7px', color: trade.side === 'LONG' ? '#34d399' : '#fb7185' }}>{trade.side} · {trade.phase}</td>
+              <td style={{ padding: '6px 7px' }}>{fmt(trade.entry)}</td>
+              <td style={{ padding: '6px 7px', color: '#fb7185' }}>{fmt(trade.stop)}</td>
+              <td style={{ padding: '6px 7px', color: '#34d399' }}>{fmt(trade.target1)} / {fmt(trade.target2)}</td>
+              <td style={{ padding: '6px 7px' }}>{trade.exitTime === null ? 'Still open' : new Date(trade.exitTime * 1000).toLocaleString('en-IN')}</td>
+              <td style={{ padding: '6px 7px' }}>{trade.exitPrice === null ? '—' : fmt(trade.exitPrice)}</td>
+              <td style={{ padding: '6px 7px', color: resultColor }}><div>{trade.outcome === 'WIN' ? 'TARGETS HIT' : trade.outcome === 'LOSS' ? 'STOP HIT' : trade.outcome}</div><div>{trade.netPnlR === null ? 'Net —' : `Net ${trade.netPnlR > 0 ? '+' : ''}${trade.netPnlR.toFixed(2)}R · ${trade.netPnlR > 0 ? 'PROFIT' : trade.netPnlR < 0 ? 'LOSS' : 'FLAT'}`}</div><div style={{ color: '#64748b' }}>gross {trade.pnlR === null ? '—' : `${trade.pnlR > 0 ? '+' : ''}${trade.pnlR.toFixed(2)}R`} · cost −{trade.costR === null ? '—' : `${trade.costR.toFixed(2)}R`}</div></td>
+              <td style={{ padding: '6px 7px', whiteSpace: 'normal', minWidth: 230 }}>{trade.lossReview ?? trade.reasons.join(' · ')}</td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </div>
+      <div style={{ padding: '0 12px 8px', color: '#64748b', fontSize: 9 }}>“TARGETS HIT” is the gross price outcome; the separate net result subtracts estimated round-trip fees and slippage. Net loss can occur even after targets hit when modeled costs exceed gross profit. Signal time is the candle close used for entry. Stop/target hits within the same candle are scored stop-first.</div>
     </details>}
+    <div style={{ borderTop: '1px solid #1f2937', padding: '9px 12px', background: '#0a1019', fontSize: 10 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center' }}>
+        <b style={{ color: '#cbd5e1' }}>SAVED ORDER-FLOW HISTORICAL REPLAY · {symbol} · {timeframe}</b>
+        <span>Raw trades: {tradeReplayInfo.status === 'ready' ? `${tradeReplayInfo.sourceTradeCount.toLocaleString()} rebuilt` : `${tradeReplayInfo.status} · saved footprints used`}</span>
+        <span>Closed footprint bars: {closedFootprintBars.length}</span>
+        <span>Captured range: {closedFootprintBars.length ? `${new Date(closedFootprintBars[0].time * 1000).toLocaleString('en-IN')} → ${new Date(closedFootprintBars[closedFootprintBars.length - 1].time * 1000).toLocaleString('en-IN')}` : '—'}</span>
+        <span>Book samples: {bookReplayInfo.status === 'ready' ? `${bookReplayInfo.samples.toLocaleString()} · ${orderFlowBookFirst} → ${orderFlowBookLast}` : `${bookReplayInfo.status} · depth omitted`}</span>
+        <span>Order-flow signals: {orderFlowBacktestTrades.length} · closed {orderFlowCompleted.length}</span>
+        <span>Net win rate {orderFlowWinRate === null ? '— · no closed trades' : `${orderFlowWinRate.toFixed(1)}%`}</span>
+        <span>Gross wins {orderFlowGrossWins}</span>
+        <span style={{ color: '#34d399' }}>Net wins {orderFlowNetWins}</span>
+        <span style={{ color: '#fb7185' }}>Net losses {orderFlowNetLosses}</span>
+        <span style={{ color: orderFlowNetR >= 0 ? '#34d399' : '#fb7185' }}>Net {orderFlowNetR >= 0 ? '+' : ''}{orderFlowNetR.toFixed(2)}R</span>
+      </div>
+      <div style={{ marginTop: 5, color: '#64748b' }}>Uses saved closed footprint price levels, bid/ask imbalance, delta/CVD and rolling POC. Historical OI and 5-level book depth are included only when available at the signal time; missing inputs are omitted, never treated as confirmation. Candle wicks score stops/targets; same-candle ordering is conservatively stop-first.</div>
+      {closedFootprintBars.length >= 6 && orderFlowBacktestTrades.length === 0 && <div style={{ marginTop: 5, color: '#fbbf24' }}>No setup passed the current strict order-flow rules in the saved-footprint sample. This is not a 0% win-rate result: there were no qualifying trades. The sample is short/incomplete and cannot establish profitability.</div>}
+      {orderFlowBacktestTrades.length > 0 && <details style={{ marginTop: 7 }}>
+        <summary style={{ cursor: 'pointer', color: '#67e8f9' }}>Order-flow trade log · {orderFlowBacktestTrades.length} entries · newest first</summary>
+        <div style={{ overflowX: 'auto', marginTop: 5 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9, whiteSpace: 'nowrap' }}>
+            <thead><tr style={{ color: '#64748b', textAlign: 'left' }}>{['Signal time', 'Side', 'Entry', 'SL', 'TP1 / TP', 'Exit time', 'Exit', 'Outcome / net', 'Signal evidence / review'].map((label) => <th key={label} style={{ padding: '5px 6px', borderBottom: '1px solid #263449' }}>{label}</th>)}</tr></thead>
+            <tbody>{[...orderFlowBacktestTrades].reverse().map((trade, index) => <tr key={`${trade.time}-${index}`} style={{ borderBottom: '1px solid #172033', verticalAlign: 'top' }}>
+              <td style={{ padding: 5 }}>{new Date(trade.time * 1000).toLocaleString('en-IN')}</td><td style={{ padding: 5 }}>{trade.side}</td><td style={{ padding: 5 }}>{fmt(trade.entry)}</td><td style={{ padding: 5 }}>{fmt(trade.stop)}</td><td style={{ padding: 5 }}>{fmt(trade.target1)} / {fmt(trade.target2)}</td><td style={{ padding: 5 }}>{trade.exitTime === null ? 'Open' : new Date(trade.exitTime * 1000).toLocaleString('en-IN')}</td><td style={{ padding: 5 }}>{trade.exitPrice === null ? '—' : fmt(trade.exitPrice)}</td><td style={{ padding: 5, color: (trade.netPnlR ?? 0) < 0 ? '#fb7185' : '#34d399' }}>{trade.outcome} · net {trade.netPnlR === null ? '—' : `${trade.netPnlR > 0 ? '+' : ''}${trade.netPnlR.toFixed(2)}R`}</td><td style={{ padding: 5, whiteSpace: 'normal', minWidth: 320 }}>{trade.lossReview ?? trade.reasons.join(' · ')}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+      </details>}
+    </div>
     {latestAgentReads.length > 0 && <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 6, padding: '0 12px 9px' }}>
       {latestAgentReads.map((read) => <div key={read.agent} style={{ padding: 7, border: '1px solid #1f2937', borderRadius: 4, background: '#0a1019', fontSize: 9 }}>
         <b style={{ color: read.bias === 'LONG' ? '#34d399' : read.bias === 'SHORT' ? '#fb7185' : '#94a3b8' }}>{read.agent} · {read.bias} · {read.strength}/3</b>
         {read.findings.map((finding) => <div key={finding} style={{ color: '#94a3b8', marginTop: 3 }}>{finding}</div>)}
       </div>)}
     </div>}
-    {!feedLive ? <div style={{ padding: 12, color: '#fbbf24', fontSize: 11 }}>Paper signal testing is paused because the exchange trade feed is stale or disconnected.</div> : strategyVersion > 3 ? <div style={{ padding: 12, color: '#fbbf24', fontSize: 11 }}>All three rule versions have recorded a loss and are paused. Review the paper journal before resetting or changing rules.</div> : position ? <div style={{ padding: 12 }}>
+    {!feedLive ? <div style={{ padding: 12, color: '#fbbf24', fontSize: 11 }}>Paper signal testing is paused because the exchange trade feed is stale or disconnected.</div> : strategyVersion > 3 ? <div style={{ padding: 12, color: '#fbbf24', fontSize: 11 }}>
+      All three rule versions have reached a losing trade and testing is paused. The saved journal is kept.
+      <button onClick={restartPaperCycle} style={{ ...buttonStyle, marginLeft: 10 }}>Start new V1 paper cycle</button>
+    </div> : position ? <div style={{ padding: 12 }}>
       <div style={{ color: sideColor, fontSize: 15, fontWeight: 800 }}>AUTO PAPER {position.side} · V{position.strategyVersion} · OPEN</div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, marginTop: 8, fontSize: 11 }}>
         <span>Entry <b>{fmt(position.entry)}</b></span><span>Stop / exit <b style={{ color: '#fb7185' }}>{fmt(position.stop)}</b></span>
@@ -285,12 +470,12 @@ export default function EntryExitSignals({ symbol, timeframe, candles, footprint
       </div>
       <div style={{ marginTop: 5, color: '#64748b' }}>Stored in this browser for this symbol/timeframe; survives refresh and Render restarts and uses no MongoDB space. Clearing browser site data will remove it. Results include the fee/slippage assumptions recorded with each trade.</div>
     </div>
-    <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>Strategy test: {strategyVersion > 3 ? 'ALL VERSIONS PAUSED' : `V${strategyVersion} active`}; {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'WIN').length} wins / {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'LOSS').length} losses in saved journal. A net loss pauses that version and moves to stricter confluence rules.</div>
+    <div style={{ padding: '0 12px 9px', color: '#94a3b8', fontSize: 10 }}>Strategy test: {strategyVersion > 3 ? 'ALL VERSIONS PAUSED' : `V${strategyVersion} active`}; {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'WIN').length} wins / {journal.filter((row) => row.strategyVersion === strategyVersion && row.result === 'LOSS').length} losses in saved journal. Each losing paper trade advances to stricter rules; a loss on V3 pauses the cycle. Starting a new V1 cycle preserves this journal.</div>
     <details style={{ borderTop: '1px solid #1f2937' }}>
       <summary style={{ cursor: 'pointer', padding: '8px 12px', fontSize: 10 }}>Recent paper decision log · {journal.length}</summary>
       {journal.length ? <div style={{ padding: '0 12px 10px', fontSize: 10, color: '#94a3b8' }}>{journal.map((row, index) => <div key={`${row.closedAt}-${index}`} style={{ padding: '4px 0' }}>{new Date(row.closedAt).toLocaleString('en-IN')} · V{row.strategyVersion} · {row.side} · {fmt(row.entry)} → {fmt(row.exit)} · <b style={{ color: row.result === 'WIN' ? '#34d399' : row.result === 'LOSS' ? '#fb7185' : '#fbbf24' }}>{row.result} {row.pnlR.toFixed(2)}R</b> · {row.reason}</div>)}</div> : <div style={{ padding: '0 12px 10px', fontSize: 10, color: '#64748b' }}>No closed paper trades yet.</div>}
     </details>
-    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>Replay versions: {replayVersions.map(({ version, count }) => `V${version} ${count}`).join(' · ')}. Only training-period net losses tighten later rules; the final 30% holdout is frozen for evaluation. These SMC, ICT, Order Flow and manager reads are deterministic rules, not AI model calls or self-training. Replay uses recorded footprints/OI only where saved. Costs estimate taker fees/slippage on both sides; they do not model funding or gap-through-stop fills. No automatic exchange orders.</div>
+    <div style={{ padding: '0 12px 9px', color: '#64748b', fontSize: 9 }}>One fixed SMC + ICT ruleset: timestamped candle structure (BOS/CHoCH/MSS), same-day PO3 distribution and previous-day premium/discount. It does not use footprints, order-book depth, OI, funding or future bars to create entries. The final 30% of candles is the holdout and training trades crossing into it are excluded. Trades use a 5-bar structural stop, 1R/2R scale-out and a 30-bar time exit; same-bar stop/target ambiguity is scored conservatively. Costs estimate taker fees/slippage on both sides; funding and gap-through-stop fills are excluded. Rules are deterministic, not AI self-training. No exchange orders are sent.</div>
   </section>;
 }
 

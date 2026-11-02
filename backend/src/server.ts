@@ -35,7 +35,7 @@ import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
 import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoHistoryStore.js';
 import { runOrderFlowCouncil, analyzeTradeOutcomeWithAI, type AgentSnapshot } from './agents/orderFlowCouncil.js';
-import { sendTradeEntryAlert, sendTradeOutcomeAlert } from './services/telegramService.js';
+import { sendTradeEntryAlert, sendTradeOutcomeAlert, sendTelegramMessage } from './services/telegramService.js';
 
 function loadProjectEnv(): void {
   const candidates = [resolve(process.cwd(), '.env'), resolve(process.cwd(), '..', '.env')];
@@ -52,20 +52,24 @@ loadProjectEnv();
 let currentMarketStatus: ConnectionStatus = 'DISCONNECTED';
 let lastTradeReceivedAt: number | null = null;
 let lastCouncilRequestAt = 0;
+
 interface MarketPipeline {
   orderBook: OrderBookState;
   footprints: Record<FootprintTimeframe, OrderFlowAggregator>;
 }
+
 const CANDLE_INTERVALS: Record<string, CandleTimeframe> = {
   '1': '1m', '3': '3m', '5': '5m', '15': '15m', '30': '30m', '60': '1h', '240': '4h', D: '1d'
 };
 const SUPPORTED_CANDLE_TIMEFRAMES = new Set<CandleTimeframe>(Object.values(CANDLE_INTERVALS));
+
 const tickSizes: Record<string, number> = {
   BTCUSDT: 0.1, ETHUSDT: 0.01, SOLUSDT: 0.01, XRPUSDT: 0.0001,
   BNBUSDT: 0.01, DOGEUSDT: 0.00001, ADAUSDT: 0.0001, LINKUSDT: 0.001,
   AVAXUSDT: 0.01, XAUTUSDT: 0.1
 };
 let resolvedTickSizes: Record<string, number> = { ...tickSizes };
+
 const footprintHistory = new FootprintHistoryStore();
 const marketPipelines = new Map<string, MarketPipeline>(SUPPORTED_SYMBOLS.map((symbol): [string, MarketPipeline] => [symbol, {
   orderBook: new OrderBookState(),
@@ -111,6 +115,7 @@ const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
 const liquidationHistory = new LiquidationHistoryStore();
 const mongoHistory = new MongoHistoryStore();
+
 type MongoWriteTask = { label: string; priority: number; write: () => Promise<void> };
 const mongoWriteQueue: MongoWriteTask[] = [];
 const MAX_PENDING_MONGO_WRITES = 1024;
@@ -130,7 +135,7 @@ function mongoWritePriority(label: string): number {
   if (label === 'footprint bar') return 3;
   if (label === 'trades') return 2;
   if (label === 'liquidations') return 1;
-  return 0; // Order-book samples are reconstructible from the next snapshot.
+  return 0;
 }
 
 function recordDroppedMongoWrite(label: string): void {
@@ -160,9 +165,6 @@ function drainMongoWriteQueue(): void {
 
 function persistToMongo(label: string, write: () => Promise<void>): void {
   if (mongoWriteQueue.length >= MAX_PENDING_MONGO_WRITES) {
-    // Keep completed footprint bars ahead of high-rate tape and sampled book
-    // writes. At equal priority, evict the oldest queued write so recent records
-    // remain available after a temporary MongoDB slowdown.
     const incomingPriority = mongoWritePriority(label);
     let lowest = 0;
     for (let i = 1; i < mongoWriteQueue.length; i++) {
@@ -213,6 +215,7 @@ async function waitForMongoWrites(maxWaitMs = 20_000): Promise<void> {
     console.warn(`[MongoDB] Shutdown wait expired with ${mongoWriteQueue.length} queued and ${activeMongoWrites} active writes.`);
   }
 }
+
 async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, readLocal: () => T): Promise<T> {
   if (!mongoHistory.connected) return readLocal();
   try { return await readMongo(); }
@@ -221,6 +224,7 @@ async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, r
     return readLocal();
   }
 }
+
 const liveTickerBySymbol = new Map<string, { lastPrice: number | null; markPrice: number | null; indexPrice: number | null }>();
 const latestExchangeCandles = new Map<string, NormalizedCandle>();
 const firstFootprintBarByKey = new Map<string, number>();
@@ -273,6 +277,47 @@ async function getThirtyDayOpenInterest(symbol: string): Promise<Array<{ openInt
   }
 }
 
+// --- LIVE AUTONOMOUS TRADING & TELEGRAM STATE ---
+interface LiveActiveTrade {
+  symbol: string;
+  decision: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  targetR: number;
+  reasons: string[];
+  strategies: string[];
+  summary: string;
+  barsHeld: number;
+  enteredAt: number;
+}
+
+// Track active positions per symbol across all supported coins
+const liveActiveTrades = new Map<string, LiveActiveTrade>();
+const liveLearnedLessons: string[] = [];
+let liveCouncilInFlight = false;
+let isAutoTradingEnabled = true;
+let lastQuotaAlertTime = 0;
+
+// Agar Groq / Gemini quota limit reach kare to Telegram par turant alert bhejo aur auto-trade pause karo
+async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
+  const now = Date.now();
+  if (now - lastQuotaAlertTime < 5 * 60_000) return; // 5 minute me 1 baar hi Telegram par notify karo
+  lastQuotaAlertTime = now;
+  isAutoTradingEnabled = false; // System khud auto pause ho jayega taaki rate limits aur na bigde
+
+  const alertText = `⚠️ <b>FLOWTERMINAL ALERT: API QUOTA EXHAUSTED</b>
+━━━━━━━━━━━━━━━━━━━━
+🚨 <b>Status:</b> Groq / AI Provider rate limit ya daily quota reach ho gaya hai!
+🔍 <b>Error:</b> <code>${errorMsg.slice(0, 160)}</code>
+
+⏸️ <b>Auto Trader ko temporarly PAUSE kar diya gaya hai.</b>
+👉 Groq keys update karne ke baad UI se "RESUME AUTO" daba kar wapas start kar sakte ho.
+━━━━━━━━━━━━━━━━━━━━`;
+
+  await sendTelegramMessage(alertText);
+}
+
 // Create HTTP server for REST endpoints
 const server = http.createServer(async (req, res) => {
   // CORS Headers
@@ -299,20 +344,47 @@ const server = http.createServer(async (req, res) => {
     query: Object.fromEntries(requestUrl.searchParams.entries()) as Record<string, string>
   };
 
+  // Status check for UI Toggle Button
+  if (req.method === 'GET' && parsed.pathname === '/api/agents/auto-status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ autoTrading: isAutoTradingEnabled }));
+    return;
+  }
+
+  // Toggle Auto Trading On/Off from UI Button
+  if (req.method === 'POST' && parsed.pathname === '/api/agents/toggle-auto') {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    try {
+      const data = JSON.parse(body || '{}') as { active?: boolean };
+      if (typeof data.active === 'boolean') {
+        isAutoTradingEnabled = data.active;
+      } else {
+        isAutoTradingEnabled = !isAutoTradingEnabled;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ autoTrading: isAutoTradingEnabled }));
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid payload' }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && parsed.pathname === '/api/agents/analyze') {
     const origin = req.headers.origin;
     const forwardedProtocol = req.headers['x-forwarded-proto'];
     const requestProtocol = (Array.isArray(forwardedProtocol) ? forwardedProtocol[0] : forwardedProtocol)?.split(',')[0] ?? 'http';
     const requestHost = req.headers.host;
     const sameOrigin = Boolean(requestHost && origin === `${requestProtocol}://${requestHost}`);
-    if (origin && !sameOrigin && origin !== 'http://localhost:3000' && origin !== 'http://127.0.0.1:3000') {
+    if (origin && !sameOrigin && origin !== 'http://localhost:3000' && origin !== 'http://127.0.0.1:3000' && origin !== 'http://localhost:5173') {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Agent analysis accepts requests only from the local FlowTerminal UI.' }));
       return;
     }
-    if (Date.now() - lastCouncilRequestAt < 60_000) {
-      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil((60_000 - (Date.now() - lastCouncilRequestAt)) / 1000)) });
-      res.end(JSON.stringify({ error: 'The agent team can be run once per minute to conserve the Google AI Studio project quota.' }));
+    if (Date.now() - lastCouncilRequestAt < 15_000) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil((15_000 - (Date.now() - lastCouncilRequestAt)) / 1000)) });
+      res.end(JSON.stringify({ error: 'Please wait a few seconds between manual analysis requests.' }));
       return;
     }
     try {
@@ -340,7 +412,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if ((snapshot.feedStatus !== 'LIVE' && snapshot.feedStatus !== 'DESYNCHRONIZED') ||
-        snapshot.lastTradeAt === null || Date.now() - snapshot.lastTradeAt >= 15_000) {
+        snapshot.lastTradeAt === null || Date.now() - snapshot.lastTradeAt >= 25_000) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Order-flow analysis is paused because the live trade feed is stale.' }));
         return;
@@ -350,7 +422,11 @@ const server = http.createServer(async (req, res) => {
       if (mongoHistory.connected) {
         try {
           paperPerformance = await mongoHistory.getAgentPaperPerformance(snapshot.symbol, snapshot.timeframe);
-          snapshot.paperPerformance = paperPerformance;
+          const persistentLessons = await mongoHistory.getLearnedLessons(10);
+          snapshot.paperPerformance = {
+            ...paperPerformance,
+            learnedLessons: [...persistentLessons, ...liveLearnedLessons]
+          };
         } catch (error) {
           console.warn('[MongoDB] Could not load prior agent outcomes:', error instanceof Error ? error.message : error);
         }
@@ -365,6 +441,9 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ...result, paperPerformance, paperPlanSaved }));
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Agent analysis failed.';
+      if (message.includes('429') || message.includes('quota') || message.includes('rate limit')) {
+        void handleQuotaExhaustedAlert(message);
+      }
       const status = message.includes('too large') ? 413 : message.includes('not configured') ? 503 : message.includes('quota') ? 429 : 502;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: message }));
@@ -390,20 +469,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const result = await restService.fetchHistoricalCandles({
-        symbol,
-        timeframe,
-        startTimeMs,
-        endTimeMs
-      });
-
+      const result = await restService.fetchHistoricalCandles({ symbol, timeframe, startTimeMs, endTimeMs });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
     } catch (err: unknown) {
       if (err instanceof BybitRestServiceError) {
-        res.writeHead(err.status && err.status >= 400 && err.status < 600 ? err.status : 502, {
-          'Content-Type': 'application/json'
-        });
+        res.writeHead(err.status && err.status >= 400 && err.status < 600 ? err.status : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message, code: err.code }));
       } else {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -564,7 +635,6 @@ const server = http.createServer(async (req, res) => {
     }
     try {
       const now = Date.now();
-      // Share an in-flight pagination job across browser retries/dev remounts.
       const points = await getThirtyDayOpenInterest(symbol);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ symbol, interval: '5min', requestedDays: 30, openInterest: points, fetchedAt: now }));
@@ -653,21 +723,16 @@ const server = http.createServer(async (req, res) => {
       mongoWriteQueue: {
         pending: mongoWriteQueue.length, active: activeMongoWrites, maxPending: MAX_PENDING_MONGO_WRITES,
         bufferedTrades: bufferedMongoTrades.length,
-        dropped: { ...droppedMongoWrites },
-        pendingByType: mongoWriteQueue.reduce<Record<string, number>>((counts, task) => {
-          counts[task.label] = (counts[task.label] ?? 0) + 1;
-          return counts;
-        }, {})
+        dropped: { ...droppedMongoWrites }
       },
-      retention: { footprintsDays: 1, footprintsHours: 24, orderBookHours: 24, orderBookLevelsPerSide: 5, otherRecordedDataHours: 48, orderBookSampleSeconds: 15 },
+      retention: { footprintsDays: 7, otherRecordedDataHours: 48 },
       trades: tradeHistory.getStatus(), orderBook: orderBookHistory.getStatus(), footprints: footprintHistory.getStatus(),
       storage: { provider: mongoHistory.connected ? 'mongodb' : 'local', mongoCounts }
     }));
     return;
   }
 
-  // In production, serve the built Vite app from this same service so its API
-  // and WebSocket connections share the Render hostname and service hours.
+  // Serve static Frontend UI in production
   if ((req.method === 'GET' || req.method === 'HEAD') && !parsed.pathname?.startsWith('/api/')) {
     const frontendDirectory = [
       resolve(process.cwd(), 'frontend', 'dist'),
@@ -676,7 +741,7 @@ const server = http.createServer(async (req, res) => {
     if (frontendDirectory) {
       const indexFile = resolve(frontendDirectory, 'index.html');
       let requestedPath = '/';
-      try { requestedPath = decodeURIComponent(parsed.pathname || '/'); } catch { /* use the app root for malformed paths */ }
+      try { requestedPath = decodeURIComponent(parsed.pathname || '/'); } catch { /* ignore */ }
       const candidate = resolve(frontendDirectory, `.${requestedPath}`);
       const isInsideFrontend = candidate.startsWith(`${frontendDirectory}${sep}`) || candidate === indexFile;
       const requestedFile = isInsideFrontend && existsSync(candidate) && statSync(candidate).isFile() ? candidate : indexFile;
@@ -726,8 +791,6 @@ export function broadcast(msg: GatewayMessage): void {
   }
 }
 
-// Keep aggregation trade-by-trade, but defer sorting/serialization/JSON broadcast
-// for forming bars. A Set deduplicates each aggregator without per-trade closures.
 const dirtyFootprintAggregators = new Set<OrderFlowAggregator>();
 let footprintFlushTimer: NodeJS.Timeout | null = null;
 function queueFormingFootprint(aggregator: OrderFlowAggregator): void {
@@ -759,67 +822,54 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
   broadcast(statusMsg);
 }
 
-
-// --- LIVE AUTONOMOUS TRADING & TELEGRAM ALERT ENGINE ---
-interface LiveActiveTrade {
-  symbol: string;
-  decision: 'LONG' | 'SHORT';
-  entryPrice: number;
-  stopPrice: number;
-  targetPrice: number;
-  targetR: number;
-  reasons: string[];
-  strategies: string[];
-  summary: string;
-  barsHeld: number;
-  enteredAt: number;
-}
-
-let liveActiveTrade: LiveActiveTrade | null = null;
-const liveLearnedLessons: string[] = [];
-let liveCouncilInFlight = false;
-
+// --- LIVE BAR PROCESSING, AUTONOMOUS TRADING & POST-MORTEM LEARNING ---
 async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar): Promise<void> {
-  // 1. Monitor open trade outcome in real-time (Node.js does this with zero AI cost)
-  if (liveActiveTrade && liveActiveTrade.symbol === symbol) {
-    liveActiveTrade.barsHeld += 1;
+  // Agar auto-trading user ne pause ki hui hai, to execution aage nahi badhegi
+  if (!isAutoTradingEnabled) {
+    return;
+  }
+
+  // 1. Is symbol ki open trade ko monitor karna (Zero AI cost - Node.js local math)
+  const currentTrade = liveActiveTrades.get(symbol);
+  if (currentTrade) {
+    currentTrade.barsHeld += 1;
     let outcome: 'WIN' | 'LOSS' | 'OPEN' = 'OPEN';
     let exitPrice = bar.close;
 
-    if (liveActiveTrade.decision === 'LONG') {
-      if (bar.low <= liveActiveTrade.stopPrice) {
+    if (currentTrade.decision === 'LONG') {
+      if (bar.low <= currentTrade.stopPrice) {
         outcome = 'LOSS';
-        exitPrice = liveActiveTrade.stopPrice;
-      } else if (bar.high >= liveActiveTrade.targetPrice) {
+        exitPrice = currentTrade.stopPrice;
+      } else if (bar.high >= currentTrade.targetPrice) {
         outcome = 'WIN';
-        exitPrice = liveActiveTrade.targetPrice;
+        exitPrice = currentTrade.targetPrice;
       }
     } else {
-      if (bar.high >= liveActiveTrade.stopPrice) {
+      if (bar.high >= currentTrade.stopPrice) {
         outcome = 'LOSS';
-        exitPrice = liveActiveTrade.stopPrice;
-      } else if (bar.low <= liveActiveTrade.targetPrice) {
+        exitPrice = currentTrade.stopPrice;
+      } else if (bar.low <= currentTrade.targetPrice) {
         outcome = 'WIN';
-        exitPrice = liveActiveTrade.targetPrice;
+        exitPrice = currentTrade.targetPrice;
       }
     }
 
-    if (outcome !== 'OPEN' || liveActiveTrade.barsHeld >= 15) {
+    if (outcome !== 'OPEN' || currentTrade.barsHeld >= 15) {
       const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN'
         ? outcome
-        : (liveActiveTrade.decision === 'LONG' ? (exitPrice >= liveActiveTrade.entryPrice ? 'WIN' : 'LOSS') : (exitPrice <= liveActiveTrade.entryPrice ? 'WIN' : 'LOSS'));
+        : (currentTrade.decision === 'LONG' ? (exitPrice >= currentTrade.entryPrice ? 'WIN' : 'LOSS') : (exitPrice <= currentTrade.entryPrice ? 'WIN' : 'LOSS'));
 
-      const risk = Math.abs(liveActiveTrade.entryPrice - liveActiveTrade.stopPrice) || 1;
-      const diff = liveActiveTrade.decision === 'LONG' ? exitPrice - liveActiveTrade.entryPrice : liveActiveTrade.entryPrice - exitPrice;
+      const risk = Math.abs(currentTrade.entryPrice - currentTrade.stopPrice) || 1;
+      const diff = currentTrade.decision === 'LONG' ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
       const pnlR = Number((diff / risk).toFixed(2));
-      const finishedTrade = { ...liveActiveTrade };
-      liveActiveTrade = null;
+      const finishedTrade = { ...currentTrade };
+      liveActiveTrades.delete(symbol);
 
-      console.log(`[Live Trade Resolved] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
+      console.log(`[Trade Resolved] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
 
       const forwardContext = resolvedOutcome === 'WIN'
-        ? `Target reached at $${exitPrice.toFixed(1)} within ${finishedTrade.barsHeld} bars with strong order-flow continuation.`
-        : `Stop loss hit at $${exitPrice.toFixed(1)} within ${finishedTrade.barsHeld} bars.`;
+        ? `Target reached at $${exitPrice.toFixed(2)} within ${finishedTrade.barsHeld} bars with strong order-flow continuation.`
+        : `Stop loss hit at $${exitPrice.toFixed(2)} within ${finishedTrade.barsHeld} bars.`;
 
       void analyzeTradeOutcomeWithAI(
         {
@@ -839,9 +889,17 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       ).then(async (insight) => {
         if (resolvedOutcome === 'LOSS') {
           liveLearnedLessons.push(insight);
-          console.log(`[Live AI Post-Mortem Rule]: "${insight}"`);
+          if (mongoHistory.connected) {
+            void mongoHistory.saveLearnedLesson({
+              symbol,
+              outcome: 'LOSS',
+              lesson: insight,
+              source: 'LIVE'
+            });
+          }
+          console.log(`[AI Rule Learned for ${symbol}]: "${insight}"`);
         } else {
-          console.log(`[Live AI Win Signature]: "${insight}"`);
+          console.log(`[AI Win Signature for ${symbol}]: "${insight}"`);
         }
 
         await sendTradeOutcomeAlert({
@@ -854,14 +912,14 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           barsHeld: finishedTrade.barsHeld,
           lessonLearned: insight
         });
-      }).catch((e) => console.warn('[Live AI Learning Warning]:', e instanceof Error ? e.message : e));
+      }).catch((e) => console.warn('[AI Learning Warning]:', e instanceof Error ? e.message : e));
 
       return;
     }
   }
 
-  // 2. If no active trade is open, run smart market trigger
-  if (!liveActiveTrade && !liveCouncilInFlight) {
+  // 2. Agar is specific symbol par koi open trade nahi hai aur AI busy nahi hai, naya setup evaluate karo
+  if (!liveActiveTrades.has(symbol) && !liveCouncilInFlight) {
     const pipeline = marketPipelines.get(symbol);
     if (!pipeline) return;
 
@@ -874,6 +932,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     const isDeltaSpike = Math.abs(bar.delta) >= 20;
     const isFiveMinBoundary = bar.time % 300 === 0;
 
+    // Faltu bars par AI trigger nahi karenge (Rate limit aur token bachane ke liye)
     if (!isLocalExtreme && !isDeltaSpike && !isFiveMinBoundary) {
       return;
     }
@@ -887,6 +946,12 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         low: b.low,
         close: b.close
       }));
+
+      // MongoDB se purane lessons bhi include karo
+      let persistentLessons: string[] = [];
+      if (mongoHistory.connected) {
+        persistentLessons = await mongoHistory.getLearnedLessons(10);
+      }
 
       const snapshot: AgentSnapshot = {
         symbol,
@@ -913,7 +978,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           winRate: null,
           averageR: null,
           recent: [],
-          learnedLessons: [...liveLearnedLessons]
+          learnedLessons: [...persistentLessons, ...liveLearnedLessons]
         }
       };
 
@@ -921,10 +986,10 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       const plan = councilResult.plan;
 
       if (plan.decision !== 'WAIT') {
-        console.log(`\n🚨 [LIVE TRADE TRIGGERED]: ${plan.decision} @ $${plan.entryPrice}`);
+        console.log(`\n🚨 [LIVE TRADE TRIGGERED]: ${plan.decision} ${symbol} @ $${plan.entryPrice}`);
         console.log(`   SL: $${plan.stopPrice} | TP: $${plan.targetPrice} (${plan.targetR}R)`);
 
-        liveActiveTrade = {
+        const newTrade: LiveActiveTrade = {
           symbol,
           decision: plan.decision,
           entryPrice: plan.entryPrice!,
@@ -937,6 +1002,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           barsHeld: 0,
           enteredAt: Date.now()
         };
+        liveActiveTrades.set(symbol, newTrade);
 
         void sendTradeEntryAlert({
           symbol,
@@ -955,7 +1021,11 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         }
       }
     } catch (err) {
-      console.warn('[Live Council Error]:', err instanceof Error ? err.message : err);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
+        void handleQuotaExhaustedAlert(msg);
+      }
+      console.warn('[Live Council Error]:', msg);
     } finally {
       liveCouncilInFlight = false;
     }
@@ -1000,17 +1070,15 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       };
       const ticker = { lastPrice: readPrice('lastPrice'), markPrice: readPrice('markPrice'), indexPrice: readPrice('indexPrice') };
       liveTickerBySymbol.set(symbol, ticker);
-      broadcast({ type: 'TICKER', data: {
-        symbol,
-        ...ticker
-      }, timestamp: Date.now() });
+      broadcast({ type: 'TICKER', data: { symbol, ...ticker }, timestamp: Date.now() });
     } else if (topic.startsWith('publicTrade.')) {
       const trades = parsePublicTradePayload(payload);
       if (trades.length > 0) {
         lastTradeReceivedAt = Date.now();
         tradeHistory.save(trades);
         if (process.env.MONGO_PERSIST_RAW_TRADES === 'true') queueMongoTrades(trades);
-        // 1. Broadcast Raw Normalized Trades
+        
+        // Broadcast raw trades to UI
         const tradeMsg: TradeGatewayMessage = {
           type: 'TRADE',
           data: trades,
@@ -1018,7 +1086,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
         };
         broadcast(tradeMsg);
 
-        // 2. Feed Trades to OHLC Bar Aggregator & Order Flow Engine
+        // Process in Order Flow Aggregator
         for (const trade of trades) {
           const pipeline = marketPipelines.get(trade.symbol);
           if (!pipeline) continue;
@@ -1027,13 +1095,11 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
           if (fpBar1m) {
             const fpKey1m = `${trade.symbol}:1m`;
             if (prevBarTime1m === undefined && !firstFootprintBarByKey.has(fpKey1m)) firstFootprintBarByKey.set(fpKey1m, fpBar1m.time);
-            // Check if a rollover just occurred (new bar created, previous closed)
+            
             if (prevBarTime1m !== undefined && fpBar1m.time > prevBarTime1m) {
               const closedBar = pipeline.footprints['1m'].getRecentBars().find((b) => b.time === prevBarTime1m);
               if (closedBar) {
                 const serialized = pipeline.footprints['1m'].serializeBar(closedBar);
-                // The first bar captured after startup can be only partially
-                // observed; publish its close, but keep it out of persisted history.
                 if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
                   footprintHistory.save(serialized);
                   persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
@@ -1045,7 +1111,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                   timestamp: Date.now()
                 });
 
-                // Live Autonomous AI Council & Telegram alerts
+                // Auto Trading Trigger
                 void handleLiveBarAutonomousTrading(trade.symbol, serialized);
               }
             }
@@ -1062,7 +1128,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
             if (prevBarTime1m === undefined || fpBar1m.time >= prevBarTime1m) queueFormingFootprint(pipeline.footprints['1m']);
           }
 
-          // --- 5-Minute Aggregations ---
+          // 5-Minute Footprint handling
           const prevBarTime5m = pipeline.footprints['5m'].getCurrentBar()?.time;
           const fpBar5m = pipeline.footprints['5m'].processTrade(trade);
           if (fpBar5m) {
@@ -1218,7 +1284,6 @@ void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((exchangeTickSizes)
 
 wss.on('connection', (ws: WebSocket) => {
   selectedSymbolByClient.set(ws, DEFAULT_SYMBOL);
-  // 1. Connection & Market Status
   ws.send(JSON.stringify({
     type: 'STATUS',
     status: currentMarketStatus,
