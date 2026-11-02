@@ -20,7 +20,6 @@ import RecorderStatus from './components/RecorderStatus.js';
 import AlertManager from './components/AlertManager.js';
 import ChartDrawingLayer from './components/ChartDrawingLayer.js';
 import IcebergSignals from './components/IcebergSignals.js';
-import EntryExitSignals from './components/EntryExitSignals.js';
 import AgentCouncilPanel from './components/AgentCouncilPanel.js';
 import GammaLevelsPanel, { type Snapshot as GammaSnapshot } from './components/GammaLevelsPanel.js';
 import { analyzeSmartMoney, drawSmartMoneyOverlay, type SmartMoneyAnalysis, type SmartMoneyFeatures } from './components/SmartMoneyOverlay.js';
@@ -1049,9 +1048,12 @@ export default function App() {
             setBestAsk(null);
           }
         } else if (msg.type === 'TICKER') {
-          if (msg.data?.symbol === selectedSymbolRef.current && Date.now() - lastTickerUiUpdateRef.current >= 500) {
-            lastTickerUiUpdateRef.current = Date.now();
-            setLiveTicker({ ...msg.data, timestamp: msg.timestamp });
+          if (msg.data?.symbol === selectedSymbolRef.current) {
+            setLastTradeAt(Date.now());
+            if (Date.now() - lastTickerUiUpdateRef.current >= 500) {
+              lastTickerUiUpdateRef.current = Date.now();
+              setLiveTicker({ ...msg.data, timestamp: msg.timestamp });
+            }
           }
         } else if (msg.type === 'TRADE') {
           const selectedTrades = (msg.data as Trade[]).filter((trade) => trade.symbol === selectedSymbolRef.current);
@@ -1830,28 +1832,7 @@ export default function App() {
         asks={orderBookAsks}
         analysis={smartMoneyAnalysis}
       />}
-      <EntryExitSignals
-        symbol={selectedSymbol}
-        timeframe={selectedTimeframe}
-        candles={signalCandles}
-        footprints={signalFootprints}
-        bids={orderBookBids}
-        asks={orderBookAsks}
-        price={tickerForSelected?.lastPrice ?? activeLatestBar?.close ?? null}
-        feedStatus={marketStatus}
-        lastTradeAt={lastTradeAt}
-        context={{ profile: selectedProfile, heatmap: heatmapSnapshot, derivatives: replayDerivativesSnapshot, gamma: gammaSnapshot?.baseCoin === selectedSymbol.replace(/USDT$/, '') ? gammaSnapshot : null }}
-        backtestTrades={backtestTrades}
-        mtfBacktestTrades={mtfBacktestTrades}
-        mtfV2BacktestTrades={mtfV2BacktestTrades}
-        orderFlowBacktestTrades={orderFlowBacktestTrades}
-        bookReplayInfo={{ status: historicalBookStatus, samples: historicalBookSamples.length, firstTime: historicalBookSamples[0]?.time ?? null, lastTime: historicalBookSamples[historicalBookSamples.length - 1]?.time ?? null }}
-        costs={backtestCosts}
-        onCostsChange={setBacktestCosts}
-        tradeReplayInfo={{ ...tradeReplayInfo, barsCount: tradeReplayBars.length }}
-        historicalOIStatus={historicalOIStatus}
-        onLiveSetupChange={publishActivePaperSetup}
-      />
+      
 
       <section style={{ marginTop: 16 }}>
         <DOMLadder symbol={selectedSymbol} bids={orderBookBids} asks={orderBookAsks} />

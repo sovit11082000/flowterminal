@@ -314,6 +314,21 @@ export default function AgentCouncilPanel({
               SMC · ICT · ORDER-FLOW COUNCIL · {symbol} ({timeframe})
             </strong>
 
+            {/* BYBIT FEED LIVE / OFFLINE STATUS BADGE */}
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                color: feedLive ? '#38bdf8' : '#f59e0b',
+                background: feedLive ? 'rgba(56, 189, 248, 0.15)' : 'rgba(245, 158, 11, 0.15)',
+                border: `1px solid ${feedLive ? '#0284c7' : '#d97706'}`,
+                padding: '2px 8px',
+                borderRadius: 4
+              }}
+            >
+              {feedLive ? '🟢 BYBIT: LIVE' : '🔴 BYBIT: CONNECTING / PAUSED'}
+            </span>
+
             {/* AUTO TRADING STATUS BADGE */}
             <span
               style={{
