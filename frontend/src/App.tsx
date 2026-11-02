@@ -116,11 +116,9 @@ const findCandleRepairRanges = (candles: CachedCandle[], timeframe: CandleTimefr
   return ranges.sort((a, b) => b.startSec - a.startSec);
 };
 const MARKETS = [
-  { symbol: 'BTCUSDT', name: 'Bitcoin' }, { symbol: 'ETHUSDT', name: 'Ethereum' },
-  { symbol: 'SOLUSDT', name: 'Solana' }, { symbol: 'XRPUSDT', name: 'XRP' },
-  { symbol: 'BNBUSDT', name: 'BNB' }, { symbol: 'DOGEUSDT', name: 'Dogecoin' },
-  { symbol: 'ADAUSDT', name: 'Cardano' }, { symbol: 'LINKUSDT', name: 'Chainlink' },
-  { symbol: 'AVAXUSDT', name: 'Avalanche' }, { symbol: 'XAUTUSDT', name: 'Gold (XAUT)' }
+  { symbol: 'BTCUSDT', name: 'Bitcoin' },
+  { symbol: 'ETHUSDT', name: 'Ethereum' },
+  { symbol: 'SOLUSDT', name: 'Solana' }
 ] as const;
 
 const BACKTEST_COSTS_KEY = 'flowterminal_backtest_costs_v1';
