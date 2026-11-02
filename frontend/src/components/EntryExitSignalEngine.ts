@@ -209,7 +209,13 @@ function latestBookAtOrBefore(samples: HistoricalBookSample[], timeMs: number): 
  * Every higher-timeframe input is restricted to bars fully closed by entry.
  */
 export function backtestMtfSmcIct(oneMinuteCandles: SignalCandle[], costs: BacktestCostAssumptions = { feeBpsPerSide: 5.5, slippageBpsPerSide: 2 }): BacktestTrade[] {
-  return backtestMtfSmcIctCore(oneMinuteCandles, costs, { stopTimeframeSeconds: 60, stopLookback: 5, maxEstimatedCostR: Infinity, maxHoldMinutes: 30 });
+  return backtestMtfSmcIctCore(oneMinuteCandles, costs, {
+    stopTimeframeSeconds: 60,
+    stopLookback: 5,
+    maxEstimatedCostR: Infinity,
+    maxHoldMinutes: 30,
+    requirePo3SweepRetest: false
+  });
 }
 
 /** V2 uses a completed 5m structure stop, a 60m time limit, and skips entries whose estimated round-trip cost exceeds 0.5R. */
