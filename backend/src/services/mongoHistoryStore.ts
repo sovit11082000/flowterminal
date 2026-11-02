@@ -32,13 +32,26 @@ export interface AgentPaperPerformance {
   recent: Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }>;
 }
 
+export interface LearnedLessonRecord {
+  symbol: string;
+  outcome: 'WIN' | 'LOSS';
+  lesson: string;
+  source: 'LIVE' | 'BACKTEST';
+  createdAt?: Date;
+  expiresAt?: Date;
+}
+
 /** MongoDB persistence for records captured after the service connects. */
 export class MongoHistoryStore {
   private readonly client: MongoClient | null;
   private readonly databaseName: string;
   private db: ReturnType<MongoClient['db']> | null = null;
   private readonly collectionNames = {
-    footprints: 'footprints', trades: 'trades', orderBooks: 'order_books', liquidations: 'liquidations'
+    footprints: 'footprints',
+    trades: 'trades',
+    orderBooks: 'order_books',
+    liquidations: 'liquidations',
+    learnedRules: 'learned_rules'
   } as const;
   private lastCapCheckAt = new Map<string, number>();
   private readonly lastOrderBookSavedAt = new Map<string, number>();
@@ -70,7 +83,9 @@ export class MongoHistoryStore {
       this.collection('liquidations').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('liquidations').createIndex({ symbol: 1, timestamp: 1 }),
       this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
-      this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 })
+      this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 }),
+      this.collection('learned_rules' as any).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.collection('learned_rules' as any).createIndex({ createdAt: -1 })
     ]);
     try {
       await this.applyRetentionPolicy();
@@ -130,6 +145,35 @@ export class MongoHistoryStore {
       }
     })), { ordered: false });
     await this.enforceCap('liquidations', 100_000);
+  }
+
+  async saveLearnedLesson(rule: LearnedLessonRecord): Promise<void> {
+    if (!this.db || !rule.lesson?.trim()) return;
+    try {
+      await this.collection('learned_rules' as any).insertOne({
+        ...rule,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + FOOTPRINT_RETENTION_MS)
+      });
+      await this.enforceCap('learned_rules' as any, 10_000);
+    } catch (err) {
+      console.warn('[MongoDB] Could not save learned lesson:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  async getLearnedLessons(limit = 10): Promise<string[]> {
+    if (!this.db) return [];
+    try {
+      const docs = await this.collection('learned_rules' as any)
+        .find({ outcome: 'LOSS' })
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .toArray();
+      return docs.map((d: any) => String(d.lesson)).filter(Boolean);
+    } catch (err) {
+      console.warn('[MongoDB] Could not load learned lessons:', err instanceof Error ? err.message : err);
+      return [];
+    }
   }
 
   /**
@@ -364,7 +408,7 @@ export class MongoHistoryStore {
 
   private collection(name: keyof typeof this.collectionNames | 'agent_decisions'): Collection<Document> {
     if (!this.db) throw new Error('MongoDB is not connected.');
-    return this.db.collection(name === 'agent_decisions' ? name : this.collectionNames[name]);
+    return this.db.collection(name === 'agent_decisions' ? name : this.collectionNames[name as keyof typeof this.collectionNames] || name);
   }
 
   private timeQuery(symbol: string, field: string, start?: number, end?: number): Document {

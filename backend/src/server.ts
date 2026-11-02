@@ -298,6 +298,7 @@ const liveLearnedLessons: string[] = [];
 let liveCouncilInFlight = false;
 let isAutoTradingEnabled = true;
 let lastQuotaAlertTime = 0;
+let lastMissingConfigLogAt = 0;
 
 // Agar Groq / Gemini quota limit reach kare to Telegram par turant alert bhejo aur auto-trade pause karo
 async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
@@ -1025,7 +1026,15 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
         void handleQuotaExhaustedAlert(msg);
       }
-      console.warn('[Live Council Error]:', msg);
+      if (msg.includes('No AI provider is configured')) {
+        const now = Date.now();
+        if (now - lastMissingConfigLogAt > 60_000) {
+          lastMissingConfigLogAt = now;
+          console.warn('[Live Council Error]: No AI provider is configured. Please check your .env in backend/.env');
+        }
+      } else {
+        console.warn('[Live Council Error]:', msg);
+      }
     } finally {
       liveCouncilInFlight = false;
     }
