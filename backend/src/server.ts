@@ -323,6 +323,7 @@ let liveCouncilInFlight = false;
 let isAutoTradingEnabled = true;
 let lastQuotaAlertTime = 0;
 let lastMissingConfigLogAt = 0;
+let lastStaleFeedLogAt = 0;
 
 async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
   const now = Date.now();
@@ -851,6 +852,20 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     return;
   }
 
+  // --- HARD FEED GUARD: ZERO API CALLS IF FEED IS NOT 100% LIVE ---
+  const isFeedFresh = currentMarketStatus === 'LIVE' &&
+                      lastTradeReceivedAt !== null &&
+                      (Date.now() - lastTradeReceivedAt < 25_000);
+
+  if (!isFeedFresh) {
+    const now = Date.now();
+    if (now - lastStaleFeedLogAt > 60_000) {
+      lastStaleFeedLogAt = now;
+      console.log(`[Auto-Trader] Feed stale/disconnected (${currentMarketStatus}). Skipping AI calls to protect API quota.`);
+    }
+    return;
+  }
+
   // 1. Check open position for this specific symbol
   const currentTrade = liveActiveTrades.get(symbol);
   if (currentTrade) {
@@ -1091,6 +1106,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       const data = (payload as { data?: Record<string, unknown> }).data;
       const symbol = topic.split('.').pop();
       if (!symbol || !SUPPORTED_SYMBOLS.includes(symbol as typeof SUPPORTED_SYMBOLS[number])) return;
+      lastTradeReceivedAt = Date.now();
       const previous = liveTickerBySymbol.get(symbol) ?? { lastPrice: null, markPrice: null, indexPrice: null };
       const readPrice = (key: 'lastPrice' | 'markPrice' | 'indexPrice') => {
         const value = Number(data?.[key]);

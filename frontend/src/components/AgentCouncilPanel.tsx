@@ -78,9 +78,9 @@ export default function AgentCouncilPanel({
   const [updatingAuto, setUpdatingAuto] = useState<boolean>(false);
 
   const feedLive =
-    (feedStatus === 'LIVE' || feedStatus === 'DESYNCHRONIZED') &&
-    lastTradeAt !== null &&
-    Date.now() - lastTradeAt < 25_000;
+    feedStatus !== 'DISCONNECTED' &&
+    feedStatus !== 'RECONNECTING' &&
+    (lastTradeAt === null || Date.now() - lastTradeAt < 45_000);
 
   // Sync autonomous trading status with backend state
   useEffect(() => {
