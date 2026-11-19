@@ -1,6 +1,8 @@
 ﻿node_modules
 dist
-
+.env
 data/*.bin
 data/*.jsonl
 backend/data/*.jsonl
+
+backend/check_*.ts

@@ -24,6 +24,7 @@ export class BybitWebSocketClient {
   private pingTimer: NodeJS.Timeout | null = null;
   private pongTimeout: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectTimeout: NodeJS.Timeout | null = null;
   private marketDataWatchdog: NodeJS.Timeout | null = null;
   private reconnectDelay: number = INITIAL_RECONNECT_DELAY_MS;
   private isExplicitShutdown: boolean = false;
@@ -64,7 +65,19 @@ export class BybitWebSocketClient {
       return;
     }
 
+    if (this.connectTimeout) clearTimeout(this.connectTimeout);
+    this.connectTimeout = setTimeout(() => {
+      if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+        this.callbacks.onStatusChange('STALE', 'WebSocket handshake timed out (12s); retrying...');
+        this.ws.terminate();
+      }
+    }, 12_000);
+
     this.ws.on('open', () => {
+      if (this.connectTimeout) {
+        clearTimeout(this.connectTimeout);
+        this.connectTimeout = null;
+      }
       this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
       this.lastMarketDataAt = Date.now();
       const openedAt = this.lastMarketDataAt;
@@ -316,6 +329,10 @@ export class BybitWebSocketClient {
   }
 
   private cleanupTimers(): void {
+    if (this.connectTimeout) {
+      clearTimeout(this.connectTimeout);
+      this.connectTimeout = null;
+    }
     this.clearHeartbeatTimers();
     if (this.marketDataWatchdog) {
       clearInterval(this.marketDataWatchdog);

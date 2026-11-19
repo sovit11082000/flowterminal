@@ -1,6 +1,8 @@
 import dns from 'node:dns';
 dns.setDefaultResultOrder('ipv4first');
-import { SPECIALIST_AGENTS, ORDER_FLOW_SKILL, strategiesFor, strategyById } from './orderFlowSkill.js';
+import { SPECIALIST_AGENTS, strategiesFor, strategyById, MANAGER_RULES } from './orderFlowSkill.js';
+import { computeMathReports } from './mathSpecialists.js';
+import { scanMarketActivity } from './marketScanner.js';
 import { createHash } from 'node:crypto';
 
 export interface OrderFlowMicrostructureSummary {
@@ -26,7 +28,34 @@ export interface OrderFlowMicrostructureSummary {
     pocPosition: 'POC_TRAPPED_OVERHEAD' | 'POC_SUPPORT_UNDERFOOT' | 'POC_CENTERED';
     signal: string;
   } | null;
+  buyImbalanceLevels?: number[];
+  sellImbalanceLevels?: number[];
   executionGuidance: string;
+}
+
+export interface IndependentContextMetrics {
+  ema50: number | null;
+  ema200: number | null;
+  emaAlignment: 'BULLISH_ABOVE_50_200' | 'BEARISH_BELOW_50_200' | 'MIXED_CROSSOVER';
+  adx14: number | null;
+  trendStrengthLabel: 'STRONG_TREND' | 'MODERATE_TREND' | 'WEAK_CHOP';
+  rsi14: number | null;
+  recent5mTimeline: Array<{
+    timeEt: string;
+    open: number;
+    close: number;
+    changePct: number;
+    bodyType: 'BULL' | 'BEAR' | 'DOJI';
+  }>;
+}
+
+export interface RiskAllocation {
+  accountBalanceUsd: number;
+  riskPerTradePct: number;
+  maxRiskUsd: number;
+  positionSizeUnits: number;
+  notionalValueUsd: number;
+  effectiveLeverage: number;
 }
 
 export interface DerivedMarketContext {
@@ -38,6 +67,13 @@ export interface DerivedMarketContext {
   pdEq: number | null;
   pwh: number | null;
   pwl: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  drawOnLiquidity: {
+    nextBullishTarget: number | null;
+    nextBearishTarget: number | null;
+    context: string;
+  };
   dealingRange: {
     swingHigh: number;
     swingLow: number;
@@ -49,11 +85,16 @@ export interface DerivedMarketContext {
   recentSwingHigh: number | null;
   recentSwingLow: number | null;
   orderFlowSummary?: OrderFlowMicrostructureSummary | null;
+  independentContext?: IndependentContextMetrics;
   htfTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   htfTrendDescription: string;
+  macro1hTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  macro4hTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   marketRegime: 'TRENDING' | 'EXPANSION' | 'CHOP_COMPRESSION';
   isLowVolumeChop: boolean;
   liquidationSignal: 'NONE' | 'SHORT_SQUEEZE_EXHAUSTION' | 'LONG_LIQUIDATION_FLUSH';
+  atr?: number | null;
+  sweepReclaim?: { long: boolean; short: boolean; levels: string[] };
 }
 
 export interface AgentSnapshot {
@@ -65,10 +106,23 @@ export interface AgentSnapshot {
   profile?: { poc: number; vah: number; val: number; capturedBars: number } | null;
   technicalContext?: {
     smc: { bias: string; events: Array<{ type: string; time: number; price: number; bullish: boolean }>; zones: Array<{ kind: string; startTime: number; endTime: number; top: number; bottom: number; bullish: boolean }>; liquidity: Array<{ label: string; time: number; price: number; swept: boolean }> };
-    ict: { po3: Array<{ label: string; time: number; endTime: number; top: number; bottom: number; bullish?: boolean }>; dailyRanges: Array<{ day: number; high: number; low: number }> };
+    ict: {
+      po3: Array<{ label: string; time: number; endTime: number; top: number; bottom: number; bullish?: boolean }>;
+      dailyRanges: Array<{ day: number; high: number; low: number }>;
+      macro1hTrend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+      macro4hTrend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+    };
   };
   derivedContext?: DerivedMarketContext;
   candles: Array<{ time: number; open?: number; high: number; low: number; close: number }>;
+  candles5m?: Array<{ time: number; open?: number; high: number; low: number; close: number }>;
+  candles15m?: Array<{ time: number; open?: number; high: number; low: number; close: number }>;
+  candles1h?: Array<{ time: number; open?: number; high: number; low: number; close: number }>;
+  footprints5m?: Array<{
+    time: number; open: number; high: number; low: number; close: number;
+    totalVolume: number; buyVolume: number; sellVolume: number; delta: number;
+    cumulativeDelta: number; pocPrice: number; isClosed: boolean;
+  }>;
   footprints: Array<{
     time: number; open: number; high: number; low: number; close: number;
     totalVolume: number; buyVolume: number; sellVolume: number; delta: number;
@@ -86,9 +140,9 @@ export interface AgentSnapshot {
   } | null;
 }
 
-type AiProvider = 'gemini' | 'groq' | 'ollama' | 'nvidia' | 'openrouter';
+type AiProvider = 'groq' | 'cloudflare' | 'agentrouter';
 type AgentRole = 'smc' | 'ict' | 'orderflow' | 'manager';
-interface ProviderConfig { provider: AiProvider; model: string; key?: string; baseUrl?: string; quotaScope?: string; }
+interface ProviderConfig { provider: AiProvider; model: string; key: string; baseUrl?: string; quotaScope?: string; }
 
 interface UsageWindow { day: string; daily: number; minute: number; minuteCount: number; cooldownUntil: number; }
 const requestUsage = new Map<string, UsageWindow>();
@@ -99,32 +153,11 @@ function pacificDay(): string {
 
 function quotaKey(config: ProviderConfig): string {
   if (config.quotaScope) return `${config.provider}:${config.quotaScope}:${config.model}`;
-  const identity = config.key || config.baseUrl || config.model;
-  return `${config.provider}:${createHash('sha256').update(identity).digest('hex')}:${config.model}`;
+  return `${config.provider}:${createHash('sha256').update(config.key).digest('hex')}:${config.model}`;
 }
 
-function quotaFor(config: ProviderConfig): { rpm: number; rpd: number } {
-  if (config.provider === 'groq') {
-    const model = config.model.toLowerCase();
-    if (model.includes('20b') || model.includes('8b')) return { rpm: 28, rpd: 1_000 };
-    return { rpm: 28, rpd: 1_000 };
-  }
-  if (config.provider === 'nvidia') {
-    return { rpm: 38, rpd: 1_000 };
-  }
-  if (config.provider === 'openrouter') {
-    return { rpm: 18, rpd: 250 };
-  }
-  if (config.provider !== 'gemini') return { rpm: 0, rpd: 0 };
-  const overrideRpm = Number(process.env.GEMINI_REQUESTS_PER_MINUTE_PER_PROJECT || 0);
-  const overrideRpd = Number(process.env.GEMINI_REQUESTS_PER_DAY_PER_PROJECT || 0);
-  const model = config.model.toLowerCase();
-  const defaults = model.includes('flash-lite')
-    ? { rpm: 14, rpd: 500 }
-    : model.includes('3.8-flash')
-      ? { rpm: 4, rpd: 19 }
-      : { rpm: 10, rpd: 500 };
-  return { rpm: overrideRpm > 0 ? overrideRpm : defaults.rpm, rpd: overrideRpd > 0 ? overrideRpd : defaults.rpd };
+function quotaFor(_config: ProviderConfig): { rpm: number; rpd: number } {
+  return { rpm: 28, rpd: 1_000 };
 }
 
 function usageFor(config: ProviderConfig): UsageWindow {
@@ -176,75 +209,253 @@ export interface CouncilPlan {
   stopPrice: number | null;
   target1Price: number | null;
   targetPrice: number | null;
-  targetR: 2 | 3 | null;
+  targetR: number | null;
   exitPlan: string;
   agreeingAgents: string[];
   dissent: string[];
   strategyIds: string[];
   strategyNames: string[];
+  riskAllocation?: RiskAllocation | null;
 }
 
-export interface CouncilResult { reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number; }
+export interface CouncilDiagnostics {
+  llmCalls: number;
+  totalTokens: number;
+  permittedDirections: Array<'LONG' | 'SHORT'>;
+  gateBlocked: string | null;
+  skipped: string[];
+}
 
-const reportSchema = {
-  type: 'OBJECT',
-  properties: {
-    bias: { type: 'STRING', enum: ['LONG', 'SHORT', 'NEUTRAL'] },
-    strength: { type: 'INTEGER' },
-    findings: { type: 'ARRAY', items: { type: 'STRING' } },
-    strategyCandidates: { type: 'ARRAY', items: { type: 'STRING' } },
-    concerns: { type: 'ARRAY', items: { type: 'STRING' } },
-    missingData: { type: 'ARRAY', items: { type: 'STRING' } }
-  },
-  required: ['bias', 'strength', 'findings', 'strategyCandidates', 'concerns', 'missingData']
-};
-
-const planSchema = {
-  type: 'OBJECT',
-  properties: {
-    decision: { type: 'STRING', enum: ['LONG', 'SHORT', 'WAIT'] },
-    summary: { type: 'STRING' },
-    reasons: { type: 'ARRAY', items: { type: 'STRING' } },
-    entryTrigger: { type: 'STRING' },
-    entryPrice: { type: 'NUMBER', nullable: true },
-    invalidation: { type: 'STRING' },
-    stopPrice: { type: 'NUMBER', nullable: true },
-    target1Price: { type: 'NUMBER', nullable: true },
-    targetPrice: { type: 'NUMBER', nullable: true },
-    targetR: { type: 'INTEGER', nullable: true },
-    exitPlan: { type: 'STRING' },
-    agreeingAgents: { type: 'ARRAY', items: { type: 'STRING' } },
-    dissent: { type: 'ARRAY', items: { type: 'STRING' } },
-    strategyIds: { type: 'ARRAY', items: { type: 'STRING' } }
-  },
-  required: ['decision', 'summary', 'reasons', 'entryTrigger', 'entryPrice', 'invalidation', 'stopPrice', 'target1Price', 'targetPrice', 'targetR', 'exitPlan', 'agreeingAgents', 'dissent', 'strategyIds']
-};
+export interface CouncilResult { reports: SpecialistReport[]; plan: CouncilPlan; model: string; generatedAt: number; diagnostics?: CouncilDiagnostics; }
 
 function textList(value: unknown, maxItems = 5): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').slice(0, maxItems).map((item) => item.slice(0, 240)) : [];
 }
 
-function parseObject<T>(text: string): T {
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  const parsed: unknown = JSON.parse(cleaned);
+/** Parses model output tolerantly: strips code fences and any preamble/postamble around the first JSON object. */
+export function parseObject<T>(text: string): T {
+  let cleaned = text.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+  if (!cleaned.startsWith('{')) {
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first >= 0 && last > first) cleaned = cleaned.slice(first, last + 1);
+  }
+  let inString = false;
+  let escaped = false;
+  let repaired = '';
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (escaped) {
+      repaired += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      repaired += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      repaired += ch;
+      continue;
+    }
+    if (inString && (ch === '\n' || ch === '\r')) {
+      repaired += ch === '\n' ? '\\n' : '';
+      continue;
+    }
+    if (inString && ch === '\t') {
+      repaired += '\\t';
+      continue;
+    }
+    repaired += ch;
+  }
+  const parsed: unknown = JSON.parse(repaired);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('AI provider returned an invalid structured response.');
   return parsed as T;
 }
 
-function extractGeminiText(payload: unknown): string {
-  const root = payload as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-  const text = root.candidates?.[0]?.content?.parts?.map((part) => part.text ?? '').join('').trim();
-  if (!text) throw new Error('Gemini returned an empty response.');
-  return text;
+/** Average true range over the last `period` candles (null when there is too little data). */
+export function computeAtr(candles: AgentSnapshot['candles'], period = 14): number | null {
+  if (candles.length < 3) return null;
+  const slice = candles.slice(-(period + 1));
+  const ranges: number[] = [];
+  for (let i = 1; i < slice.length; i++) {
+    const c = slice[i];
+    const prevClose = slice[i - 1].close;
+    ranges.push(Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose)));
+  }
+  return ranges.length ? Number((ranges.reduce((a, b) => a + b, 0) / ranges.length).toFixed(6)) : null;
+}
+
+function computeSimpleEma(values: number[], period: number): number | null {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
+  }
+  return Number(ema.toFixed(6));
+}
+
+function computeRsi(closes: number[], period = 14): number | null {
+  if (closes.length <= period) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  if (losses === 0) return 100;
+  const rs = gains / losses;
+  return Number((100 - 100 / (1 + rs)).toFixed(1));
+}
+
+function computeAdx(candles: AgentSnapshot['candles'], period = 14): number | null {
+  if (candles.length < period + 2) return null;
+  const slice = candles.slice(-(period * 2));
+  let trSum = 0;
+  let plusDmSum = 0;
+  let minusDmSum = 0;
+  for (let i = 1; i < slice.length; i++) {
+    const curr = slice[i];
+    const prev = slice[i - 1];
+    const upMove = curr.high - prev.high;
+    const downMove = prev.low - curr.low;
+    plusDmSum += upMove > downMove && upMove > 0 ? upMove : 0;
+    minusDmSum += downMove > upMove && downMove > 0 ? downMove : 0;
+    trSum += Math.max(curr.high - curr.low, Math.abs(curr.high - prev.close), Math.abs(curr.low - prev.close));
+  }
+  if (trSum <= 0) return null;
+  const plusDi = (plusDmSum / trSum) * 100;
+  const minusDi = (minusDmSum / trSum) * 100;
+  const diSum = plusDi + minusDi;
+  if (diSum <= 0) return 0;
+  return Number(((Math.abs(plusDi - minusDi) / diSum) * 100).toFixed(1));
+}
+
+function buildIndependentContext(snapshot: AgentSnapshot): IndependentContextMetrics {
+  const baseCandles = (snapshot.candles5m && snapshot.candles5m.length >= 20)
+    ? snapshot.candles5m
+    : snapshot.candles;
+  const closes = baseCandles.map((c) => c.close);
+  const lastPrice = snapshot.latestPrice ?? closes[closes.length - 1] ?? null;
+
+  const ema50 = computeSimpleEma(closes, 50);
+  const ema200 = computeSimpleEma(closes, 200);
+  let emaAlignment: IndependentContextMetrics['emaAlignment'] = 'MIXED_CROSSOVER';
+  if (lastPrice !== null && ema50 !== null && ema200 !== null) {
+    if (lastPrice > ema50 && ema50 > ema200) emaAlignment = 'BULLISH_ABOVE_50_200';
+    else if (lastPrice < ema50 && ema50 < ema200) emaAlignment = 'BEARISH_BELOW_50_200';
+  } else if (lastPrice !== null && ema50 !== null) {
+    emaAlignment = lastPrice > ema50 ? 'BULLISH_ABOVE_50_200' : 'BEARISH_BELOW_50_200';
+  }
+
+  const adx14 = computeAdx(baseCandles, 14);
+  const trendStrengthLabel: IndependentContextMetrics['trendStrengthLabel'] =
+    adx14 === null ? 'MODERATE_TREND' : adx14 >= 28 ? 'STRONG_TREND' : adx14 >= 18 ? 'MODERATE_TREND' : 'WEAK_CHOP';
+  const rsi14 = computeRsi(closes, 14);
+
+  const recent5m = (snapshot.candles5m ?? []).slice(-10);
+  const recent5mTimeline = recent5m.map((c) => {
+    const o = c.open ?? c.close;
+    const changePct = o > 0 ? Number((((c.close - o) / o) * 100).toFixed(3)) : 0;
+    const bodyType: 'BULL' | 'BEAR' | 'DOJI' =
+      Math.abs(changePct) < 0.015 ? 'DOJI' : c.close > o ? 'BULL' : 'BEAR';
+    const timeEt = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(new Date(c.time * 1000));
+    return { timeEt, open: o, close: c.close, changePct, bodyType };
+  });
+
+  return { ema50, ema200, emaAlignment, adx14, trendStrengthLabel, rsi14, recent5mTimeline };
 }
 
 /**
- * Computes deterministic, backtest-proven OrderFlow microstructure signals from closed footprint bars:
- * - Evaluates whether the POC is trapped overhead (bearish rejection) or supporting underfoot (bullish defense).
- * - Aggregates the last 5 closed 1m footprint bars into a synthetic 5m footprint block to filter out 1m noise
- *   (validated on BTCUSDT replay.json where 5m POC/Absorption rules achieved 100% win rate vs 25% on noisy 1m CVD).
+ * A real liquidity sweep needs a wick through the level AND a later closed reclaim back across it.
  */
-function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlowMicrostructureSummary | null {
+export function detectSweepReclaim(
+  candles: AgentSnapshot['candles'],
+  levels: { pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null },
+  lookback = 10
+): { long: boolean; short: boolean; levels: string[] } {
+  const out = { long: false, short: false, levels: [] as string[] };
+  const recent = candles.slice(-lookback);
+  const last = recent[recent.length - 1];
+  if (!last) return out;
+  for (const [name, level] of [['PDL', levels.pdl], ['PWL', levels.pwl]] as const) {
+    if (level !== null && recent.some((c) => c.low < level) && last.close > level) { out.long = true; out.levels.push(name); }
+  }
+  for (const [name, level] of [['PDH', levels.pdh], ['PWH', levels.pwh]] as const) {
+    if (level !== null && recent.some((c) => c.high > level) && last.close < level) { out.short = true; out.levels.push(name); }
+  }
+  return out;
+}
+
+export function detectSidewaysMarket(
+  candles: AgentSnapshot['candles'],
+  footprints: AgentSnapshot['footprints'],
+  lookback = 45,
+  activeSession: DerivedMarketContext['activeSession'] = 'OFF_HOURS'
+): { isChop: boolean; chopIndex: number; efficiencyRatio: number; reason: string } {
+  if (candles.length < 14) {
+    return { isChop: false, chopIndex: 0, efficiencyRatio: 1, reason: '' };
+  }
+
+  const windowSize = Math.min(candles.length, lookback);
+  const slice = candles.slice(-windowSize);
+  const highest = Math.max(...slice.map((c) => c.high));
+  const lowest = Math.min(...slice.map((c) => c.low));
+  const rangeSpan = Math.max(highest - lowest, 1e-6);
+  const rangePct = (rangeSpan / Math.max(lowest, 1e-6)) * 100;
+
+  let trueRangeSum = 0;
+  for (let i = 1; i < slice.length; i++) {
+    const tr = Math.max(
+      slice[i].high - slice[i].low,
+      Math.abs(slice[i].high - slice[i - 1].close),
+      Math.abs(slice[i].low - slice[i - 1].close)
+    );
+    trueRangeSum += tr;
+  }
+
+  const chopIndex = (Math.log10(trueRangeSum / rangeSpan) / Math.log10(windowSize)) * 100;
+  const netMove = Math.abs(slice[slice.length - 1].close - slice[0].close);
+  const efficiencyRatio = netMove / Math.max(trueRangeSum, 1e-6);
+
+  const closedFp = footprints.filter((f) => f.isClosed);
+  const recentPocs = closedFp.slice(-3).map((f) => f.pocPrice).filter(Boolean);
+  let pocOverlap = false;
+  if (recentPocs.length === 3) {
+    const maxPoc = Math.max(...recentPocs);
+    const minPoc = Math.min(...recentPocs);
+    if ((maxPoc - minPoc) / recentPocs[0] < 0.0008) {
+      pocOverlap = true;
+    }
+  }
+
+  const isQuietSession = activeSession === 'ASIA' || activeSession === 'OFF_HOURS' || activeSession === 'NY_LUNCH';
+  const isTightSessionGrind = isQuietSession && rangePct < 0.30;
+  const isDeadRangeAnySession = rangePct < 0.20;
+  const isChop =
+    isTightSessionGrind ||
+    isDeadRangeAnySession ||
+    (chopIndex >= 66.0 && efficiencyRatio < 0.14) ||
+    efficiencyRatio < 0.10 ||
+    (pocOverlap && chopIndex >= 63.0);
+
+  const reason = isChop
+    ? `Sideways Regime (${windowSize}m Range: ${rangePct.toFixed(2)}%, Session: ${activeSession}, ChopIndex: ${chopIndex.toFixed(1)}, ER: ${efficiencyRatio.toFixed(2)})`
+    : '';
+
+  return { isChop, chopIndex, efficiencyRatio, reason };
+}
+
+export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlowMicrostructureSummary | null {
   const closedBars = snapshot.footprints.filter((bar) => bar.isClosed);
   const bars = closedBars.length >= 1 ? closedBars : snapshot.footprints;
   if (!bars.length) return null;
@@ -264,8 +475,8 @@ function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlow
         ? 'POC_SUPPORT_UNDERFOOT'
         : 'POC_CENTERED';
 
-  const refIdx = Math.max(0, closedBars.length - 4);
-  const cvdChange3Bar = Number((latest.cumulativeDelta - closedBars[refIdx].cumulativeDelta).toFixed(3));
+  const refBar = bars[Math.max(0, bars.length - 4)];
+  const cvdChange3Bar = Number((latest.cumulativeDelta - refBar.cumulativeDelta).toFixed(3));
   const cvdTrend: OrderFlowMicrostructureSummary['cvdTrend'] =
     cvdChange3Bar > Math.abs(latest.totalVolume) * 0.08
       ? 'RISING'
@@ -294,12 +505,14 @@ function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlow
 
   let deltaBreakoutSignal: OrderFlowMicrostructureSummary['deltaBreakoutSignal'] = 'NONE';
   if (
+    lookback.length >= 3 &&
     latest.low <= Math.min(...lookback.slice(0, -1).map((b) => b.low)) &&
     latest.delta < -avgVol * 0.25 &&
     latest.close < latest.pocPrice
   ) {
     deltaBreakoutSignal = 'BEARISH_DELTA_BREAKDOWN';
   } else if (
+    lookback.length >= 3 &&
     latest.high >= Math.max(...lookback.slice(0, -1).map((b) => b.high)) &&
     latest.delta > avgVol * 0.25 &&
     latest.close > latest.pocPrice
@@ -308,16 +521,29 @@ function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlow
   }
 
   const sortedLevels = [...(latest.priceLevels ?? [])].sort((a, b) => a.price - b.price);
-  const buyImbalances: number[] = [];
-  const sellImbalances: number[] = [];
-  for (const level of sortedLevels) {
-    if (level.askVolume > Math.max(level.bidVolume * 3.0, avgVol * 0.015)) {
-      buyImbalances.push(level.price);
+  const minRowVolume = avgVol * 0.015;
+  const buyFlags = sortedLevels.map((level) => level.askVolume > Math.max(level.bidVolume * 3.0, minRowVolume));
+  const sellFlags = sortedLevels.map((level) => level.bidVolume > Math.max(level.askVolume * 3.0, minRowVolume));
+  const buyImbalances = sortedLevels.filter((_, i) => buyFlags[i]).map((l) => l.price);
+  const sellImbalances = sortedLevels.filter((_, i) => sellFlags[i]).map((l) => l.price);
+  const tick = sortedLevels.length > 1
+    ? Math.min(...sortedLevels.slice(1).map((l, i) => l.price - sortedLevels[i].price).filter((g) => g > 0))
+    : 0;
+  const stackedRuns = (flags: boolean[]): number[] => {
+    const out: number[] = [];
+    let run: number[] = [];
+    const flush = (): void => { if (run.length >= 3) out.push(...run); run = []; };
+    for (let i = 0; i < sortedLevels.length; i++) {
+      const adjacent = run.length > 0 && Number.isFinite(tick) && tick > 0 &&
+        sortedLevels[i].price - run[run.length - 1] <= tick * 1.5;
+      if (flags[i] && (run.length === 0 || adjacent)) run.push(sortedLevels[i].price);
+      else { flush(); if (flags[i]) run.push(sortedLevels[i].price); }
     }
-    if (level.bidVolume > Math.max(level.askVolume * 3.0, avgVol * 0.015)) {
-      sellImbalances.push(level.price);
-    }
-  }
+    flush();
+    return out;
+  };
+  const stackedBuy = stackedRuns(buyFlags);
+  const stackedSell = stackedRuns(sellFlags);
 
   let synthetic5mSummary: OrderFlowMicrostructureSummary['synthetic5mSummary'] = null;
   if (snapshot.timeframe === '1m' && bars.length >= 2) {
@@ -376,8 +602,8 @@ function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlow
 
   const executionGuidance =
     snapshot.timeframe === '1m'
-      ? 'CRITICAL BACKTEST RULE: Do NOT fade 1m CVD divergence alone during strong momentum. Require synthetic5mSummary POC alignment (POC_TRAPPED_OVERHEAD for SHORT, POC_SUPPORT_UNDERFOOT for LONG) or confirmed multi-bar absorption.'
-      : 'CRITICAL BACKTEST RULE: Prioritize 5m POC position relative to close (POC_TRAPPED_OVERHEAD for SHORT, POC_SUPPORT_UNDERFOOT for LONG) combined with delta absorption or impulse.';
+      ? 'CRITICAL RULE: Never counter-trade momentum on 1m divergence alone. Require synthetic 5m POC alignment or confirmed multi-level absorption.'
+      : 'CRITICAL RULE: Align entries with institutional absorption and POC support/resistance relative to close.';
 
   return {
     timeframe: snapshot.timeframe,
@@ -389,14 +615,16 @@ function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): OrderFlow
     latestBarVolume: Number(latest.totalVolume.toFixed(3)),
     absorptionSignal,
     deltaBreakoutSignal,
-    stackedBuyImbalances: buyImbalances.slice(0, 6),
-    stackedSellImbalances: sellImbalances.slice(0, 6),
+    stackedBuyImbalances: stackedBuy.slice(0, 6),
+    stackedSellImbalances: stackedSell.slice(0, 6),
+    buyImbalanceLevels: buyImbalances.slice(0, 6),
+    sellImbalanceLevels: sellImbalances.slice(0, 6),
     synthetic5mSummary,
     executionGuidance
   };
 }
 
-function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
+export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
   const candles = snapshot.candles;
   const lastCandleTimeSec = candles[candles.length - 1]?.time ?? Math.floor(Date.now() / 1000);
   const refDate = new Date(lastCandleTimeSec * 1000);
@@ -412,7 +640,7 @@ function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
   const nyTimeFormatted = `${partMap.year}-${partMap.month}-${partMap.day} ${String(nyHour).padStart(2, '0')}:${String(nyMinute).padStart(2, '0')} ET`;
 
   let activeSession: DerivedMarketContext['activeSession'] = 'OFF_HOURS';
-  if (nyHour >= 20 || nyHour < 0) activeSession = 'ASIA';
+  if (nyHour >= 20) activeSession = 'ASIA';
   else if (nyHour >= 2 && nyHour < 5) activeSession = 'LONDON';
   else if (nyHour >= 8 && nyHour < 12) activeSession = 'NY_AM';
   else if (nyHour >= 12 && nyHour < 13) activeSession = 'NY_LUNCH';
@@ -434,7 +662,11 @@ function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
   const pwh = priorWeekDays.length ? Math.max(...priorWeekDays.map((d) => d.high)) : null;
   const pwl = priorWeekDays.length ? Math.min(...priorWeekDays.map((d) => d.low)) : null;
 
-  const recentWindow = candles.slice(-60);
+  const recentSessionCandles = candles.slice(-180);
+  const sessionHigh = recentSessionCandles.length ? Math.max(...recentSessionCandles.map((c) => c.high)) : null;
+  const sessionLow = recentSessionCandles.length ? Math.min(...recentSessionCandles.map((c) => c.low)) : null;
+
+  const recentWindow = candles.slice(-240);
   const latestPrice = snapshot.latestPrice ?? candles[candles.length - 1]?.close ?? null;
   let dealingRange: DerivedMarketContext['dealingRange'] = null;
   if (recentWindow.length >= 10 && latestPrice !== null) {
@@ -455,21 +687,36 @@ function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
     }
   }
 
+  const atrVal = computeAtr(candles) ?? (latestPrice ? latestPrice * 0.004 : 0);
+  const rawBullDol = pdh && latestPrice && latestPrice < pdh ? pdh : sessionHigh;
+  const rawBearDol = pdl && latestPrice && latestPrice > pdl ? pdl : sessionLow;
+  const nextBullishTarget = latestPrice && rawBullDol && (rawBullDol - latestPrice) > atrVal * 2
+    ? rawBullDol
+    : latestPrice ? Number((latestPrice + atrVal * 3.5).toFixed(6)) : rawBullDol;
+  const nextBearishTarget = latestPrice && rawBearDol && (latestPrice - rawBearDol) > atrVal * 2
+    ? rawBearDol
+    : latestPrice ? Number((latestPrice - atrVal * 3.5).toFixed(6)) : rawBearDol;
+  const dolContext = latestPrice && nextBullishTarget && nextBearishTarget
+    ? `Bullish Target: ${nextBullishTarget} (Distance: ${(nextBullishTarget - latestPrice).toFixed(1)}) | Bearish Target: ${nextBearishTarget} (Distance: ${(latestPrice - nextBearishTarget).toFixed(1)})`
+    : 'DOL searching external liquidity pools';
+
   const last10 = candles.slice(-10);
   const recentSwingHigh = last10.length ? Math.max(...last10.map((c) => c.high)) : null;
   const recentSwingLow = last10.length ? Math.min(...last10.map((c) => c.low)) : null;
   const orderFlowSummary = buildOrderFlowMicrostructureSummary(snapshot);
+  const independentContext = buildIndependentContext(snapshot);
 
-  // --- SKILL 1: 15m Higher Timeframe (HTF) Trend Shield ---
+  const macro1hTrend: DerivedMarketContext['macro1hTrend'] = snapshot.technicalContext?.ict.macro1hTrend ?? 'NEUTRAL';
+  const macro4hTrend: DerivedMarketContext['macro4hTrend'] = snapshot.technicalContext?.ict.macro4hTrend ?? 'NEUTRAL';
+
   let htfTrend: DerivedMarketContext['htfTrend'] = 'NEUTRAL';
-  let htfTrendDescription = '15m HTF structure neutral';
-  if (candles.length >= 15) {
-    const span = Math.min(candles.length, 60);
+  if (candles.length >= 30) {
+    const span = Math.min(candles.length, 240);
     const sub = candles.slice(-span);
     const htfBars: Array<{ high: number; low: number; close: number; open: number }> = [];
     for (let k = 0; k < sub.length; k += 15) {
       const chunk = sub.slice(k, k + 15);
-      if (chunk.length >= 5) {
+      if (chunk.length >= 10) {
         htfBars.push({
           open: chunk[0].open ?? chunk[0].close,
           high: Math.max(...chunk.map((c) => c.high)),
@@ -478,42 +725,39 @@ function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
         });
       }
     }
-    if (htfBars.length >= 2) {
+    if (htfBars.length >= 3) {
       const latestHtf = htfBars[htfBars.length - 1];
       const prevHtf = htfBars[htfBars.length - 2];
-      if (latestHtf.close > prevHtf.high || (latestHtf.high > prevHtf.high && latestHtf.low > prevHtf.low)) {
+      const oldHtf = htfBars[0];
+      const macroUp = latestHtf.close >= oldHtf.close && latestHtf.low >= prevHtf.low;
+      const macroDown = latestHtf.close <= oldHtf.close && latestHtf.high <= prevHtf.high;
+      if (macroUp && (latestHtf.close > prevHtf.high || latestHtf.high > prevHtf.high)) {
         htfTrend = 'BULLISH';
-        htfTrendDescription = '15m HTF structure is BULLISH (making higher highs & higher lows)';
-      } else if (latestHtf.close < prevHtf.low || (latestHtf.high < prevHtf.high && latestHtf.low < prevHtf.low)) {
+      } else if (macroDown && (latestHtf.close < prevHtf.low || latestHtf.low < prevHtf.low)) {
         htfTrend = 'BEARISH';
-        htfTrendDescription = '15m HTF structure is BEARISH (making lower highs & lower lows)';
-      } else {
-        htfTrend = latestHtf.close >= latestHtf.open ? 'BULLISH' : 'BEARISH';
-        htfTrendDescription = `15m HTF consolidation (${htfTrend.toLowerCase()} bias)`;
       }
     }
   }
 
-  // --- SKILL 2: Chop & Low Volume Dead Zone Filter ---
+  const htfTrendDescription = `Intraday 15m/5m Bias: ${htfTrend}`;
+
   let marketRegime: DerivedMarketContext['marketRegime'] = 'TRENDING';
   let isLowVolumeChop = false;
   const recentFp = snapshot.footprints.slice(-15);
-  if (recentFp.length >= 6) {
+
+  const chopAnalysis = detectSidewaysMarket(candles, snapshot.footprints, 45, activeSession);
+
+  if (chopAnalysis.isChop) {
+    marketRegime = 'CHOP_COMPRESSION';
+    isLowVolumeChop = true;
+  } else if (recentFp.length >= 6) {
     const avgVolume = recentFp.reduce((s, b) => s + b.totalVolume, 0) / recentFp.length;
     const last3Vol = recentFp.slice(-3).reduce((s, b) => s + b.totalVolume, 0) / 3;
-    const recentRange = Math.max(...recentFp.slice(-5).map((b) => b.high)) - Math.min(...recentFp.slice(-5).map((b) => b.low));
-    const currentPrice = snapshot.latestPrice ?? candles[candles.length - 1]?.close ?? 70000;
-    const rangePct = recentRange / currentPrice;
-
-    if (last3Vol < avgVolume * 0.45 && rangePct < 0.0009) {
-      marketRegime = 'CHOP_COMPRESSION';
-      isLowVolumeChop = true;
-    } else if (last3Vol > avgVolume * 1.8 || Math.abs(recentFp[recentFp.length - 1]?.delta ?? 0) > avgVolume * 0.3) {
+    if (last3Vol > avgVolume * 1.8 || Math.abs(recentFp[recentFp.length - 1]?.delta ?? 0) > avgVolume * 0.3) {
       marketRegime = 'EXPANSION';
     }
   }
 
-  // --- SKILL 3: Open Interest & Liquidation Exhaustion Engine ---
   let liquidationSignal: DerivedMarketContext['liquidationSignal'] = 'NONE';
   if (recentFp.length >= 4) {
     const lastBar = recentFp[recentFp.length - 1];
@@ -537,358 +781,637 @@ function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketContext {
     pdEq,
     pwh,
     pwl,
+    sessionHigh,
+    sessionLow,
+    drawOnLiquidity: {
+      nextBullishTarget,
+      nextBearishTarget,
+      context: dolContext
+    },
     dealingRange,
     recentSwingHigh,
     recentSwingLow,
     orderFlowSummary,
+    independentContext,
     htfTrend,
     htfTrendDescription,
+    macro1hTrend,
+    macro4hTrend,
     marketRegime,
     isLowVolumeChop,
-    liquidationSignal
+    liquidationSignal,
+    atr: computeAtr(candles),
+    sweepReclaim: detectSweepReclaim(candles, { pdh, pdl, pwh, pwl })
   };
 }
 
+// ===========================================================================
+// Council configuration
+// ===========================================================================
+export type Direction = 'LONG' | 'SHORT';
+
+export function councilConfig() {
+  const num = (key: string, fallback: number): number => {
+    const raw = process.env[key];
+    if (raw === undefined || raw.trim() === '') return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    minClosedFootprints: 4,
+    minCandles: 10,
+    minAgreeing: 2,
+    minLeadStrength: 2,
+    opposeVetoStrength: 2,
+    minRR: num('COUNCIL_MIN_RR', 1.3),
+    maxRR: num('COUNCIL_MAX_RR', 2.0),
+    minRiskPct: num('COUNCIL_MIN_RISK_PCT', 0.50),
+    maxRiskPct: num('COUNCIL_MAX_RISK_PCT', 1.00),
+    maxEntryDriftPct: num('COUNCIL_MAX_ENTRY_DRIFT_PCT', 0.25),
+    accountBalanceUsd: num('ACCOUNT_BALANCE_USD', 1000),
+    riskPerTradePct: num('RISK_PER_TRADE_PCT', 0.5),
+    maxDailyLossR: num('MAX_DAILY_LOSS_R', 3.0),
+    managerMode: (process.env.COUNCIL_MANAGER ?? '').trim().toLowerCase() === 'off' ? 'off' as const : 'llm' as const,
+    reasoningEffort: (process.env.GROQ_REASONING_EFFORT ?? '').trim().toLowerCase()
+  };
+}
+
+// ===========================================================================
+// Deterministic hard gates (Data Quality + Stale Feed + Risk Circuit Breaker + Intraday Gates)
+// ===========================================================================
+export interface GateResult {
+  blocked: string | null;
+  permitted: Direction[];
+  denied: Partial<Record<Direction, string>>;
+}
+
+export function evaluateGates(snapshot: AgentSnapshot): GateResult {
+  const cfg = councilConfig();
+  const derived = snapshot.derivedContext ?? buildDerivedContext(snapshot);
+  const closed = snapshot.footprints.filter((bar) => bar.isClosed).length;
+  const none: Direction[] = [];
+
+  // 1. Critical Data Quality & Stale/Missing Feed Hard Gate
+  if (snapshot.feedStatus !== 'LIVE') {
+    return { blocked: `Data quality gate: feed status is ${snapshot.feedStatus || 'UNKNOWN'} (must be LIVE).`, permitted: none, denied: {} };
+  }
+  if (snapshot.lastTradeAt === null || !Number.isFinite(snapshot.lastTradeAt)) {
+    return { blocked: 'Data quality gate: missing lastTradeAt market timestamp.', permitted: none, denied: {} };
+  }
+  if (Date.now() - snapshot.lastTradeAt > 30_000) {
+    const staleSec = Math.round((Date.now() - snapshot.lastTradeAt) / 1000);
+    return { blocked: `Data quality gate: market feed stale (${staleSec}s since last trade).`, permitted: none, denied: {} };
+  }
+
+  // 2. Account-Level Risk Circuit Breaker (Daily Loss / Consecutive Loss Guard)
+  const recentTrades = snapshot.paperPerformance?.recent ?? [];
+  const lastThree = recentTrades.slice(-3);
+  if (lastThree.length === 3 && lastThree.every((t) => t.outcome === 'LOSS')) {
+    return { blocked: 'Risk circuit breaker: 3 consecutive losses recorded; pausing new entries until regime resets.', permitted: none, denied: {} };
+  }
+  const recentNetR = recentTrades.reduce((sum, t) => sum + t.pnlR, 0);
+  if (recentNetR <= -cfg.maxDailyLossR) {
+    return { blocked: `Risk circuit breaker: daily drawdown (${recentNetR.toFixed(2)}R) hit -${cfg.maxDailyLossR}R limit.`, permitted: none, denied: {} };
+  }
+
+  if (closed < cfg.minClosedFootprints) {
+    return { blocked: `Insufficient context: ${closed} closed footprints supplied (need ${cfg.minClosedFootprints}).`, permitted: none, denied: {} };
+  }
+  if (snapshot.candles.length < cfg.minCandles) {
+    return { blocked: `Insufficient context: ${snapshot.candles.length} candles supplied (need ${cfg.minCandles}).`, permitted: none, denied: {} };
+  }
+
+  const sweep = derived.sweepReclaim ?? detectSweepReclaim(snapshot.candles, derived);
+  const absorption = derived.orderFlowSummary?.absorptionSignal ?? 'NONE';
+  const isChopRegime = derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop;
+  const hasChopLong = sweep.long || absorption === 'BULLISH_ABSORPTION';
+  const hasChopShort = sweep.short || absorption === 'BEARISH_ABSORPTION';
+
+  if (isChopRegime && !hasChopLong && !hasChopShort) {
+    return { blocked: 'CHOP_COMPRESSION: volume is below baseline and range is compressed (no sweep or absorption); standing aside.', permitted: none, denied: {} };
+  }
+
+  const sweptLevels = sweep.levels ?? [];
+  const hasMajorSweepLong = sweep.long && sweptLevels.some((l) => l === 'PDL' || l === 'PWL');
+  const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH');
+
+  const denied: Partial<Record<Direction, string>> = {};
+
+  if (isChopRegime && !hasChopLong) {
+    denied.LONG = 'CHOP_COMPRESSION: LONG blocked without bullish sweep or bullish absorption.';
+  }
+  if (isChopRegime && !hasChopShort) {
+    denied.SHORT = 'CHOP_COMPRESSION: SHORT blocked without bearish sweep or bearish absorption.';
+  }
+
+  const activityScan = scanMarketActivity(snapshot);
+  const is15mBullish = activityScan.structure15m === 'UPTREND_STRUCTURE' || activityScan.structure15m === 'DIP_IN_UPTREND';
+  const is15mBearish = activityScan.structure15m === 'DOWNTREND_STRUCTURE' || activityScan.structure15m === 'BOUNCE_IN_DOWNTREND';
+
+  const macroBearish = is15mBearish && !is15mBullish;
+  const macroBullish = is15mBullish && !is15mBearish;
+
+  const rangeBars = (snapshot.candles5m && snapshot.candles5m.length >= 20)
+    ? snapshot.candles5m.slice(-54)
+    : snapshot.candles.slice(-270);
+  const lastPrice = snapshot.latestPrice ?? snapshot.candles[snapshot.candles.length - 1]?.close ?? null;
+  let rangePosPct: number | null = null;
+  if (rangeBars.length >= 10 && lastPrice !== null) {
+    const rHigh = Math.max(...rangeBars.map((c) => c.high));
+    const rLow = Math.min(...rangeBars.map((c) => c.low));
+    const rSpan = rHigh - rLow;
+    if (rSpan > 0) rangePosPct = ((lastPrice - rLow) / rSpan) * 100;
+  }
+
+
+ const fpNetDelta = snapshot.footprints.slice(-60).reduce((s, b) => s + b.delta, 0);
+  const recent15Delta = snapshot.footprints.slice(-15).reduce((s, b) => s + b.delta, 0);
+  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION';
+  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION';
+
+  if (macroBearish && !hasReversalTriggerLong) {
+    denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
+  } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
+    denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
+  } else if (!macroBullish && recent15Delta <= 0 && rangePosPct !== null && rangePosPct > 78) {
+    denied.LONG = `Top chasing blocked: price at ${rangePosPct.toFixed(0)}% of 4.5h range without bullish 15m delta.`;
+  }
+
+  if (macroBullish && !hasReversalTriggerShort) {
+    denied.SHORT = `Intraday 15m/5m trend is BULLISH (${activityScan.structure15m}); SHORTs blocked unless sweep-rejection or absorption occurs.`;
+  } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0) {
+    denied.SHORT = `Counter-trend SHORT blocked: 15m/5m BULLISH and both 60m (+${fpNetDelta.toFixed(1)}) and 15m (+${recent15Delta.toFixed(1)}) delta remain positive.`;
+  } else if (!macroBearish && recent15Delta >= 0 && rangePosPct !== null && rangePosPct < 22) {
+    denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of 4.5h range without bearish 15m delta.`;
+  }
+
+  if (activityScan.blockedDirection === 'LONG' && !denied.LONG) {
+    denied.LONG = activityScan.blockReason ?? 'Blocked by Pre-Trade Market Activity Scanner.';
+  }
+  if (activityScan.blockedDirection === 'SHORT' && !denied.SHORT) {
+    denied.SHORT = activityScan.blockReason ?? 'Blocked by Pre-Trade Market Activity Scanner.';
+  }
+
+  const permitted = (['LONG', 'SHORT'] as Direction[]).filter((dir) => !denied[dir]);
+  return { blocked: null, permitted, denied };
+}
+
+// ===========================================================================
+// Strict Multi-Specialist Consensus (Minimum 2 independent specialists required)
+// ===========================================================================
+export function computeConsensus(reports: SpecialistReport[]): { bias: Direction | null; reason: string } {
+  const cfg = councilConfig();
+  const tally = (dir: Direction) => reports.filter((r) => r.bias === dir && r.strength >= 1);
+  const vetoed = (dir: Direction) => reports.some((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= cfg.opposeVetoStrength);
+
+  for (const dir of ['LONG', 'SHORT'] as Direction[]) {
+    const supporters = tally(dir);
+    const opposing = reports.filter((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= 1);
+    const hasLeadOrUnanimous = supporters.some((r) => r.strength >= cfg.minLeadStrength) || supporters.length >= 3;
+    const unopposedPair = supporters.length >= 2 && opposing.length === 0;
+    if (supporters.length >= cfg.minAgreeing && (hasLeadOrUnanimous || unopposedPair) && !vetoed(dir)) {
+      return { bias: dir, reason: `${supporters.map((r) => r.name).join(' + ')} agree on ${dir}.` };
+    }
+  }
+  const summary = reports.map((r) => `${r.agentId}:${r.bias}/${r.strength}`).join(', ');
+  return { bias: null, reason: `No qualifying consensus (${summary}). Need ${cfg.minAgreeing}+ aligned specialists, one with strength >= ${cfg.minLeadStrength}, and no opposing specialist at strength >= ${cfg.opposeVetoStrength}.` };
+}
+
+// ===========================================================================
+// Trade levels & Account-Level Position Sizing Engine
+// ===========================================================================
+export type LevelsResult =
+  | { ok: true; entryPrice: number; stopPrice: number; target1Price: number; targetPrice: number; targetR: number; riskAllocation: RiskAllocation; notes: string[] }
+  | { ok: false; reason: string };
+
+export function computeRiskAllocation(entryPrice: number, stopPrice: number): RiskAllocation {
+  const cfg = councilConfig();
+  const maxRiskUsd = Number(((cfg.accountBalanceUsd * cfg.riskPerTradePct) / 100).toFixed(2));
+  const stopDistance = Math.max(Math.abs(entryPrice - stopPrice), 1e-8);
+  const positionSizeUnits = Number((maxRiskUsd / stopDistance).toFixed(6));
+  const notionalValueUsd = Number((positionSizeUnits * entryPrice).toFixed(2));
+  const effectiveLeverage = Number((notionalValueUsd / Math.max(cfg.accountBalanceUsd, 1)).toFixed(2));
+  return {
+    accountBalanceUsd: cfg.accountBalanceUsd,
+    riskPerTradePct: cfg.riskPerTradePct,
+    maxRiskUsd,
+    positionSizeUnits,
+    notionalValueUsd,
+    effectiveLeverage
+  };
+}
+
+export function resolveTradeLevels(
+  decision: Direction,
+  snapshot: AgentSnapshot,
+  raw: { entry: unknown; stop: unknown; target: unknown }
+): LevelsResult {
+  const cfg = councilConfig();
+  const candles = snapshot.candles;
+  const last = snapshot.latestPrice ?? candles[candles.length - 1]?.close ?? null;
+  if (last === null || !(last > 0)) return { ok: false, reason: 'No valid latest price to anchor the trade levels.' };
+
+  const dir = decision === 'LONG' ? 1 : -1;
+  const notes: string[] = [];
+  const positive = (value: unknown): number | null => {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+
+  let entry = positive(raw.entry);
+  if (entry === null || (Math.abs(entry - last) / last) * 100 > cfg.maxEntryDriftPct) {
+    if (entry !== null) notes.push(`Entry ${entry} drifted more than ${cfg.maxEntryDriftPct}% from price; using ${last}.`);
+    entry = last;
+  }
+
+  const atr = snapshot.derivedContext?.atr ?? computeAtr(candles);
+  const recent = candles.slice(-8);
+  const swingLow = recent.length ? Math.min(...recent.map((c) => c.low)) : last * 0.997;
+  const swingHigh = recent.length ? Math.max(...recent.map((c) => c.high)) : last * 1.003;
+  const buffer = Math.max(atr !== null ? atr * 0.6 : 0, entry * 0.0012);
+
+  let stop = positive(raw.stop);
+  const wrongSide = (value: number | null): boolean => value === null || (dir === 1 ? value >= entry : value <= entry);
+  if (wrongSide(stop)) {
+    notes.push(stop === null ? 'Stop placed beyond the recent structural swing.' : 'Proposed stop was on the wrong side; used the structural swing stop.');
+    stop = dir === 1 ? swingLow - buffer : swingHigh + buffer;
+    if (wrongSide(stop)) stop = entry - dir * buffer * 2;
+  }
+  let stopPrice = stop as number;
+  let risk = Math.abs(entry - stopPrice);
+
+  const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(snapshot.symbol);
+  const effectiveMinRiskPct = isForex ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
+  const effectiveMaxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
+
+  const minRisk = Math.max((entry * effectiveMinRiskPct) / 100, atr !== null ? atr * 2.0 : 0);
+  if (risk < minRisk) {
+    stopPrice = entry - dir * minRisk;
+    risk = minRisk;
+    notes.push('Stop was inside normal noise; widened to the volatility floor.');
+  }
+  const riskPct = (risk / entry) * 100;
+  if (riskPct > effectiveMaxRiskPct) {
+    return { ok: false, reason: `Stop distance ${riskPct.toFixed(2)}% exceeds the ${effectiveMaxRiskPct}% limit; structure is too wide for this timeframe.` };
+  }
+
+  const validSide = (value: number | null): value is number => value !== null && (dir === 1 ? value > entry : value < entry);
+  let target = positive(raw.target);
+
+  if (!validSide(target) || (target !== null && Math.abs(target - entry) / risk < cfg.minRR)) {
+    if (target !== null && !validSide(target)) notes.push('Target was on the wrong side of entry; ignored.');
+    const dolRaw = snapshot.derivedContext?.drawOnLiquidity;
+    const dol = positive(dir === 1 ? dolRaw?.nextBullishTarget : dolRaw?.nextBearishTarget);
+
+    if (validSide(dol) && Math.abs(dol - entry) / risk >= cfg.minRR) {
+      target = dol;
+      notes.push('Target taken from next draw on liquidity.');
+    } else {
+      target = entry + dir * risk * 1.35;
+      notes.push('Local DOL too tight; defaulted to 1.8R structural target.');
+    }
+  }
+
+  let finalTarget = target as number;
+  let rr = Math.abs(finalTarget - entry) / risk;
+
+  if (rr < cfg.minRR) {
+    finalTarget = entry + dir * risk * cfg.minRR;
+    rr = cfg.minRR;
+    notes.push(`Target expanded to meet minimum ${cfg.minRR}R.`);
+  }
+  if (rr > cfg.maxRR) {
+    finalTarget = entry + dir * risk * cfg.maxRR;
+    rr = cfg.maxRR;
+    notes.push(`Target capped at ${cfg.maxRR}R.`);
+  }
+
+  const round = (value: number): number => Number(value.toFixed(6));
+  const entryPrice = round(entry);
+  const roundedStop = round(stopPrice);
+  return {
+    ok: true,
+    entryPrice,
+    stopPrice: roundedStop,
+    target1Price: round(entry + dir * risk),
+    targetPrice: round(finalTarget),
+    targetR: Number(rr.toFixed(2)),
+    riskAllocation: computeRiskAllocation(entryPrice, roundedStop),
+    notes
+  };
+}
+
+// ===========================================================================
+// Lessons memory hygiene
+// ===========================================================================
+export function normalizeLessons(lessons: readonly string[] | undefined, max = 6): string[] {
+  const seen = new Set<string>();
+  const clean: string[] = [];
+  for (const raw of lessons ?? []) {
+    if (typeof raw !== 'string') continue;
+    const text = raw.replace(/[\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 220);
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    clean.push(text);
+  }
+  if (clean.length <= max) return clean;
+  const head = Math.ceil(max / 2);
+  return [...clean.slice(0, head), ...clean.slice(clean.length - (max - head))];
+}
+
+function lessonsBlock(lessons: string[], title: string): string {
+  return lessons.length ? `\n${title}\n${lessons.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n` : '';
+}
+
+// ===========================================================================
+// Snapshot compaction
+// ===========================================================================
 function compactSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
   const derivedContext = buildDerivedContext(snapshot);
   return {
     ...snapshot,
     derivedContext,
-    candles: snapshot.candles.slice(-40),
-    footprints: snapshot.footprints.filter((bar) => bar.isClosed).slice(-4).map((bar) => ({
+    candles: snapshot.candles.slice(-300),
+    footprints: snapshot.footprints.filter((bar) => bar.isClosed).slice(-12).map((bar) => ({
       ...bar,
-      priceLevels: [...bar.priceLevels].sort((a, b) => Math.abs(a.price - bar.pocPrice) - Math.abs(b.price - bar.pocPrice)).slice(0, 10)
+      priceLevels: [...bar.priceLevels]
+        .sort((a, b) => b.totalVolume - a.totalVolume)
+        .slice(0, 14)
     })),
-    trades: snapshot.trades.slice(0, 10),
+    trades: [...snapshot.trades]
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 25),
     bids: snapshot.bids.slice(0, 5),
     asks: snapshot.asks.slice(0, 5)
   };
 }
 
-/**
- * Trim irrelevant heavy arrays per specialist so Groq agents use ~70% fewer tokens
- * and stay comfortably inside Groq's free TPM/TPD limits.
- */
-function payloadForSpecialist(snapshot: AgentSnapshot, role: 'smc' | 'ict' | 'orderflow'): unknown {
-  const d = snapshot.derivedContext;
-  if (role === 'smc') {
-    return {
-      symbol: snapshot.symbol,
-      latestPrice: snapshot.latestPrice,
-      htfTrend: d?.htfTrend,
-      marketRegime: d?.marketRegime,
-      recentSwingHigh: d?.recentSwingHigh,
-      recentSwingLow: d?.recentSwingLow,
-      events: snapshot.technicalContext?.smc.events.slice(-5) ?? [],
-      zones: snapshot.technicalContext?.smc.zones.slice(-4) ?? [],
-      recentCandles: snapshot.candles.slice(-10).map((c) => ({ high: c.high, low: c.low, close: c.close }))
-    };
+// ===========================================================================
+// LLM transport
+// ===========================================================================
+interface GenerateOptions { maxTokens: number; effort?: 'low' | 'medium' | 'high'; temperature?: number; }
+interface GenerateOutput<T> { data: T; tokens: number; }
+
+function parseRetrySeconds(detail: string, headerValue: string | null): number {
+  const header = Number(headerValue);
+  if (Number.isFinite(header) && header > 0) return Math.min(Math.ceil(header), 6 * 3600);
+  const match = detail.match(/try again in\s+(?:(\d+)h)?\s*(?:(\d+)m(?!s))?\s*(?:(\d+(?:\.\d+)?)s)?/i);
+  if (match && (match[1] || match[2] || match[3])) {
+    const seconds = Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Math.ceil(Number(match[3] ?? 0));
+    if (seconds > 0) return Math.min(seconds + 1, 6 * 3600);
   }
-  if (role === 'ict') {
-    return {
-      symbol: snapshot.symbol,
-      latestPrice: snapshot.latestPrice,
-      activeSession: d?.activeSession,
-      silverBullet: d?.silverBulletWindow,
-      dealingRange: d?.dealingRange ? { zone: d.dealingRange.zone, equilibrium: d.dealingRange.equilibrium } : null,
-      pdh: d?.pdh,
-      pdl: d?.pdl,
-      po3: snapshot.technicalContext?.ict.po3.slice(-3) ?? [],
-      recentCandles: snapshot.candles.slice(-10).map((c) => ({ high: c.high, low: c.low, close: c.close }))
-    };
-  }
-  const availableFootprints = snapshot.footprints.filter((b) => b.isClosed).length > 0
-    ? snapshot.footprints.filter((b) => b.isClosed).slice(-3)
-    : snapshot.footprints.slice(-3);
-  return {
-    symbol: snapshot.symbol,
-    latestPrice: snapshot.latestPrice,
-    microstructure: d?.orderFlowSummary ? {
-      cvdTrend: d.orderFlowSummary.cvdTrend,
-      latestPocPosition: d.orderFlowSummary.latestPocPosition,
-      latestBarDelta: d.orderFlowSummary.latestBarDelta,
-      absorptionSignal: d.orderFlowSummary.absorptionSignal,
-      deltaBreakoutSignal: d.orderFlowSummary.deltaBreakoutSignal,
-      stackedBuyImbalances: d.orderFlowSummary.stackedBuyImbalances,
-      stackedSellImbalances: d.orderFlowSummary.stackedSellImbalances
-    } : null,
-    recentFootprints: availableFootprints.map(({ open, high, low, close, totalVolume, delta, pocPrice }) => ({
-      open, high, low, close, totalVolume, delta, pocPrice
-    }))
-  };
+  return 4;
 }
 
-async function generateJson<T>(config: ProviderConfig, system: string, input: unknown, schema: object): Promise<T> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.provider === 'ollama' ? 90_000 : 35_000);
+function penalizeKey(config: ProviderConfig, ms: number): void {
+  const usage = usageFor(config);
+  usage.cooldownUntil = Math.max(usage.cooldownUntil, Date.now() + ms);
+}
+
+async function readErrorDetail(response: Response): Promise<string> {
   try {
-    const url = config.provider === 'gemini'
-      ? `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`
-      : config.provider === 'groq'
-        ? `${config.baseUrl ?? 'https://api.groq.com/openai/v1'}/chat/completions`
-        : config.provider === 'nvidia'
-          ? `${config.baseUrl ?? 'https://integrate.api.nvidia.com/v1'}/chat/completions`
-          : config.provider === 'openrouter'
-            ? `${config.baseUrl ?? 'https://openrouter.ai/api/v1'}/chat/completions`
-            : `${config.baseUrl ?? 'http://127.0.0.1:11434'}/api/chat`;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' };
-    if (config.provider === 'gemini' && config.key) headers['x-goog-api-key'] = config.key;
-    if ((config.provider === 'groq' || config.provider === 'nvidia' || config.provider === 'openrouter') && config.key) {
-      headers.Authorization = `Bearer ${config.key}`;
-    }
-    if (config.provider === 'openrouter') {
-      headers['HTTP-Referer'] = 'http://localhost:4000';
-      headers['X-Title'] = 'FlowTerminal';
-    }
-    const body = config.provider === 'gemini'
-      ? {
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: 'user', parts: [{ text: JSON.stringify(input) }] }],
-          generationConfig: { temperature: 0.15, maxOutputTokens: 1100, responseMimeType: 'application/json', responseSchema: schema }
-        }
-      : (config.provider === 'groq' || config.provider === 'nvidia' || config.provider === 'openrouter')
-        ? {
-            model: config.provider === 'nvidia' ? (config.model.includes('/') ? config.model : 'meta/llama-3.3-70b-instruct')
-                 : config.provider === 'openrouter' ? (config.model.includes(':') ? config.model : 'meta-llama/llama-3.3-70b-instruct:free')
-                 : config.model,
-            temperature: 0.15,
-            max_tokens: 1800,
-            response_format: { type: 'json_object' },
-            ...(config.provider === 'groq' ? { reasoning_format: 'hidden', reasoning_effort: 'low' } : {}),
-            messages: [
-              { role: 'user', content: `${system}\n\nCRITICAL REQUIREMENT: Output a valid JSON object matching this schema. Do not write any preamble, reasoning, or markdown code fences.\nSCHEMA:\n${JSON.stringify(schema)}\n\nMARKET_DATA:\n${JSON.stringify(input)}` }
-            ]
-          }
-        : {
-            model: config.model, stream: false, format: schema,
-            messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify(input) }],
-            options: { temperature: 0.15 }
-          };
-    recordAttempt(config);
-    let response: Response | null = null;
-    let netErr: unknown = null;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        response = await fetch(url, { method: 'POST', headers, signal: controller.signal, body: JSON.stringify(body) });
-        break;
-      } catch (err) {
-        netErr = err;
-        if (attempt === 0) await new Promise((r) => setTimeout(r, 1500));
-      }
-    }
-    if (!response) {
-      throw new Error(`${config.provider} (${config.model}): ${netErr instanceof Error ? netErr.message : 'fetch failed'}`);
-    }
-    if (response.status === 429) {
-      let errDetail = '';
-      try {
-        const errJson = await response.json() as any;
-        errDetail = errJson?.error?.message || errJson?.message || JSON.stringify(errJson);
-      } catch {
-        try { errDetail = await response.text(); } catch { /* ignore */ }
-      }
-      let retrySec = 3;
-      const match = errDetail.match(/try again in (\d+(\.\d+)?)s/i);
-      if (match) retrySec = Math.ceil(Number(match[1])) + 1;
-      const headerRetry = Number(response.headers.get('retry-after'));
-      if (Number.isFinite(headerRetry) && headerRetry > 0) retrySec = headerRetry;
-      usageFor(config).cooldownUntil = Date.now() + (retrySec * 1000);
-      throw new Error(`${config.provider} (${config.model}): ${errDetail || '429 rate limit reached'}`);
-    }
-    if (!response.ok) {
-      const status = response.status;
-      let errDetail = '';
-      try {
-        const errJson = await response.json() as any;
-        errDetail = errJson?.error?.message || errJson?.message || JSON.stringify(errJson);
-      } catch {
-        try { errDetail = await response.text(); } catch { /* ignore */ }
-      }
-      if (status === 400 || status === 403) {
-        throw new Error(`${config.provider} (${config.model}) rejected: ${errDetail || 'Check API key or model name.'}`);
-      }
-      if (status === 404) {
-        throw new Error(`${config.provider} (${config.model}) 404 not found: ${errDetail || 'Model decommissioned or URL invalid.'}`);
-      }
-      throw new Error(`${config.provider} (${config.model}) HTTP ${status}: ${errDetail || 'Request failed'}`);
-    }
-    const payload = await response.json() as any;
-    const text = config.provider === 'gemini'
-      ? extractGeminiText(payload)
-      : (config.provider === 'groq' || config.provider === 'nvidia' || config.provider === 'openrouter')
-        ? payload.choices?.[0]?.message?.content
-        : payload.message?.content;
-    if (typeof text !== 'string' || !text.trim()) throw new Error(`${config.provider} returned an empty structured response.`);
-    return parseObject<T>(text.trim());
-  } finally {
-    clearTimeout(timer);
+    const json = (await response.json()) as any;
+    return json?.error?.message || json?.message || JSON.stringify(json);
+  } catch {
+    try { return await response.text(); } catch { return ''; }
   }
 }
 
-async function generateWithFallback<T>(providers: ProviderConfig[], role: AgentRole, system: string, input: unknown, schema: object): Promise<{ data: T; used: ProviderConfig }> {
+async function generateJson<T>(config: ProviderConfig, system: string, input: unknown, template: string, options: GenerateOptions): Promise<GenerateOutput<T>> {
+  const cfg = councilConfig();
+  const isAnthropicModel = config.provider === 'agentrouter' && /^claude/i.test(config.model);
+  const isResponsesModel = config.provider === 'agentrouter' && !isAnthropicModel;
+
+  const url = isAnthropicModel
+    ? `${config.baseUrl ?? 'https://agentrouter.org/v1'}/messages`
+    : isResponsesModel
+      ? `${config.baseUrl ?? 'https://agentrouter.org/v1'}/responses`
+      : config.provider === 'cloudflare'
+        ? (config.baseUrl?.includes('/accounts/')
+            ? `${config.baseUrl}/chat/completions`
+            : `${config.baseUrl}/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`)
+        : `${config.baseUrl ?? 'https://api.groq.com/openai/v1'}/chat/completions`;
+
+  const headers: Record<string, string> = isAnthropicModel
+    ? {
+        'Content-Type': 'application/json',
+        'x-api-key': config.key,
+        'anthropic-version': '2023-06-01',
+        'User-Agent': 'claude-cli/1.0.24 (external, cli)'
+      }
+    : {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${config.key}`,
+        ...(config.provider === 'agentrouter' ? { 'User-Agent': 'claude-cli/1.0.24 (external, cli)' } : {})
+      };
+
+  const body: Record<string, unknown> = isAnthropicModel
+    ? {
+        model: config.model,
+        max_tokens: options.maxTokens,
+        temperature: options.temperature ?? 0.1,
+        system: `${system}\n\nRespond with ONE valid JSON object only (no markdown, no preamble), shaped exactly like:\n${template}`,
+        messages: [
+          { role: 'user', content: input === undefined ? 'Produce the JSON object now.' : `MARKET_DATA:\n${JSON.stringify(input)}` }
+        ]
+      }
+    : isResponsesModel
+      ? {
+          model: config.model,
+          max_output_tokens: 16000,
+          reasoning: { effort: 'low' },
+          instructions: `${system}\n\nKeep each string concise (max 25 words). Respond with ONE valid JSON object only (no markdown, no preamble), shaped exactly like:\n${template}`,
+          input: input === undefined ? 'Produce the JSON object now.' : `MARKET_DATA:\n${JSON.stringify(input)}`
+        }
+      : {
+          model: config.model,
+          temperature: options.temperature ?? 0.1,
+          max_tokens: options.maxTokens,
+          ...(!/gpt-oss/i.test(config.model) ? { response_format: { type: 'json_object' } } : {}),
+          messages: [
+            { role: 'system', content: `${system}\n\nRespond with ONE valid JSON object only (no markdown, no preamble), shaped exactly like:\n${template}` },
+            { role: 'user', content: input === undefined ? 'Produce the JSON object now.' : `MARKET_DATA:\n${JSON.stringify(input)}` }
+          ]
+        };
+
+  if (config.provider === 'groq' && /gpt-oss/i.test(config.model) && cfg.reasoningEffort !== 'off') {
+    body.reasoning_effort = ['low', 'medium', 'high'].includes(cfg.reasoningEffort) ? cfg.reasoningEffort : (options.effort ?? 'low');
+  }
+
+  recordAttempt(config);
+  let sentReasoningParam = 'reasoning_effort' in body;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const controller = new AbortController();
+    const timeoutMs = config.provider === 'agentrouter' ? 120_000 : 35_000;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(url, { method: 'POST', headers, signal: controller.signal, body: JSON.stringify(body) });
+    } catch (err) {
+      clearTimeout(timer);
+      if (attempt < 2) { await new Promise((r) => setTimeout(r, 1200)); continue; }
+      penalizeKey(config, 20_000);
+      throw new Error(`${config.provider} (${config.model}): network error - ${err instanceof Error ? err.message : 'fetch failed'}`);
+    }
+
+    try {
+      if (response.status === 429) {
+        const detail = await readErrorDetail(response);
+        const retrySec = parseRetrySeconds(detail, response.headers.get('retry-after'));
+        usageFor(config).cooldownUntil = Date.now() + retrySec * 1000;
+        throw new Error(`${config.provider} (${config.model}): ${detail || '429 rate limit reached'}`);
+      }
+      if (response.status >= 500 && attempt < 2) {
+        await readErrorDetail(response);
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+      if (!response.ok) {
+        const detail = await readErrorDetail(response);
+        if (response.status === 400 && sentReasoningParam && /reasoning/i.test(detail)) {
+          delete body.reasoning_effort;
+          sentReasoningParam = false;
+          continue;
+        }
+        if (/restricted|suspended|deactivated|disabled|blocked/i.test(detail)) penalizeKey(config, 30 * 60_000);
+        else if (response.status === 401 || response.status === 403 || response.status === 404) penalizeKey(config, 10 * 60_000);
+        else penalizeKey(config, response.status >= 500 ? 20_000 : 60_000);
+        throw new Error(`${config.provider} (${config.model}) HTTP ${response.status}: ${detail || 'Request failed'}`);
+      }
+
+      const payload = (await response.json()) as any;
+      const choice = payload.choices?.[0];
+      const text = isAnthropicModel
+        ? payload.content?.[0]?.text
+        : isResponsesModel
+          ? (payload.output_text ??
+              payload.output
+                ?.flatMap((item: any) => item?.content ?? [])
+                ?.find((c: any) => c?.type === 'output_text' || typeof c?.text === 'string')
+                ?.text)
+          : choice?.message?.content;
+      if (typeof text !== 'string' || !text.trim()) {
+        const why = choice?.finish_reason === 'length' ? 'ran out of max_tokens' : 'returned an empty response';
+        throw new Error(`${config.provider} (${config.model}) ${why}.`);
+      }
+      return { data: parseObject<T>(text.trim()), tokens: Number(payload.usage?.total_tokens) || 0 };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error(`${config.provider} (${config.model}): request failed after retries.`);
+}
+
+async function generateWithFallback<T>(
+  providers: ProviderConfig[], role: AgentRole, system: string, input: unknown, template: string, options: GenerateOptions
+): Promise<{ data: T; used: ProviderConfig; tokens: number }> {
+  if (!providers.length) throw new Error(`No Groq key configured for ${role.toUpperCase()} (set GROQ_${role.toUpperCase()}_API_KEY).`);
   const failures: string[] = [];
   let eligible = providers.filter(isAvailable);
+
   if (!eligible.length) {
     const minCooldown = Math.min(...providers.map((p) => usageFor(p).cooldownUntil));
-    const waitMs = Math.max(1500, Math.min(minCooldown - Date.now(), 6000));
-    console.log(`\n[Auto-Pacing] All ${role.toUpperCase()} keys in 2s cooldown window. Pausing ${(waitMs / 1000).toFixed(1)}s...`);
+    const remainingMs = minCooldown - Date.now();
+    if (remainingMs > 5000) {
+      throw new Error(`All Groq keys for ${role.toUpperCase()} are paused for another ${Math.round(remainingMs / 1000)}s after earlier failures (check the key/account).`);
+    }
+    const waitMs = Math.max(1200, remainingMs);
+    console.log(`\n[Auto-Pacing] All Groq keys for ${role.toUpperCase()} cooling down. Pausing ${(waitMs / 1000).toFixed(1)}s...`);
     await new Promise((r) => setTimeout(r, waitMs));
     eligible = providers;
   }
+
   for (let idx = 0; idx < eligible.length; idx++) {
     const provider = eligible[idx];
     try {
-      const data = await generateJson<T>(provider, system, input, schema);
-      return { data, used: provider };
+      const { data, tokens } = await generateJson<T>(provider, system, input, template, options);
+      return { data, used: provider, tokens };
     } catch (error) {
-      const errText = error instanceof Error ? error.message : `${provider.provider}: request failed`;
-      failures.push(errText);
+      const message = error instanceof Error ? error.message : `${provider.provider}: request failed`;
+      failures.push(message);
+      const cooldownSec = Math.max(0, Math.round((usageFor(provider).cooldownUntil - Date.now()) / 1000));
+      const reason = message.replace(/^groq \([^)]*\)\s*/, '').slice(0, 220);
+      const note = cooldownSec > 0 ? ` (key paused ${cooldownSec}s)` : '';
       if (idx < eligible.length - 1) {
-        const nextKey = eligible[idx + 1].key ? `...${eligible[idx + 1].key?.slice(-6)}` : 'backup';
-        console.log(`\n[Auto-Rotation] ${role.toUpperCase()} key ...${provider.key?.slice(-6)} rate-limited. Immediately switching to backup key ${nextKey}...`);
+        console.log(`[Auto-Rotation] ${role.toUpperCase()} key ...${provider.key.slice(-6)} failed: ${reason}${note} -> trying ...${eligible[idx + 1].key.slice(-6)}`);
+      } else {
+        console.warn(`[Auto-Rotation] ${role.toUpperCase()} last key ...${provider.key.slice(-6)} failed: ${reason}${note}`);
       }
     }
   }
-  throw new Error(`AI provider for ${role.toUpperCase()} failed: ${failures.join(' | ')}`);
+  throw new Error(`All Groq keys for ${role.toUpperCase()} failed: ${failures.join(' | ')}`);
 }
 
-function isPlaceholderKey(key: string | undefined): boolean {
-  if (!key) return true;
-  const lower = key.trim().toLowerCase();
-  return !lower || lower.includes('paste-key-here') || lower.includes('your-api-key') || lower.includes('yahan_apni') || lower === 'xxx';
-}
-
-function detectProviderFromKey(key: string, fallbackProvider: AiProvider): AiProvider {
-  if (key.startsWith('gsk_')) return 'groq';
-  if (key.startsWith('nvapi-')) return 'nvidia';
-  if (key.startsWith('sk-or-')) return 'openrouter';
-  if (key.startsWith('AIza') || key.startsWith('AQ.')) return 'gemini';
-  return fallbackProvider;
-}
-
-/**
- * Expands a single role API key into a high-intelligence primary model + high-daily-limit backup model
- * on that EXACT same key, so one agent never steals another agent's key but still survives model rate caps:
- * - Groq key: tries primary (e.g. llama-3.3-70b-versatile: 1,000 RPD) -> automatic fallback to llama-3.1-8b-instant (14,400 RPD, 500K TPD)
- * - Gemini key: tries primary (e.g. gemini-2.5-flash: 1,500 RPD or gemini-2.5-flash-lite) -> automatic fallback to alternate high-RPD Flash model
- */
-function expandKeyWithModelFallback(
-  provider: AiProvider,
-  key: string,
-  primaryModel: string,
-  backupModel: string,
-  scopePrefix: string
-): ProviderConfig[] {
-  const configs: ProviderConfig[] = [
-    { provider, key, model: primaryModel, quotaScope: `${scopePrefix}:${primaryModel}` }
-  ];
-  if (backupModel && backupModel !== primaryModel) {
-    configs.push({ provider, key, model: backupModel, quotaScope: `${scopePrefix}:${backupModel}` });
-  }
-  return configs;
-}
-
-function getModelForProvider(provider: AiProvider, role: AgentRole): string {
-  const roleName = role.toUpperCase();
-  if (provider === 'groq') {
-    const configured = (role === 'manager'
-      ? (process.env.GROQ_MANAGER_MODEL?.trim() || process.env.GROQ_MODEL?.trim())
-      : (process.env.GROQ_SPECIALIST_MODEL?.trim() || process.env.GROQ_MODEL?.trim())) || 'openai/gpt-oss-20b';
-    return process.env[`GROQ_${roleName}_MODEL`]?.trim() || configured;
-  }
-  if (provider === 'nvidia') {
-    return process.env[`NVIDIA_${roleName}_MODEL`]?.trim() || process.env.NVIDIA_MODEL?.trim() || 'meta/llama-3.3-70b-instruct';
-  }
-  if (provider === 'openrouter') {
-    return process.env[`OPENROUTER_${roleName}_MODEL`]?.trim() || process.env.OPENROUTER_MODEL?.trim() || 'meta-llama/llama-3.3-70b-instruct:free';
-  }
-  return process.env[`GEMINI_${roleName}_MODEL`]?.trim() || process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash';
-}
-
-function parseRoleCredentialList(
-  raw: string | undefined,
-  defaultProvider: AiProvider,
-  roleName: string
-): ProviderConfig[] {
+function parseRoleCredentialList(raw: string | undefined, roleName: string): ProviderConfig[] {
   if (!raw?.trim()) return [];
   const credentials: ProviderConfig[] = [];
   const role = roleName.toLowerCase() as AgentRole;
-  for (const part of raw.split(',').map((value) => value.trim()).filter(Boolean)) {
-    const separator = part.indexOf('|');
-    const scope = separator >= 0 ? part.slice(0, separator).trim() : '';
-    const key = separator >= 0 ? part.slice(separator + 1).trim() : part;
-    if (isPlaceholderKey(key)) continue;
-    const provider = detectProviderFromKey(key, defaultProvider);
-    const model = getModelForProvider(provider, role);
-    const keyFingerprint = createHash('sha256').update(key).digest('hex').slice(0, 8);
+
+  const defaultModel = role === 'manager'
+    ? (process.env.GROQ_MANAGER_MODEL?.trim() || 'openai/gpt-oss-120b')
+    : (process.env[`GROQ_${roleName}_MODEL`]?.trim() || 'openai/gpt-oss-20b');
+
+  for (const part of raw.split(',').map((v) => v.trim()).filter(Boolean)) {
+    if (!part.startsWith('gsk_')) continue;
+    const keyFingerprint = createHash('sha256').update(part).digest('hex').slice(0, 8);
     credentials.push({
-      provider,
-      key,
-      model,
-      quotaScope: scope || `${roleName}-${provider}-${keyFingerprint}`
+      provider: 'groq',
+      key: part,
+      model: defaultModel,
+      quotaScope: `${roleName}-groq-${keyFingerprint}`
     });
   }
   return credentials;
 }
 
-/**
- * Strict 1-API-key-per-agent configuration with smart high-RPD model selection:
- * - Manager default (Gemini): primary `gemini-2.5-flash` (1,500 RPD, strong reasoning) -> backup `gemini-2.5-flash-lite` (1,500 RPD, 15 RPM)
- * - OrderFlow default (Gemini): primary `gemini-2.5-flash` (1,500 RPD) -> backup `gemini-2.5-flash-lite` (1,500 RPD, 15 RPM)
- * - SMC & ICT defaults (Groq): primary `llama-3.3-70b-versatile` (1,000 RPD, 70B reasoning) -> backup `llama-3.1-8b-instant` (14,400 RPD, 500K TPD)
- */
 function getProviderConfigs(role: AgentRole): ProviderConfig[] {
   const roleName = role.toUpperCase();
-  const defaultGeminiPrimary = role === 'manager'
-    ? (process.env.GEMINI_MANAGER_MODEL?.trim() || 'gemini-3.8-flash')
-    : (process.env.GEMINI_SPECIALIST_MODEL?.trim() || 'gemini-3.5-flash-lite');
-  const geminiPrimary = process.env[`GEMINI_${roleName}_MODEL`]?.trim() || defaultGeminiPrimary;
-  const geminiBackup = process.env[`GEMINI_${roleName}_BACKUP_MODEL`]?.trim() ||
-    (geminiPrimary.includes('lite') ? 'gemini-3.8-flash' : 'gemini-3.5-flash-lite');
-
-  const defaultGroqPrimary = role === 'manager'
-    ? (process.env.GROQ_MANAGER_MODEL?.trim() || process.env.GROQ_MODEL?.trim() || 'openai/gpt-oss-120b')
-    : (process.env.GROQ_SPECIALIST_MODEL?.trim() || 'openai/gpt-oss-20b');
-  const groqPrimary = process.env[`GROQ_${roleName}_MODEL`]?.trim() || defaultGroqPrimary;
-  const groqBackup = process.env[`GROQ_${roleName}_BACKUP_MODEL`]?.trim() ||
-    (groqPrimary.includes('20b') ? 'openai/gpt-oss-120b' : 'openai/gpt-oss-20b');
-
   const configured: ProviderConfig[] = [];
 
-  configured.push(...parseRoleCredentialList(process.env[`${roleName}_API_KEY`], 'gemini', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`GROQ_${roleName}_API_KEY`], 'groq', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`GROQ_${roleName}_CREDENTIALS`], 'groq', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`NVIDIA_${roleName}_API_KEY`], 'nvidia', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`OPENROUTER_${roleName}_API_KEY`], 'openrouter', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`GEMINI_${roleName}_API_KEY`], 'gemini', roleName));
-  configured.push(...parseRoleCredentialList(process.env[`GEMINI_${roleName}_CREDENTIALS`], 'gemini', roleName));
+  if (role === 'manager' && process.env.AGENT_ROUTER_API_KEY?.trim()) {
+    configured.push({
+      provider: 'agentrouter',
+      key: process.env.AGENT_ROUTER_API_KEY.trim(),
+      model: process.env.AGENT_ROUTER_MODEL?.trim() || 'gpt-5.6-sol',
+      baseUrl: (process.env.AGENT_ROUTER_BASE_URL?.trim() || 'https://agentrouter.org/v1').replace(/\/+$/, ''),
+      quotaScope: 'agent-router-live-manager'
+    });
+  }
+
+  configured.push(...parseRoleCredentialList(process.env[`GROQ_${roleName}_API_KEY`], roleName));
+
+  if (role === 'manager' && process.env.CLOUDFLARE_API_TOKEN && process.env.CLOUDFLARE_ACCOUNT_ID) {
+    configured.push({
+      provider: 'cloudflare',
+      key: process.env.CLOUDFLARE_API_TOKEN,
+      model: process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.1-8b-instruct-fp8-fast',
+      baseUrl: 'https://api.cloudflare.com/client/v4',
+      quotaScope: 'cloudflare-workers-ai'
+    });
+  }
 
   const seen = new Set<string>();
-  const uniqueRoleConfigs = configured.filter((item) => {
+  return configured.filter((item) => {
     const id = `${item.provider}:${item.key}:${item.model}`;
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
   });
-
-  if (uniqueRoleConfigs.length > 0) {
-    return uniqueRoleConfigs;
-  }
-
-  const legacyGemini = process.env.GEMINI_API_KEY?.trim();
-  if (legacyGemini && !isPlaceholderKey(legacyGemini)) {
-    return expandKeyWithModelFallback('gemini', legacyGemini, geminiPrimary, geminiBackup, `${roleName}-fallback`);
-  }
-  const legacyGroq = process.env.GROQ_API_KEY?.trim();
-  if (legacyGroq && !isPlaceholderKey(legacyGroq)) {
-    return expandKeyWithModelFallback('groq', legacyGroq, groqPrimary, groqBackup, `${roleName}-fallback`);
-  }
-  return [];
 }
 
-function sanitizeReport(value: SpecialistReport, agent: typeof SPECIALIST_AGENTS[number]): SpecialistReport {
+// ===========================================================================
+// Report / plan sanitising
+// ===========================================================================
+export function sanitizeReport(value: SpecialistReport, agent: typeof SPECIALIST_AGENTS[number]): SpecialistReport {
   const allowed = new Set(strategiesFor(agent.id).map((strategy) => strategy.id));
-  const direction = value.bias === 'LONG' || value.bias === 'SHORT' ? value.bias : 'NEUTRAL';
+  let direction: SpecialistReport['bias'] = value.bias === 'LONG' || value.bias === 'SHORT' ? value.bias : 'NEUTRAL';
+  let strength = Math.max(0, Math.min(3, Math.round(Number(value.strength) || 0)));
+  if (strength === 0) direction = 'NEUTRAL';
+  if (direction === 'NEUTRAL') strength = 0;
   const strategyCandidates = textList(value.strategyCandidates, 4).filter((id) => {
     const strategy = strategyById(id);
     return allowed.has(id) && strategy && (direction === 'NEUTRAL' || strategy.direction === 'BOTH' || strategy.direction === direction);
@@ -897,7 +1420,7 @@ function sanitizeReport(value: SpecialistReport, agent: typeof SPECIALIST_AGENTS
     agentId: agent.id,
     name: agent.name,
     bias: direction,
-    strength: Math.max(0, Math.min(3, Math.round(Number(value.strength) || 0))),
+    strength,
     findings: textList(value.findings, 5),
     strategyCandidates,
     concerns: textList(value.concerns, 4),
@@ -905,295 +1428,324 @@ function sanitizeReport(value: SpecialistReport, agent: typeof SPECIALIST_AGENTS
   };
 }
 
-function computeFallbackLevels(
-  decision: 'LONG' | 'SHORT',
-  snapshot: AgentSnapshot,
-  rawEntry: number,
-  rawStop: number,
-  rawTargetR: number | null
-): { entryPrice: number; stopPrice: number; target1Price: number; targetPrice: number; targetR: 2 | 3 } {
-  const candles = snapshot.candles;
-  const lastClose = snapshot.latestPrice ?? candles[candles.length - 1]?.close ?? 0;
-  const recent = candles.slice(-8);
-  const swingLow = recent.length ? Math.min(...recent.map((c) => c.low)) : lastClose * 0.997;
-  const swingHigh = recent.length ? Math.max(...recent.map((c) => c.high)) : lastClose * 1.003;
-
-  const entryPrice = Number.isFinite(rawEntry) && rawEntry > 0 ? rawEntry : lastClose;
-  const defaultBuffer = Math.max(entryPrice * 0.0008, Math.abs(swingHigh - swingLow) * 0.25, 1e-6);
-
-  let stopPrice = Number.isFinite(rawStop) && rawStop > 0 ? rawStop : (decision === 'LONG' ? Math.min(swingLow, entryPrice - defaultBuffer) : Math.max(swingHigh, entryPrice + defaultBuffer));
-  if (decision === 'LONG' && stopPrice >= entryPrice) {
-    stopPrice = Math.min(swingLow < entryPrice ? swingLow : entryPrice - defaultBuffer, entryPrice - defaultBuffer);
-  } else if (decision === 'SHORT' && stopPrice <= entryPrice) {
-    stopPrice = Math.max(swingHigh > entryPrice ? swingHigh : entryPrice + defaultBuffer, entryPrice + defaultBuffer);
-  }
-
-  const risk = Math.max(Math.abs(entryPrice - stopPrice), 1e-6);
-  const targetR: 2 | 3 = rawTargetR === 3 ? 3 : 2;
-  const dir = decision === 'LONG' ? 1 : -1;
-  const target1Price = Number((entryPrice + dir * risk).toFixed(6));
-  const targetPrice = Number((entryPrice + dir * risk * targetR).toFixed(6));
-
+export function buildWaitPlan(reports: SpecialistReport[], summary: string, reasons: string[] = []): CouncilPlan {
+  const fallbackReasons = reports.flatMap((r) => r.findings.slice(0, 1)).slice(0, 3);
   return {
-    entryPrice: Number(entryPrice.toFixed(6)),
-    stopPrice: Number(stopPrice.toFixed(6)),
-    target1Price,
-    targetPrice,
-    targetR
+    decision: 'WAIT',
+    summary: summary.slice(0, 420),
+    reasons: (reasons.length ? reasons : fallbackReasons).slice(0, 4).map((r) => r.slice(0, 240)),
+    entryTrigger: 'WAIT: Wait for 2/3 specialist confluence + liquidity sweep confirmation.',
+    entryPrice: null,
+    invalidation: 'WAIT: No active trade setup.',
+    stopPrice: null,
+    target1Price: null,
+    targetPrice: null,
+    targetR: null,
+    exitPlan: 'WAIT: Stand aside and monitor key liquidity and POC levels.',
+    agreeingAgents: [],
+    dissent: reports.map((report) => `${report.name}: ${report.bias} (strength ${report.strength}/3)`),
+    strategyIds: [],
+    strategyNames: [],
+    riskAllocation: null
   };
 }
 
-function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], snapshot: AgentSnapshot): CouncilPlan {
-  const longReports = reports.filter((r) => r.bias === 'LONG' && r.strength >= 1);
-  const shortReports = reports.filter((r) => r.bias === 'SHORT' && r.strength >= 1);
-  const strongLong = reports.some((r) => r.bias === 'LONG' && r.strength >= 2);
-  const strongShort = reports.some((r) => r.bias === 'SHORT' && r.strength >= 2);
+const SUMMARY_VETO = /^\s*(wait|no[\s-]?trade|stand(?:ing)?\s+aside|stay(?:ing)?\s+out|pass)\b/i;
 
-  let consensusBias: 'LONG' | 'SHORT' | null = null;
-  if (longReports.length >= 2 && strongLong && !reports.some((r) => r.bias === 'SHORT' && r.strength >= 3)) {
-    consensusBias = 'LONG';
-  } else if (shortReports.length >= 2 && strongShort && !reports.some((r) => r.bias === 'LONG' && r.strength >= 3)) {
-    consensusBias = 'SHORT';
+export function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], snapshot: AgentSnapshot): CouncilPlan {
+  const consensus = computeConsensus(reports);
+  const gates = evaluateGates(snapshot);
+
+  const proposedDir = value.decision === 'LONG' || value.decision === 'SHORT' ? value.decision : null;
+
+  let waitReason: string | null = null;
+  if (!proposedDir) waitReason = null;
+  else if (!consensus.bias) waitReason = consensus.reason;
+  else if (proposedDir !== consensus.bias) waitReason = `Manager proposed ${proposedDir} but the specialist consensus is ${consensus.bias}.`;
+  else if (SUMMARY_VETO.test(value.summary || '')) waitReason = 'Manager summary itself recommends standing aside.';
+  else if (gates.blocked) waitReason = gates.blocked;
+  else if (!gates.permitted.includes(proposedDir)) waitReason = gates.denied[proposedDir] ?? 'Direction blocked by a hard gate.';
+
+  const wantsTrade = proposedDir !== null && waitReason === null;
+  if (!wantsTrade) {
+    const managerSummary = String(value.summary || '').trim();
+    const summary = waitReason
+      ? `WAIT: ${waitReason}`
+      : (managerSummary || 'WAIT: Confluence threshold or clean Draw on Liquidity not reached. Standing aside.');
+    return buildWaitPlan(reports, summary, textList(value.reasons, 4));
   }
 
-  // Both Manager AND specialist consensus MUST agree. If Manager chose WAIT or rejected the trade, NEVER force a trade!
-  let decision: CouncilPlan['decision'] = 'WAIT';
-  const managerWantsTrade = (value.decision === 'LONG' || value.decision === 'SHORT');
-  const summaryRejection = /reject|hold off|held off|defer|no trade|wait stance|too risky/i.test(value.summary || '');
-
-  if (managerWantsTrade && value.decision === consensusBias && !summaryRejection) {
-    decision = value.decision;
-  } else {
-    decision = 'WAIT';
+  const decision = proposedDir as Direction;
+  const levels = resolveTradeLevels(decision, snapshot, { entry: value.entryPrice, stop: value.stopPrice, target: value.targetPrice });
+  if (!levels.ok) {
+    return buildWaitPlan(reports, `WAIT: ${levels.reason}`, textList(value.reasons, 4));
   }
 
-  const hasFreshFeed = (snapshot.feedStatus === 'LIVE' || snapshot.feedStatus === 'DESYNCHRONIZED') &&
-    snapshot.lastTradeAt !== null && Date.now() - snapshot.lastTradeAt < 15_000;
-  const hasContext = snapshot.footprints.filter((bar) => bar.isClosed).length >= 4 && snapshot.candles.length >= 4;
-
-  // Quality gate: 3 New Loss-Reduction Skills
-  if (snapshot.derivedContext?.marketRegime === 'CHOP_COMPRESSION' || snapshot.derivedContext?.isLowVolumeChop) {
-    decision = 'WAIT';
-  }
-
-  if (decision === 'LONG' && snapshot.derivedContext?.htfTrend === 'BEARISH') {
-    const isPdlSweep = snapshot.derivedContext.pdl !== null && (snapshot.latestPrice ?? 0) <= snapshot.derivedContext.pdl * 1.0005;
-    if (!isPdlSweep) decision = 'WAIT';
-  }
-
-  if (decision === 'SHORT' && snapshot.derivedContext?.htfTrend === 'BULLISH') {
-    const isPdhSweep = snapshot.derivedContext.pdh !== null && (snapshot.latestPrice ?? 0) >= snapshot.derivedContext.pdh * 0.9995;
-    if (!isPdhSweep) decision = 'WAIT';
-  }
-
-  if (decision === 'LONG' && snapshot.derivedContext?.liquidationSignal === 'SHORT_SQUEEZE_EXHAUSTION') {
-    decision = 'WAIT';
-  }
-
-  if (!hasFreshFeed || !hasContext || decision === 'WAIT') {
-    decision = 'WAIT';
-  }
-
-  const aligned = decision === 'WAIT' ? [] : reports.filter((report) => report.bias === decision);
+  const aligned = reports.filter((report) => report.bias === decision);
   const eligibleCandidates = new Set(aligned.flatMap((report) => report.strategyCandidates));
-  const managerSelectedIds = textList(value.strategyIds, 6).filter((id) => eligibleCandidates.has(id));
-  const fallbackIds = [...eligibleCandidates].slice(0, 6);
-  const selectedStrategyIds = managerSelectedIds.length > 0 ? managerSelectedIds : fallbackIds;
 
-  if (decision === 'WAIT') {
-    const waitReasons = textList(value.reasons, 4);
-    return {
-      decision: 'WAIT',
-      summary: String(value.summary || 'WAIT: Specialists do not have a clear 2/3 directional confluence yet.').slice(0, 420),
-      reasons: waitReasons.length > 0 ? waitReasons : reports.flatMap((r) => r.findings.slice(0, 1)).slice(0, 3),
-      entryTrigger: 'WAIT: Wait for at least 2 of 3 specialists (SMC, ICT, Order Flow) to align with confirmed displacement or absorption.',
-      entryPrice: null,
-      invalidation: 'WAIT: No active trade setup.',
-      stopPrice: null,
-      target1Price: null,
-      targetPrice: null,
-      targetR: null,
-      exitPlan: 'WAIT: Stand aside and monitor key liquidity and POC/Value Area levels.',
-      agreeingAgents: [],
-      dissent: reports.map((report) => `${report.name}: ${report.bias} (strength ${report.strength}/3)`),
-      strategyIds: [],
-      strategyNames: []
-    };
+  const aPlusTriggers = [
+    'SMC01', 'SMC02', 'SMC03', 'SMC04',
+    'SMC05', 'SMC06',
+    'SMC07', 'SMC08',
+    'SMC09', 'SMC10', 'SMC11', 'SMC12', 'SMC13', 'SMC14', 'SMC15', 'SMC17',
+    'ICT01', 'ICT02', 'ICT03', 'ICT04', 'ICT05', 'ICT06', 'ICT11', 'ICT12',
+    'ICT13', 'ICT14', 'ICT15', 'ICT16', 'ICT19',
+    'OF01', 'OF02', 'OF03', 'OF04', 'OF13', 'OF14', 'OF21', 'OF23'
+  ];
+  const hasAPlusTrigger = aPlusTriggers.some((id) => eligibleCandidates.has(id));
+  if (!hasAPlusTrigger) {
+    return buildWaitPlan(
+      reports,
+      'WAIT: No A+ structural/liquidity trigger (Sweep, IDM, OB/Breaker, PDH/PDL raid, or Whale Absorption). Skipping plain pullback.',
+      textList(value.reasons, 4)
+    );
   }
 
-  const levels = computeFallbackLevels(
-    decision,
-    snapshot,
-    Number(value.entryPrice),
-    Number(value.stopPrice),
-    value.targetR
-  );
+  const smcReport = reports.find((r) => r.agentId === 'smc');
+  if (!smcReport || smcReport.bias !== decision || smcReport.strength < 1) {
+    return buildWaitPlan(
+      reports,
+      `WAIT: SMC market structure (${smcReport?.bias ?? 'NEUTRAL'}) has not confirmed ${decision} shift yet.`,
+      textList(value.reasons, 4)
+    );
+  }
 
-  const rawEntry = Number(value.entryPrice);
-  const rawStop = Number(value.stopPrice);
-  const rawTarget = Number(value.targetPrice);
-  const rawRisk = Math.abs(rawEntry - rawStop);
-  const rawReward = Math.abs(rawTarget - rawEntry);
-  const rawActualR = rawRisk > 0 ? rawReward / rawRisk : 0;
-  const rawTargetR: 2 | 3 = value.targetR === 3 ? 3 : 2;
-  const rawValid = Number.isFinite(rawEntry) && rawEntry > 0 &&
-    Number.isFinite(rawStop) && rawStop > 0 &&
-    Number.isFinite(rawTarget) && rawTarget > 0 &&
-    Math.abs(rawActualR - rawTargetR) <= 0.4 &&
-    (decision === 'LONG' ? rawStop < rawEntry && rawTarget > rawEntry : rawStop > rawEntry && rawTarget < rawEntry);
+  const sweepIds = ['SMC05', 'SMC06', 'SMC07', 'SMC08', 'ICT13', 'ICT14', 'ICT15', 'ICT16', 'ICT19'];
+  const derivedSweep = snapshot.derivedContext?.sweepReclaim;
+  const liquidityAlreadyTaken =
+    sweepIds.some((id) => eligibleCandidates.has(id)) ||
+    (decision === 'LONG' && Boolean(derivedSweep?.long)) ||
+    (decision === 'SHORT' && Boolean(derivedSweep?.short));
 
-  const finalEntry = rawValid ? rawEntry : levels.entryPrice;
-  const finalStop = rawValid ? rawStop : levels.stopPrice;
-  const finalRisk = Math.abs(finalEntry - finalStop);
-  const finalDir = decision === 'LONG' ? 1 : -1;
-  const finalTarget1 = Number((finalEntry + finalDir * finalRisk).toFixed(6));
-  const finalTarget = rawValid ? rawTarget : levels.targetPrice;
-  const finalTargetR = rawValid ? rawTargetR : levels.targetR;
+  if (!liquidityAlreadyTaken) {
+    const closedFps = snapshot.footprints.filter((b) => b.isClosed);
+    const lastClosedFp = closedFps[closedFps.length - 1];
+    if (lastClosedFp) {
+      const midBar = (lastClosedFp.high + lastClosedFp.low) / 2;
+      if (decision === 'SHORT' && (lastClosedFp.close >= lastClosedFp.open || lastClosedFp.close > midBar)) {
+        return buildWaitPlan(
+          reports,
+          `WAIT: No liquidity sweep yet; waiting for bearish rejection candle close (last bar closed at ${lastClosedFp.close}).`,
+          textList(value.reasons, 4)
+        );
+      }
+      if (decision === 'LONG' && (lastClosedFp.close <= lastClosedFp.open || lastClosedFp.close < midBar)) {
+        return buildWaitPlan(
+          reports,
+          `WAIT: No liquidity sweep yet; waiting for bullish reclaim candle close (last bar closed at ${lastClosedFp.close}).`,
+          textList(value.reasons, 4)
+        );
+      }
+    }
+  }
+
+  const managerSelectedIds = textList(value.strategyIds, 6).filter((id) => eligibleCandidates.has(id));
+  const selectedStrategyIds = managerSelectedIds.length > 0 ? managerSelectedIds : [...eligibleCandidates].slice(0, 6);
 
   const rawReasons = textList(value.reasons, 5);
-  const synthesizedReasons = rawReasons.length > 0
+  const reasons = rawReasons.length > 0
     ? rawReasons
     : aligned.flatMap((r) => r.findings.slice(0, 2).map((f) => `[${r.name}] ${f}`)).slice(0, 5);
 
   const trigger = String(value.entryTrigger ?? '').trim() ||
-    (snapshot.profile
-      ? `${decision} near ${finalEntry} holding footprint POC (${snapshot.profile.poc}) / Value Area (${snapshot.profile.val}–${snapshot.profile.vah})`
-      : `${decision} entry near ${finalEntry} on closed-bar structure and order-flow confirmation`);
-
+    `${decision} entry near ${levels.entryPrice} with Draw on Liquidity targeting ${levels.targetPrice} (${levels.targetR}R)`;
   const invalidation = String(value.invalidation ?? '').trim() ||
-    `Setup invalid if price closes beyond structural stop at ${finalStop}.`;
-
+    `Setup invalid if price closes beyond structural stop at ${levels.stopPrice}.`;
   const exitPlan = String(value.exitPlan ?? '').trim() ||
-    `Book 50% at TP1 (1R: ${finalTarget1}), move stop to breakeven (${finalEntry}), and trail remaining 50% to final TP (${finalTargetR}R: ${finalTarget}).`;
+    `Take partials at 1R (${levels.target1Price}), move SL to breakeven, and let runner hit Draw on Liquidity target at ${levels.targetPrice}.`;
+  const summaryText = String(value.summary || `${decision} setup confirmed toward Draw on Liquidity.`);
+  const levelNotes = levels.notes.length ? ` [Levels adjusted: ${levels.notes.join(' ')}]` : '';
 
   return {
     decision,
-    summary: String(value.summary || `${decision} setup confirmed by ${aligned.map((a) => a.name).join(' + ')}.`).slice(0, 420),
-    reasons: synthesizedReasons,
+    summary: `${summaryText.slice(0, 340)}${levelNotes}`.slice(0, 420),
+    reasons,
     entryTrigger: trigger.slice(0, 260),
-    entryPrice: finalEntry,
+    entryPrice: levels.entryPrice,
     invalidation: invalidation.slice(0, 260),
-    stopPrice: finalStop,
-    target1Price: finalTarget1,
-    targetPrice: finalTarget,
-    targetR: finalTargetR,
+    stopPrice: levels.stopPrice,
+    target1Price: levels.target1Price,
+    targetPrice: levels.targetPrice,
+    targetR: levels.targetR,
     exitPlan: exitPlan.slice(0, 260),
     agreeingAgents: aligned.map((report) => report.name),
     dissent: reports.filter((report) => report.bias !== decision)
       .map((report) => `${report.name}: ${report.bias} (strength ${report.strength}/3)`),
     strategyIds: selectedStrategyIds,
-    strategyNames: selectedStrategyIds.map((id) => strategyById(id)?.name ?? id)
+    strategyNames: selectedStrategyIds.map((id) => strategyById(id)?.name ?? id),
+    riskAllocation: levels.riskAllocation
+  };
+}
+
+// ===========================================================================
+// Prompts
+// ===========================================================================
+const PLAN_TEMPLATE = '{"decision":"LONG|SHORT|WAIT","summary":"string","reasons":["string"],"entryTrigger":"string","entryPrice":number|null,"invalidation":"string","stopPrice":number|null,"target1Price":number|null,"targetPrice":number|null,"targetR":number|null,"exitPlan":"string","agreeingAgents":["string"],"dissent":["string"],"strategyIds":["string"]}';
+
+function buildManagerPrompt(consensus: { bias: Direction | null }, permitted: Direction[], lessons: string[], symbol = ''): string {
+  const cfg = councilConfig();
+  const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(symbol);
+  const minRiskPct = isForex ? (symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
+  const maxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
+  const allowedList = consensus.bias ? `${consensus.bias} or WAIT` : 'WAIT';
+  return `ROLE: HEAD EXECUTION TRADER (CONFLUENCE & PRICE ACTION DESK).
+Three deterministic specialists (SMC, ICT, Order Flow) have already passed all hard gates and reached consensus: ${consensus.bias ?? 'NONE'}.
+YOUR JOB IS TO VALIDATE AND EXECUTE CLEAN SETUPS (DO NOT OVER-REJECT):
+1. CONTEXT CHECK: Check independentContext (EMA 50/200, ADX, RSI, and recent 5m candles). Note: if ema200 is null due to short history, ignore ema200 and evaluate EMA50 + 5m structure + order flow. Only reject for ADX if ADX < 14 AND there is no liquidity sweep or absorption.
+2. AUDIT ENFORCEMENT: Check the Post-Trade Audit Rules below. Reject ONLY if the current setup clearly violates a rule.
+3. EXECUTION MINDSET: When 2+ specialists align with a structural trigger (sweep, BOS/CHoCH, OB/FVG, or absorption) and hard gates are clear, APPROVE ${consensus.bias ?? 'WAIT'} with precise entryPrice, stopPrice, and targetPrice.
+Allowed decisions: ${allowedList}. Permitted directions: ${permitted.join(', ') || 'NONE'}.
+CONSTRAINTS: minimum reward-to-risk ${cfg.minRR}R, maximum ${cfg.maxRR}R; stop distance must stay between ${minRiskPct}% and ${maxRiskPct}% of entry; entry within ${cfg.maxEntryDriftPct}% of latestPrice.
+
+${MANAGER_RULES}${lessonsBlock(lessons, 'LIVE POST-TRADE AUDIT RULES (STRICTLY ENFORCE):')}`;
+}
+
+// ===========================================================================
+// Orchestration
+// ===========================================================================
+export function buildMathPlan(decision: Direction, reports: SpecialistReport[]): CouncilPlan {
+  const aligned = reports.filter((r) => r.bias === decision);
+  const strategyIds = [...new Set(aligned.flatMap((r) => r.strategyCandidates))].slice(0, 6);
+  return {
+    decision,
+    summary: `${decision}: ${aligned.map((r) => r.name).join(' + ')} aligned (rule-based consensus).`,
+    reasons: aligned.flatMap((r) => r.findings.slice(0, 2).map((finding) => `[${r.name}] ${finding}`)).slice(0, 5),
+    entryTrigger: '', entryPrice: null, invalidation: '', stopPrice: null,
+    target1Price: null, targetPrice: null, targetR: null, exitPlan: '',
+    agreeingAgents: aligned.map((r) => r.name), dissent: [], strategyIds, strategyNames: [],
+    riskAllocation: null
   };
 }
 
 export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<CouncilResult> {
-  const configuredRoles = SPECIALIST_AGENTS.map((agent) => getProviderConfigs(agent.id));
+  const cfg = councilConfig();
   const managerProviders = getProviderConfigs('manager');
-  const providers = [...configuredRoles.flat(), ...managerProviders];
-  if (!providers.length) throw new Error('No AI provider is configured. Set your 4 role keys in .env, then restart the backend.');
+  if (cfg.managerMode === 'llm' && !managerProviders.length) {
+    throw new Error('No Groq provider configured. Set GROQ_MANAGER_API_KEY in .env (or COUNCIL_MANAGER=off for math-only mode).');
+  }
+
   const input = compactSnapshot(snapshot);
-  const missingRole = SPECIALIST_AGENTS.find((agent, index) => !configuredRoles[index].length);
-  if (missingRole) throw new Error(`No API key is configured for ${missingRole.id.toUpperCase()}. Set ${missingRole.id.toUpperCase()}_API_KEY in .env.`);
-  if (!managerProviders.length) throw new Error('No API key is configured for MANAGER. Set MANAGER_API_KEY in .env.');
+  const derived = input.derivedContext as DerivedMarketContext;
+  const gates = evaluateGates(input);
+  const diagnostics: CouncilDiagnostics = { llmCalls: 0, totalTokens: 0, permittedDirections: gates.permitted, gateBlocked: gates.blocked, skipped: [] };
 
-  const usedRoleModels: string[] = [];
-  const reports = await Promise.all(SPECIALIST_AGENTS.map(async (agent, index) => {
-    try {
-      const specialistInput = payloadForSpecialist(input, agent.id);
-      const pastLessons = input.paperPerformance?.learnedLessons ?? [];
-      const pastLessonsText = pastLessons.length
-        ? `\n\nCRITICAL: RULES LEARNED FROM PAST LOSSES (DO NOT REPEAT THESE MISTAKES):\n${pastLessons.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n`
-        : '';
-      const orderFlowExtraRules = agent.id === 'orderflow'
-        ? `\n\nBACKTEST-VALIDATED ORDERFLOW RULES (MUST FOLLOW):\n1. Examine 'microstructure' (especially 'latestPocPosition', 'absorptionSignal', 'deltaBreakoutSignal', and 'synthetic5mSummary').\n2. NEVER trigger a counter-trend reversal on 1m CVD divergence alone. Require either 5m/multi-bar POC trapped overhead (for SHORT) or POC support underfoot (for LONG) with absorption.\n3. Give strength 2 or 3 ONLY when price close vs POC position confirms your directional bias.`
-        : '';
-      const strategyList = strategiesFor(agent.id).map(({ id, name, rule }) => `${id} ${name}: ${rule}`).join('; ');
-      const specialistSystem = `ROLE: ${agent.name}. TASK: ${agent.focus}${pastLessonsText}${orderFlowExtraRules}\nCATALOG: ${strategyList}\nOutput JSON with keys: bias ("LONG"|"SHORT"|"NEUTRAL"), strength (0-3), findings (string[]), strategyCandidates (string[] max 2 IDs), concerns (string[]), missingData (string[]).`;
-      const { data: raw, used } = await generateWithFallback<SpecialistReport>(configuredRoles[index], agent.id,
-        specialistSystem, specialistInput, reportSchema);
-      usedRoleModels[index] = `${agent.id}:${used.provider}/${used.model}`;
-      return sanitizeReport(raw, agent);
-    } catch (error) {
-      usedRoleModels[index] = `${agent.id}:failed`;
-      return {
-        agentId: agent.id, name: agent.name, bias: 'NEUTRAL' as const, strength: 0,
-        findings: [], strategyCandidates: [], concerns: [error instanceof Error ? error.message.slice(0, 220) : 'Specialist analysis failed.'],
-        missingData: ['Specialist analysis unavailable.']
-      };
-    }
-  }));
+  const reports = computeMathReports(input, derived).map((report, index) => sanitizeReport(report, SPECIALIST_AGENTS[index]));
+  const specialistLabel = 'math:smc+ict+orderflow';
+  const finish = (plan: CouncilPlan, managerLabel: string): CouncilResult => ({
+    reports, plan, model: `${specialistLabel} · ${managerLabel}`, generatedAt: Date.now(), diagnostics
+  });
 
-  const pastLessons = input.paperPerformance?.learnedLessons ?? [];
-  const pastLessonsText = pastLessons.length
-    ? `\n\nCRITICAL: RULES LEARNED FROM PAST LOSSES (STRICTLY OBEY - REJECT TRADE IF IT REPEATS A PAST MISTAKE):\n${pastLessons.map((l, i) => `${i + 1}. ${l}`).join('\n')}\n`
-    : '';
-  const managerSystemPrompt = `ROLE: TRADE PLAN MANAGER\nSynthesize the 3 specialist reports (SMC, ICT, Order Flow) and determine the trade plan.\n1. Choose LONG or SHORT when at least 2 of 3 specialists agree on the direction with strength >= 2 and no specialist opposes with strength 3. Otherwise choose WAIT.\n2. HTF Trend & Loss Rules: strictly obey past loss rules and 15m HTF trend. If 15m trend opposes trade or regime is CHOP_COMPRESSION, choose WAIT.${pastLessonsText}\n3. If valid, provide entryPrice, stopPrice, target1Price (1R), targetPrice (2R or 3R), targetR (2|3), and 2 clear reasons. Output valid JSON.`;
+  if (gates.blocked) {
+    diagnostics.skipped.push('manager');
+    return finish(buildWaitPlan(reports, `WAIT: ${gates.blocked}`, [gates.blocked]), 'manager:skipped');
+  }
 
-  const managerInputPayload = {
+  const consensus = computeConsensus(reports);
+  if (!consensus.bias) {
+    diagnostics.skipped.push('manager');
+    return finish(buildWaitPlan(reports, `WAIT: ${consensus.reason}`), 'manager:skipped');
+  }
+  if (!gates.permitted.includes(consensus.bias)) {
+    diagnostics.skipped.push('manager');
+    return finish(buildWaitPlan(reports, `WAIT: ${gates.denied[consensus.bias] ?? 'Direction blocked by a hard gate.'}`), 'manager:skipped');
+  }
+
+  if (cfg.managerMode === 'off') {
+    diagnostics.skipped.push('manager');
+    return finish(sanitizePlan(buildMathPlan(consensus.bias, reports), reports, input), 'manager:math');
+  }
+
+  const lessons = normalizeLessons(input.paperPerformance?.learnedLessons);
+  const perf = input.paperPerformance;
+  const managerPayload = {
     symbol: input.symbol,
     latestPrice: input.latestPrice,
-    htfTrend: input.derivedContext?.htfTrend,
-    marketRegime: input.derivedContext?.marketRegime,
-    microstructure: input.derivedContext?.orderFlowSummary ? {
-      cvdTrend: input.derivedContext.orderFlowSummary.cvdTrend,
-      latestPocPosition: input.derivedContext.orderFlowSummary.latestPocPosition,
-      absorptionSignal: input.derivedContext.orderFlowSummary.absorptionSignal
-    } : null,
+    atr: derived.atr ?? null,
+    htfTrend: derived.htfTrend,
+    marketRegime: derived.marketRegime,
+    independentContext: derived.independentContext ?? null,
+    marketActivityScan: scanMarketActivity(input),
+    activeSession: derived.activeSession,
+    liquidationSignal: derived.liquidationSignal,
+    sweepReclaim: derived.sweepReclaim,
+    dealingRange: derived.dealingRange ?? null,
+    drawOnLiquidity: derived.drawOnLiquidity,
+    swings: { recentSwingHigh: derived.recentSwingHigh, recentSwingLow: derived.recentSwingLow },
+    levels: { pdh: derived.pdh, pdl: derived.pdl, pwh: derived.pwh, pwl: derived.pwl, sessionHigh: derived.sessionHigh, sessionLow: derived.sessionLow },
+    profile: input.profile ?? null,
+    paperContext: perf ? { resolved: perf.resolved, winRate: perf.winRate, averageR: perf.averageR, recent: perf.recent?.slice(-5) } : null,
     reports: reports.map((r) => ({
       name: r.name,
       bias: r.bias,
       strength: r.strength,
-      findings: r.findings.slice(0, 2),
+      findings: r.findings.slice(0, 4),
+      concerns: r.concerns.slice(0, 3),
+      missingData: r.missingData.slice(0, 2),
       strategies: r.strategyCandidates
     }))
   };
 
-  const { data: rawPlan, used: managerUsed } = await generateWithFallback<CouncilPlan>(
-    managerProviders,
-    'manager',
-    managerSystemPrompt,
-    managerInputPayload,
-    planSchema
+  const { data: rawPlan, used: managerUsed, tokens } = await generateWithFallback<CouncilPlan>(
+    managerProviders, 'manager', buildManagerPrompt({ bias: consensus.bias }, gates.permitted, lessons, input.symbol), managerPayload, PLAN_TEMPLATE,
+    { maxTokens: 3000, effort: 'low' }
   );
-  const usedProviders = [...usedRoleModels, `manager:${managerUsed.provider}/${managerUsed.model}`].join(' · ');
-  return { reports, plan: sanitizePlan(rawPlan, reports, input), model: usedProviders, generatedAt: Date.now() };
+  diagnostics.llmCalls += 1;
+  diagnostics.totalTokens += tokens;
+  return finish(sanitizePlan(rawPlan, reports, input), `manager:${managerUsed.provider}/${managerUsed.model}`);
+}
+
+// ===========================================================================
+// Post-trade learning
+// ===========================================================================
+export function cleanLesson(text: string): string {
+  return text
+    .replace(/[\u0000-\u001f]+/g, ' ')
+    .replace(/^["'`\s]+|["'`\s]+$/g, '')
+    .replace(/\$?\d[\d,]{3,}(?:\.\d+)?/g, 'the level')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 220);
 }
 
 export async function analyzeTradeOutcomeWithAI(
   trade: { decision: 'LONG' | 'SHORT'; entryPrice: number; stopPrice: number; targetPrice?: number; reasons: string[]; summary: string },
   marketOutcome: { outcome: 'WIN' | 'LOSS'; exitPrice: number; exitReason: string; marketContext: string }
 ): Promise<string> {
+  const isWin = marketOutcome.outcome === 'WIN';
   const managerProviders = getProviderConfigs('manager');
+  const fallbackLesson = isWin
+    ? 'Winning setup: HTF Draw on Liquidity alignment and volume absorption reached target.'
+    : `Avoid ${trade.decision} entries when momentum opposes market structure.`;
   if (!managerProviders.length) {
-    return marketOutcome.outcome === 'WIN'
+    return isWin
       ? 'Confluence between HTF trend, POC defense, and stacked imbalances produced successful continuation.'
       : 'Do not enter trade against dominant market structure.';
   }
-  const schema = {
-    type: 'OBJECT',
-    properties: {
-      lesson: { type: 'STRING' }
-    },
-    required: ['lesson']
-  };
 
-  const isWin = marketOutcome.outcome === 'WIN';
   const roleTitle = isWin ? 'TRADING SUCCESS REINFORCEMENT ANALYST' : 'TRADING POST-MORTEM ANALYST';
-  const tradeResultText = isWin ? 'TARGET REACHED (+2R WIN)' : 'STOP LOSS HIT (-1R LOSS)';
+  const tradeResultText = isWin ? 'TARGET REACHED (WIN)' : 'STOP LOSS HIT (LOSS)';
   const taskDesc = isWin
-    ? 'Provide a single concise, punchy trading insight (1 sentence) explaining why this trade SUCCEEDED and what winning confluence pattern the agents should look for in the future.\nExample: "Bullish continuation confirmed when 15m HTF trend aligned with 1m stacked buy imbalances holding the POC."'
-    : 'Provide a single concise, punchy trading rule (1 sentence) explaining why this trade FAILED and what mistake the agents must NEVER repeat in the future.\nExample: "Never enter LONG on 1m divergence when 5m POC is overhead and market structure made lower lows."';
-
+    ? 'State which combination of conditions made this trade work, as a reusable rule worth repeating.'
+    : 'Identify the most likely avoidable cause (premature entry, no sweep/reclaim confirmation, counter-HTF momentum, entry inside chop, stop inside noise, weak flow confirmation) and turn it into a filter.';
   const targetLine = trade.targetPrice ? `, Target: ${trade.targetPrice}` : '';
-  const prompt = `ROLE: ${roleTitle}\nA trade resulted in a ${tradeResultText}.\nTRADE DETAILS:\nSide: ${trade.decision}, Entry: ${trade.entryPrice}, Stop: ${trade.stopPrice}${targetLine}\nReasons: ${trade.reasons.join(' | ')}\n\nMARKET OUTCOME:\nExit Price: ${marketOutcome.exitPrice}\nContext: ${marketOutcome.marketContext}\n\nTASK: ${taskDesc}`;
+  const prompt = `ROLE: ${roleTitle}
+A paper trade resolved: ${tradeResultText}.
+TRADE: ${trade.decision}, Entry: ${trade.entryPrice}, Stop: ${trade.stopPrice}${targetLine}
+PLAN SUMMARY: ${trade.summary.slice(0, 300)}
+ORIGINAL REASONS: ${trade.reasons.slice(0, 4).join(' | ')}
+OUTCOME: Exit ${marketOutcome.exitPrice} (${marketOutcome.exitReason}). ${marketOutcome.marketContext}
+TASK: ${taskDesc}
+FORMAT: ONE sentence, at most 30 words, written as a reusable IF <measurable conditions> THEN <action> rule. Use measurable terms (htfTrend, session, sweep/reclaim, POC position, delta/CVD, regime). Do NOT include specific prices or times. Do not blame luck.`;
 
   try {
-    const { data } = await generateWithFallback<{ lesson: string }>(managerProviders, 'manager', prompt, {}, schema);
-    return data.lesson || (isWin ? 'Strong order-flow confluence and HTF trend alignment drove high-probability trade target.' : 'Verify multi-timeframe POC alignment before entering counter-trend setups.');
+    const { data } = await generateWithFallback<{ lesson: string }>(
+      managerProviders, 'manager', prompt, undefined, '{"lesson":"string"}', { maxTokens: 600, effort: 'low' }
+    );
+    const lesson = typeof data.lesson === 'string' ? cleanLesson(data.lesson) : '';
+    return lesson || fallbackLesson;
   } catch {
-    return isWin
-      ? 'Winning setup: Multi-timeframe trend alignment and order-flow participation confirmed move.'
-      : `Avoid ${trade.decision} entries when momentum and POC flip oppose the trade.`;
+    return fallbackLesson;
   }
 }
 
@@ -1201,3 +1753,122 @@ export const analyzeTradeLossWithAI = (
   trade: { decision: 'LONG' | 'SHORT'; entryPrice: number; stopPrice: number; reasons: string[]; summary: string },
   marketOutcome: { exitPrice: number; exitReason: string; marketContext: string }
 ) => analyzeTradeOutcomeWithAI(trade, { outcome: 'LOSS', ...marketOutcome });
+
+// ===========================================================================
+// Dedicated Nightly Audit Engine
+// ===========================================================================
+function getAuditProviderConfigs(): ProviderConfig[] {
+  const configured: ProviderConfig[] = [];
+
+  if (process.env.AGENT_ROUTER_API_KEY?.trim()) {
+    configured.push({
+      provider: 'agentrouter',
+      key: process.env.AGENT_ROUTER_API_KEY.trim(),
+      model: process.env.AGENT_ROUTER_MODEL?.trim() || 'gpt-5.6-sol',
+      baseUrl: (process.env.AGENT_ROUTER_BASE_URL?.trim() || 'https://agentrouter.org/v1').replace(/\/+$/, ''),
+      quotaScope: 'agent-router-audit'
+    });
+  }
+
+  const auditModel = process.env.GROQ_AUDIT_MODEL?.trim() || 'openai/gpt-oss-120b';
+
+  if (process.env.GROQ_AUDIT_API_KEY?.trim()) {
+    for (const part of process.env.GROQ_AUDIT_API_KEY.split(',').map((v) => v.trim()).filter(Boolean)) {
+      if (!part.startsWith('gsk_')) continue;
+      const fp = createHash('sha256').update(part).digest('hex').slice(0, 8);
+      configured.push({
+        provider: 'groq',
+        key: part,
+        model: auditModel,
+        quotaScope: `AUDIT-groq-${fp}`
+      });
+    }
+  }
+
+  if (process.env.CLOUDFLARE_AUDIT_API_TOKEN?.trim() && process.env.CLOUDFLARE_AUDIT_ACCOUNT_ID?.trim()) {
+    configured.push({
+      provider: 'cloudflare',
+      key: process.env.CLOUDFLARE_AUDIT_API_TOKEN.trim(),
+      model: process.env.CLOUDFLARE_AUDIT_MODEL?.trim() || '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
+      baseUrl: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_AUDIT_ACCOUNT_ID.trim()}/ai/v1`,
+      quotaScope: 'cloudflare-audit-ai'
+    });
+  }
+
+  return configured.length > 0 ? configured : getProviderConfigs('manager');
+}
+
+export interface AuditTradeInput {
+  tradeId: string;
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  exitPrice: number;
+  outcome: 'WIN' | 'LOSS';
+  exitKind: string;
+  pnlR: number;
+  barsHeld: number;
+  macro1hTrend: string;
+  macro4hTrend: string;
+  strategies: string[];
+  reasons: string[];
+  preTradeSummary: string;
+  postTrade1hSummary: string;
+}
+
+export interface AuditFindingOutput {
+  tradeId: string;
+  symbol: string;
+  category: 'SL_TOO_TIGHT' | 'STRATEGY_FAILURE' | 'EARLY_EXIT_SAVED' | 'EARLY_EXIT_PREMATURE' | 'WINNING_PATTERN' | 'SYSTEM_ISSUE';
+  problemDetected: string;
+  rootCause: string;
+  recommendedFix: string;
+  verifiedRuleToSave: string | null;
+}
+
+export async function runNightlyBatchAuditWithAI(trades: AuditTradeInput[]): Promise<AuditFindingOutput[]> {
+  if (!trades.length) return [];
+  const providers = getAuditProviderConfigs();
+  if (!providers.length) {
+    throw new Error('No Audit AI provider configured (set GROQ_AUDIT_API_KEY or CLOUDFLARE_AUDIT_API_TOKEN).');
+  }
+
+  const systemPrompt = `ROLE: SENIOR QUANTITATIVE TRADING AUDITOR.
+You are conducting the nightly post-market deep audit of completed trades.
+For each trade, you are given:
+1. Macro Trend (1H & 4H) at entry.
+2. Pre-Trade 4-5 Hour Intraday Context (range position, sweeps, delta/CVD, SL width).
+3. Actual Trade Execution & Exit Kind (TARGET, STOP, EARLY_EXIT, SCRATCH_EXIT, TIMEOUT).
+4. Post-Trade 1-Hour Actual Price Follow-Through (what price did AFTER exit!).
+
+DIAGNOSIS RULES:
+- If exitKind is STOP, check Post-Trade 1-Hour Follow-Through:
+  * If price reversed and reached the original TP within 1 hour -> category MUST be "SL_TOO_TIGHT". The setup/strategy was VALID; only the stop loss was inside wick noise. Set verifiedRuleToSave = null. Recommend a specific SL buffer fix in recommendedFix.
+  * If price continued moving against the trade -> category MUST be "STRATEGY_FAILURE". Identify why the pre-trade 4-5h or intraday context contradicted the entry, and write ONE measurable "IF <condition> THEN <filter>" rule in verifiedRuleToSave.
+- If exitKind is EARLY_EXIT or SCRATCH_EXIT:
+  * If price later hit the original SL -> category = "EARLY_EXIT_SAVED" (verifiedRuleToSave = null).
+  * If price later hit the original TP -> category = "EARLY_EXIT_PREMATURE" (explain what triggered premature exit and how to tighten the exit threshold).
+- If outcome is WIN (TARGET hit):
+  * category = "WINNING_PATTERN". Summarize the exact confluence (Trend + Sweep + Order Flow) that worked so it is documented in the audit report (verifiedRuleToSave = null).`;
+
+  const template = '{"findings":[{"tradeId":"string","symbol":"string","category":"SL_TOO_TIGHT|STRATEGY_FAILURE|EARLY_EXIT_SAVED|EARLY_EXIT_PREMATURE|WINNING_PATTERN|SYSTEM_ISSUE","problemDetected":"string","rootCause":"string","recommendedFix":"string","verifiedRuleToSave":"string|null"}]}';
+
+  const { data } = await generateWithFallback<Record<string, unknown>>(
+    providers,
+    'manager',
+    systemPrompt,
+    { trades },
+    template,
+    { maxTokens: 6000, effort: 'medium' }
+  );
+
+  if (Array.isArray(data)) return data as AuditFindingOutput[];
+  if (Array.isArray(data?.findings)) return data.findings as AuditFindingOutput[];
+  if (Array.isArray(data?.results)) return data.results as AuditFindingOutput[];
+  const firstArray = Object.values(data ?? {}).find((v) => Array.isArray(v));
+  if (Array.isArray(firstArray)) return firstArray as AuditFindingOutput[];
+  console.warn('[Nightly Audit] Unexpected AI response shape:', JSON.stringify(data).slice(0, 300));
+  return [];
+}

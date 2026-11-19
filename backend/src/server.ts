@@ -7,7 +7,7 @@ dns.setDefaultResultOrder('ipv4first');
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
-import { LOCAL_GATEWAY_PORT, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS } from './config/constants.js';
+import { LOCAL_GATEWAY_PORT, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, CRYPTO_SYMBOLS, FOREX_SYMBOLS } from './config/constants.js';
 import {
   ConnectionStatus,
   GatewayMessage,
@@ -27,6 +27,7 @@ import {
 import { parsePublicTradePayload } from './normalizers/tradeNormalizer.js';
 import { OrderBookState } from './normalizers/orderbookNormalizer.js';
 import { BybitWebSocketClient } from './ingestion/bybitClient.js';
+import { DerivForexClient } from './ingestion/derivForexClient.js';
 import { OrderFlowAggregator } from './engine/orderFlowAggregator.js';
 import { BybitRestService, BybitRestServiceError } from './services/bybitRestService.js';
 import { BybitOptionsService, type OptionBase } from './services/bybitOptionsService.js';
@@ -36,8 +37,10 @@ import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
 import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoHistoryStore.js';
-import { runOrderFlowCouncil, analyzeTradeOutcomeWithAI, type AgentSnapshot } from './agents/orderFlowCouncil.js';
-import { sendTradeEntryAlert, sendTradeOutcomeAlert, sendTelegramMessage } from './services/telegramService.js';
+import { runOrderFlowCouncil, type AgentSnapshot, type RiskAllocation } from './agents/orderFlowCouncil.js';
+import { sendTradeEntryAlert, sendTradeOutcomeAlert, sendTelegramMessage, sendOrEditLiveStatusMessage } from './services/telegramService.js';
+import { runNightlyAuditCycle, renderAuditDashboardHtml } from './services/nightlyAuditService.js';
+
 
 // --- ROBUST ENVIRONMENT & RENDER SECRET FILES LOADER ---
 function loadProjectEnv(): void {
@@ -63,9 +66,7 @@ function loadProjectEnv(): void {
         if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
           val = val.slice(1, -1);
         }
-        if (process.env[key] === undefined) {
-          process.env[key] = val;
-        }
+        process.env[key] = val;
       }
     } catch {
       // ignore read issues
@@ -75,8 +76,19 @@ function loadProjectEnv(): void {
 loadProjectEnv();
 
 let currentMarketStatus: ConnectionStatus = 'DISCONNECTED';
+const marketStatusBySymbol = new Map<string, ConnectionStatus>();
 let lastTradeReceivedAt: number | null = null;
+const lastTradeAtBySymbol = new Map<string, number>();
 let lastCouncilRequestAt = 0;
+
+function istDayString(tsMs = Date.now()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date(tsMs));
+}
 
 interface MarketPipeline {
   orderBook: OrderBookState;
@@ -91,7 +103,8 @@ const SUPPORTED_CANDLE_TIMEFRAMES = new Set<CandleTimeframe>(Object.values(CANDL
 const tickSizes: Record<string, number> = {
   BTCUSDT: 0.1, ETHUSDT: 0.01, SOLUSDT: 0.01, XRPUSDT: 0.0001,
   BNBUSDT: 0.01, DOGEUSDT: 0.00001, ADAUSDT: 0.0001, LINKUSDT: 0.001,
-  AVAXUSDT: 0.01, XAUTUSDT: 0.1
+  AVAXUSDT: 0.01, XAUTUSDT: 0.1,
+  XAUUSD: 0.1, EURUSD: 0.0001, GBPUSD: 0.0001
 };
 let resolvedTickSizes: Record<string, number> = { ...tickSizes };
 
@@ -106,7 +119,7 @@ const marketPipelines = new Map<string, MarketPipeline>(SUPPORTED_SYMBOLS.map((s
 
 const BYBIT_REST_BASE = (process.env.BYBIT_REST_URL?.trim() || 'https://api.bytick.com').replace(/\/+$/, '');
 
-async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 6500): Promise<Response> {
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 12000): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -217,6 +230,7 @@ function flushBufferedMongoTrades(): void {
 }
 
 function queueMongoTrades(trades: NormalizedTrade[]): void {
+  if (process.env.MONGO_PERSIST_TRADES !== 'true') return;
   bufferedMongoTrades.push(...trades);
   if (bufferedMongoTrades.length > MAX_BUFFERED_MONGO_TRADES) {
     const excess = bufferedMongoTrades.length - MAX_BUFFERED_MONGO_TRADES;
@@ -302,14 +316,20 @@ async function getThirtyDayOpenInterest(symbol: string): Promise<Array<{ openInt
   }
 }
 
-// --- MULTI-COIN LIVE TRADING ENGINE ---
+// --- MULTI-COIN LIVE TRADING ENGINE (STRICTLY PAPER TRADING + TELEGRAM SIGNALS) ---
 interface LiveActiveTrade {
+  tradeId: string;
   symbol: string;
   decision: 'LONG' | 'SHORT';
   entryPrice: number;
   stopPrice: number;
+  initialStopPrice: number;
+  initialRisk: number;
   targetPrice: number;
   targetR: number;
+  riskAllocation?: RiskAllocation | null;
+  macro1hTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  macro4hTrend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   reasons: string[];
   strategies: string[];
   summary: string;
@@ -318,12 +338,183 @@ interface LiveActiveTrade {
 }
 
 const liveActiveTrades = new Map<string, LiveActiveTrade>();
+const symbolCooldownUntil = new Map<string, number>();
 const liveLearnedLessons: string[] = [];
-let liveCouncilInFlight = false;
+
+// IST Calendar-Day Persistent Trade History (Survives restarts via MongoDB reload)
+interface TodayResolvedRecord {
+  istDay: string;
+  side: 'LONG' | 'SHORT';
+  outcome: 'WIN' | 'LOSS';
+  pnlR: number;
+  resolvedAt: number;
+}
+const todayIstResolvedResults: TodayResolvedRecord[] = [];
+
+function getTodayIstResults(): Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }> {
+  const today = istDayString();
+  // Prune any previous IST day entries
+  while (todayIstResolvedResults.length && todayIstResolvedResults[0].istDay !== today) {
+    todayIstResolvedResults.shift();
+  }
+  return todayIstResolvedResults.map(({ side, outcome, pnlR }) => ({ side, outcome, pnlR }));
+}
+
+async function hydrateTodayIstResultsFromMongo(): Promise<void> {
+  if (!mongoHistory.connected) return;
+  try {
+    const today = istDayString();
+    const istMidnightMs = new Date(`${today}T00:00:00+05:30`).getTime();
+    const todaysFromDb = await mongoHistory.getLiveTradesSince(istMidnightMs);
+
+    todayIstResolvedResults.length = 0;
+    for (const t of todaysFromDb) {
+      todayIstResolvedResults.push({
+        istDay: today,
+        side: t.side,
+        outcome: t.outcome,
+        pnlR: t.pnlR,
+        resolvedAt: t.resolvedAt ?? Date.now()
+      });
+    }
+    if (todayIstResolvedResults.length > 0) {
+      const netR = todayIstResolvedResults.reduce((s, r) => s + r.pnlR, 0);
+      console.log(`[Startup Risk Guard] Loaded ${todayIstResolvedResults.length} resolved trades for today (${today} IST) | Net PnL: ${netR >= 0 ? '+' : ''}${netR.toFixed(2)}R`);
+    }
+  } catch (err) {
+    console.warn('[Startup Risk Guard] Could not hydrate today IST trades:', err instanceof Error ? err.message : err);
+  }
+}
+
+function isMissingProviderError(message: string): boolean {
+  return /no (ai|groq) (provider|key)/i.test(message) || message.includes('not configured');
+}
+
+function rememberLesson(lesson: string): void {
+  const clean = lesson.trim();
+  if (!clean || liveLearnedLessons.some((existing) => existing.toLowerCase() === clean.toLowerCase())) return;
+  liveLearnedLessons.push(clean);
+  if (liveLearnedLessons.length > 40) liveLearnedLessons.splice(0, liveLearnedLessons.length - 40);
+}
+
+const DAILY_RANGE_TTL_MS = 30 * 60_000;
+const dailyRangeCache = new Map<string, { fetchedAt: number; ranges: Array<{ day: number; high: number; low: number }> }>();
+
+async function getDailyRanges(symbol: string): Promise<Array<{ day: number; high: number; low: number }>> {
+  const cached = dailyRangeCache.get(symbol);
+  if (cached && Date.now() - cached.fetchedAt < DAILY_RANGE_TTL_MS) return cached.ranges;
+  try {
+    if ((FOREX_SYMBOLS as readonly string[]).includes(symbol)) {
+      const fxDaily = await DerivForexClient.fetchHistoricalCandles({ symbol, timeframe: '1d', count: 10 });
+      const ranges = fxDaily.map((c) => ({ day: c.time, high: c.high, low: c.low })).sort((a, b) => a.day - b.day);
+      dailyRangeCache.set(symbol, { fetchedAt: ranges.length ? Date.now() : Date.now() - DAILY_RANGE_TTL_MS + 60_000, ranges });
+      return ranges;
+    }
+    const now = Date.now();
+    const result = await restService.fetchHistoricalCandles({ symbol, timeframe: '1d', startTimeMs: now - 10 * 86_400_000, endTimeMs: now });
+    const ranges = result.candles
+      .filter((c) => Number.isFinite(c.high) && Number.isFinite(c.low))
+      .map((c) => ({ day: c.time, high: c.high, low: c.low }))
+      .sort((a, b) => a.day - b.day);
+    dailyRangeCache.set(symbol, { fetchedAt: ranges.length ? now : now - DAILY_RANGE_TTL_MS + 60_000, ranges });
+    return ranges;
+  } catch (error) {
+    console.warn(`[Daily Ranges] Could not load 1d candles for ${symbol}:`, error instanceof Error ? error.message : error);
+    dailyRangeCache.set(symbol, { fetchedAt: Date.now() - DAILY_RANGE_TTL_MS + 60_000, ranges: cached?.ranges ?? [] });
+    return cached?.ranges ?? [];
+  }
+}
+
+const MACRO_TREND_TTL_MS = 5 * 60_000;
+const macroTrendCache = new Map<string, {
+  fetchedAt: number;
+  trend1h: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  trend4h: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  candles1h: Array<{ time: number; open: number; high: number; low: number; close: number }>;
+  candles15m: Array<{ time: number; open: number; high: number; low: number; close: number }>;
+  candles5m: Array<{ time: number; open: number; high: number; low: number; close: number }>;
+}>();
+
+function classifyMacroCandles(candles: Array<{ open: number; high: number; low: number; close: number }>): 'BULLISH' | 'BEARISH' | 'NEUTRAL' {
+  if (candles.length < 20) return 'NEUTRAL';
+  const closes = candles.map((c) => c.close);
+  const k = 2 / 21;
+  let ema20 = closes.slice(0, 20).reduce((a, b) => a + b, 0) / 20;
+  for (let i = 20; i < closes.length; i++) {
+    ema20 = closes[i] * k + ema20 * (1 - k);
+  }
+  const last = candles[candles.length - 1];
+  const bar3Ago = candles[candles.length - 4];
+  const bar6Ago = candles[candles.length - 7];
+
+  if (last.close > ema20 && last.close > bar3Ago.close && last.close > bar6Ago.close) return 'BULLISH';
+  if (last.close < ema20 && last.close < bar3Ago.close && last.close < bar6Ago.close) return 'BEARISH';
+  return 'NEUTRAL';
+}
+
+async function getMacroTrends(symbol: string) {
+  const cached = macroTrendCache.get(symbol);
+  if (cached && Date.now() - cached.fetchedAt < MACRO_TREND_TTL_MS) {
+    return cached;
+  }
+  try {
+    if ((FOREX_SYMBOLS as readonly string[]).includes(symbol)) {
+      const [c5m, c15m, c1h, c4h] = await Promise.all([
+        DerivForexClient.fetchHistoricalCandles({ symbol, timeframe: '5m', count: 100 }),
+        DerivForexClient.fetchHistoricalCandles({ symbol, timeframe: '15m', count: 96 }),
+        DerivForexClient.fetchHistoricalCandles({ symbol, timeframe: '1h', count: 72 }),
+        DerivForexClient.fetchHistoricalCandles({ symbol, timeframe: '4h', count: 40 })
+      ]);
+      const entry = {
+        fetchedAt: Date.now(),
+        trend1h: classifyMacroCandles(c1h),
+        trend4h: classifyMacroCandles(c4h),
+        candles1h: c1h.slice(-72),
+        candles15m: c15m.slice(-96),
+        candles5m: c5m.slice(-100)
+      };
+      macroTrendCache.set(symbol, entry);
+      return entry;
+    }
+    const now = Date.now();
+    const [res5m, res15m, res1h, res4h] = await Promise.all([
+      restService.fetchHistoricalCandles({ symbol, timeframe: '5m', startTimeMs: now - 9 * 3600_000, endTimeMs: now }),
+      restService.fetchHistoricalCandles({ symbol, timeframe: '15m', startTimeMs: now - 24 * 3600_000, endTimeMs: now }),
+      restService.fetchHistoricalCandles({ symbol, timeframe: '1h', startTimeMs: now - 72 * 3600_000, endTimeMs: now }),
+      restService.fetchHistoricalCandles({ symbol, timeframe: '4h', startTimeMs: now - 5 * 86_400_000, endTimeMs: now })
+    ]);
+    const trend1h = classifyMacroCandles(res1h.candles);
+    const trend4h = classifyMacroCandles(res4h.candles);
+    const entry = {
+      fetchedAt: now,
+      trend1h,
+      trend4h,
+      candles1h: res1h.candles.slice(-72),
+      candles15m: res15m.candles.slice(-96),
+      candles5m: res5m.candles.slice(-100)
+    };
+    macroTrendCache.set(symbol, entry);
+    return entry;
+  } catch {
+    return cached ?? { fetchedAt: 0, trend1h: 'NEUTRAL' as const, trend4h: 'NEUTRAL' as const, candles1h: [], candles15m: [], candles5m: [] };
+  }
+}
+
+// Per-symbol concurrency lock with overall API concurrency cap (prevents BTC from blocking ETH/SOL)
+const councilInFlightSymbols = new Set<string>();
+const MAX_CONCURRENT_COUNCILS = 2;
+
 let isAutoTradingEnabled = true;
 let lastQuotaAlertTime = 0;
 let lastMissingConfigLogAt = 0;
 let lastStaleFeedLogAt = 0;
+
+const sessionPerformance = {
+  totalTrades: 0,
+  wins: 0,
+  losses: 0,
+  netR: 0
+};
 
 async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
   const now = Date.now();
@@ -368,14 +559,54 @@ const server = http.createServer(async (req, res) => {
     query: Object.fromEntries(requestUrl.searchParams.entries()) as Record<string, string>
   };
 
-  // Status check for UI Toggle Button
+  if (req.method === 'GET' && parsed.pathname === '/audit-report') {
+    const logs = mongoHistory.connected ? await mongoHistory.getSystemAuditLogs(100) : [];
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(renderAuditDashboardHtml(logs));
+    return;
+  }
+
+  if (req.method === 'POST' && parsed.pathname === '/api/agents/run-audit') {
+    try {
+      const result = await runNightlyAuditCycle(mongoHistory, { forceAllRecent: true });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (err: unknown) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Audit failed' }));
+    }
+    return;
+  }
+
   if (req.method === 'GET' && parsed.pathname === '/api/agents/auto-status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ autoTrading: isAutoTradingEnabled }));
     return;
   }
 
-  // Toggle Auto Trading On/Off from UI Button
+  if (req.method === 'GET' && parsed.pathname === '/api/health') {
+    const feedAgeSec = lastTradeReceivedAt ? Math.round((Date.now() - lastTradeReceivedAt) / 1000) : null;
+    const isHealthy = currentMarketStatus === 'LIVE' && feedAgeSec !== null && feedAgeSec < 30;
+    const perSymbolAgeSec = Object.fromEntries(
+      SUPPORTED_SYMBOLS.map((sym) => {
+        const ts = lastTradeAtBySymbol.get(sym);
+        return [sym, ts ? Math.round((Date.now() - ts) / 1000) : null];
+      })
+    );
+    res.writeHead(isHealthy ? 200 : 503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: isHealthy ? 'OK' : 'DEGRADED',
+      marketStatus: currentMarketStatus,
+      feedAgeSec,
+      perSymbolAgeSec,
+      autoTrading: isAutoTradingEnabled,
+      activeTrades: liveActiveTrades.size,
+      todayResolvedCount: getTodayIstResults().length,
+      uptimeMin: Math.round(process.uptime() / 60)
+    }));
+    return;
+  }
+
   if (req.method === 'POST' && parsed.pathname === '/api/agents/toggle-auto') {
     let body = '';
     for await (const chunk of req) body += chunk;
@@ -449,6 +680,7 @@ const server = http.createServer(async (req, res) => {
           const persistentLessons = await mongoHistory.getLearnedLessons(10);
           snapshot.paperPerformance = {
             ...paperPerformance,
+            recent: getTodayIstResults(),
             learnedLessons: [...persistentLessons, ...liveLearnedLessons]
           };
         } catch (error) {
@@ -468,7 +700,7 @@ const server = http.createServer(async (req, res) => {
       if (message.includes('429') || message.includes('quota') || message.includes('rate limit')) {
         void handleQuotaExhaustedAlert(message);
       }
-      const status = message.includes('too large') ? 413 : message.includes('not configured') ? 503 : message.includes('quota') ? 429 : 502;
+      const status = message.includes('too large') ? 413 : isMissingProviderError(message) ? 503 : message.includes('quota') ? 429 : 502;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: message }));
     }
@@ -494,6 +726,12 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const result = await restService.fetchHistoricalCandles({ symbol, timeframe, startTimeMs, endTimeMs });
+      if ((FOREX_SYMBOLS as readonly string[]).includes(symbol)) {
+        const candles = await DerivForexClient.fetchHistoricalCandles({ symbol, timeframe, count: 200 });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ symbol, timeframe, candles }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
     } catch (err: unknown) {
@@ -756,7 +994,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Serve Frontend UI in Production
+  // Serve Frontend UI in Production (if built)
   if ((req.method === 'GET' || req.method === 'HEAD') && !parsed.pathname?.startsWith('/api/')) {
     const frontendDirectory = [
       resolve(process.cwd(), 'frontend', 'dist'),
@@ -777,6 +1015,20 @@ const server = http.createServer(async (req, res) => {
       };
       res.writeHead(200, { 'Content-Type': contentTypes[extname(requestedFile)] ?? 'application/octet-stream' });
       res.end(req.method === 'HEAD' ? undefined : readFileSync(requestedFile));
+      return;
+    }
+
+    // Headless Cloud Mode Root Status
+    if (parsed.pathname === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(req.method === 'HEAD' ? undefined : JSON.stringify({
+        engine: 'FlowTerminal Headless Paper-Trading & Signal Engine',
+        status: currentMarketStatus,
+        autoTrading: isAutoTradingEnabled,
+        activeTrades: liveActiveTrades.size,
+        todayResolvedCount: getTodayIstResults().length,
+        auditDashboard: '/audit-report'
+      }));
       return;
     }
   }
@@ -830,8 +1082,27 @@ function queueFormingFootprint(aggregator: OrderFlowAggregator): void {
   }, 75);
 }
 
+let lastDisconnectAlertAt = 0;
+let wasDisconnectedAlertSent = false;
+
 export function updateMarketStatus(status: ConnectionStatus, message?: string, affectedSymbol?: string): void {
-  if (!affectedSymbol) currentMarketStatus = status;
+  if (!affectedSymbol) {
+    currentMarketStatus = status;
+    if (status === 'DISCONNECTED' || status === 'RECONNECTING') {
+      if (!wasDisconnectedAlertSent && Date.now() - lastDisconnectAlertAt > 3 * 60_000) {
+        lastDisconnectAlertAt = Date.now();
+        wasDisconnectedAlertSent = true;
+        void sendTelegramMessage(
+          `⚠️ <b>FLOWTERMINAL FEED DISCONNECTED</b>\n━━━━━━━━━━━━━━━━━━━━\n📡 <b>Status:</b> ${status}\n🔍 <b>Details:</b> ${message || 'Bybit WebSocket dropped'}\n⏳ Auto-reconnecting...`
+        ).catch(() => {});
+      }
+    } else if (status === 'LIVE' && wasDisconnectedAlertSent) {
+      wasDisconnectedAlertSent = false;
+      void sendTelegramMessage(
+        `✅ <b>FLOWTERMINAL FEED RECONNECTED</b>\n━━━━━━━━━━━━━━━━━━━━\n📡 Live market data & auto-trader back online!`
+      ).catch(() => {});
+    }
+  }
   if (status === 'DISCONNECTED' || status === 'RECONNECTING' || status === 'DESYNCHRONIZED') {
     if (affectedSymbol) marketPipelines.get(affectedSymbol)?.orderBook.reset();
     else for (const pipeline of marketPipelines.values()) pipeline.orderBook.reset();
@@ -846,136 +1117,220 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
   broadcast(statusMsg);
 }
 
-// --- MULTI-COIN LIVE BAR PROCESSING & LEARNING ---
+// --- MULTI-COIN LIVE BAR PROCESSING & LEARNING (STRICTLY PAPER + TELEGRAM) ---
 async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar): Promise<void> {
   if (!isAutoTradingEnabled) {
     return;
   }
 
-  // --- HARD FEED GUARD: ZERO API CALLS IF FEED IS NOT 100% LIVE ---
-  const isFeedFresh = currentMarketStatus === 'LIVE' &&
-                      lastTradeReceivedAt !== null &&
-                      (Date.now() - lastTradeReceivedAt < 25_000);
+  // --- PER-SYMBOL FEED & ORDERBOOK SAFETY GUARD ---
+  const symbolStatus = marketStatusBySymbol.get(symbol) ?? currentMarketStatus;
+  const symbolLastTradeAt = lastTradeAtBySymbol.get(symbol) ?? null;
+  const isSymbolFeedFresh = symbolStatus === 'LIVE' &&
+                            symbolLastTradeAt !== null &&
+                            (Date.now() - symbolLastTradeAt < 25_000);
 
-  if (!isFeedFresh) {
+  if (!isSymbolFeedFresh) {
     const now = Date.now();
     if (now - lastStaleFeedLogAt > 60_000) {
       lastStaleFeedLogAt = now;
-      console.log(`[Auto-Trader] Feed stale/disconnected (${currentMarketStatus}). Skipping AI calls to protect API quota.`);
+      console.log(`[Auto-Trader] Feed stale/disconnected for ${symbol} (${currentMarketStatus}). Skipping AI calls to protect API quota.`);
     }
     return;
   }
 
-  // 1. Check open position for this specific symbol
+  const pipeline = marketPipelines.get(symbol);
+  if (!pipeline) return;
+
+  const isCrypto = (CRYPTO_SYMBOLS as readonly string[]).includes(symbol);
+  const bookStatus = pipeline.orderBook.getStatus();
+  const isOrderBookSafe = !isCrypto || bookStatus.isSynchronized;
+
+  // 1. Check open paper position for this specific symbol (0 API calls)
   const currentTrade = liveActiveTrades.get(symbol);
   if (currentTrade) {
     currentTrade.barsHeld += 1;
     let outcome: 'WIN' | 'LOSS' | 'OPEN' = 'OPEN';
+    let exitKind: 'TARGET' | 'STOP' | 'EARLY_EXIT' | 'SCRATCH_EXIT' | 'TIMEOUT' | null = null;
     let exitPrice = bar.close;
 
-    if (currentTrade.decision === 'LONG') {
+    const initialRisk = currentTrade.initialRisk;
+    const isLong = currentTrade.decision === 'LONG';
+    const currentR = isLong
+      ? (bar.close - currentTrade.entryPrice) / initialRisk
+      : (currentTrade.entryPrice - bar.close) / initialRisk;
+    const peakR = isLong
+      ? (bar.high - currentTrade.entryPrice) / initialRisk
+      : (currentTrade.entryPrice - bar.low) / initialRisk;
+
+    if (isLong) {
+      if (currentTrade.targetR >= 2.5 && peakR >= 2.4 && currentTrade.stopPrice < currentTrade.entryPrice + initialRisk * 1.0) {
+        currentTrade.stopPrice = currentTrade.entryPrice + initialRisk * 1.0;
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.4R -> SL moved up to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
+      } else if (peakR >= 1.5 && currentTrade.stopPrice < currentTrade.entryPrice + initialRisk * 0.15) {
+        currentTrade.stopPrice = currentTrade.entryPrice + initialRisk * 0.15;
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.5R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
+      }
+
       if (bar.low <= currentTrade.stopPrice) {
-        outcome = 'LOSS';
         exitPrice = currentTrade.stopPrice;
+        const lockedR = (exitPrice - currentTrade.entryPrice) / initialRisk;
+        outcome = lockedR > 0.05 ? 'WIN' : 'LOSS';
+        exitKind = lockedR > 0.05 ? 'EARLY_EXIT' : 'STOP';
       } else if (bar.high >= currentTrade.targetPrice) {
         outcome = 'WIN';
         exitPrice = currentTrade.targetPrice;
+        exitKind = 'TARGET';
       }
     } else {
+      if (currentTrade.targetR >= 2.5 && peakR >= 2.4 && currentTrade.stopPrice > currentTrade.entryPrice - initialRisk * 1.0) {
+        currentTrade.stopPrice = currentTrade.entryPrice - initialRisk * 1.0;
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.4R -> SL moved down to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
+      } else if (peakR >= 1.5 && currentTrade.stopPrice > currentTrade.entryPrice - initialRisk * 0.15) {
+        currentTrade.stopPrice = currentTrade.entryPrice - initialRisk * 0.15;
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.5R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
+      }
+
       if (bar.high >= currentTrade.stopPrice) {
-        outcome = 'LOSS';
         exitPrice = currentTrade.stopPrice;
+        const lockedR = (currentTrade.entryPrice - exitPrice) / initialRisk;
+        outcome = lockedR > 0.05 ? 'WIN' : 'LOSS';
+        exitKind = lockedR > 0.05 ? 'EARLY_EXIT' : 'STOP';
       } else if (bar.low <= currentTrade.targetPrice) {
         outcome = 'WIN';
         exitPrice = currentTrade.targetPrice;
+        exitKind = 'TARGET';
       }
     }
 
-    if (outcome !== 'OPEN' || currentTrade.barsHeld >= 15) {
-      const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN'
-        ? outcome
-        : (currentTrade.decision === 'LONG' ? (exitPrice >= currentTrade.entryPrice ? 'WIN' : 'LOSS') : (exitPrice <= currentTrade.entryPrice ? 'WIN' : 'LOSS'));
+    const macroNow = macroTrendCache.get(symbol);
+    const htfAligned = (isLong && macroNow?.trend1h === 'BULLISH') || (!isLong && macroNow?.trend1h === 'BEARISH');
+    const maxHoldBars = (currentR > 0.25 && htfAligned) ? 90 : 60;
 
-      const risk = Math.abs(currentTrade.entryPrice - currentTrade.stopPrice) || 1;
-      const diff = currentTrade.decision === 'LONG' ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
-      const pnlR = Number((diff / risk).toFixed(2));
+    if (outcome !== 'OPEN' || currentTrade.barsHeld >= maxHoldBars) {
+      const diff = isLong ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
+      const rawR = diff / initialRisk;
+      const feeSlippageR = 0.05; // Realistic round-trip maker/taker fee + spread slippage deduction
+      const pnlR = Number((rawR - feeSlippageR).toFixed(2));
+      const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN' ? outcome : (pnlR > 0.15 ? 'WIN' : 'LOSS');
+      const finalExitKind = exitKind ?? 'TIMEOUT';
+
       const finishedTrade = { ...currentTrade };
       liveActiveTrades.delete(symbol);
 
-      console.log(`[Trade Resolved] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
+      const resolvedIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
+      if (resolvedOutcome === 'LOSS' && finalExitKind === 'STOP') {
+        symbolCooldownUntil.set(symbol, Date.now() + 5 * 60_000);
+      }
 
-      const forwardContext = resolvedOutcome === 'WIN'
-        ? `Target reached at $${exitPrice.toFixed(2)} within ${finishedTrade.barsHeld} bars with strong order-flow continuation.`
-        : `Stop loss hit at $${exitPrice.toFixed(2)} within ${finishedTrade.barsHeld} bars.`;
+      sessionPerformance.totalTrades += 1;
+      if (resolvedOutcome === 'WIN') sessionPerformance.wins += 1;
+      else sessionPerformance.losses += 1;
+      sessionPerformance.netR += pnlR;
 
-      void analyzeTradeOutcomeWithAI(
-        {
-          decision: finishedTrade.decision,
-          entryPrice: finishedTrade.entryPrice,
-          stopPrice: finishedTrade.stopPrice,
-          targetPrice: finishedTrade.targetPrice,
-          reasons: finishedTrade.reasons,
-          summary: finishedTrade.summary
-        },
-        {
-          outcome: resolvedOutcome,
-          exitPrice,
-          exitReason: resolvedOutcome === 'WIN' ? 'Hit Target (+2R)' : 'Hit Stop Loss (-1R)',
-          marketContext: forwardContext
-        }
-      ).then(async (insight) => {
-        if (resolvedOutcome === 'LOSS') {
-          liveLearnedLessons.push(insight);
-          if (mongoHistory.connected) {
-            void mongoHistory.saveLearnedLesson({
-              symbol,
-              outcome: 'LOSS',
-              lesson: insight,
-              source: 'LIVE'
-            });
-          }
-          console.log(`[AI Rule Learned for ${symbol}]: "${insight}"`);
-        } else {
-          console.log(`[AI Win Signature for ${symbol}]: "${insight}"`);
-        }
+      const winRate = sessionPerformance.totalTrades > 0
+        ? (sessionPerformance.wins / sessionPerformance.totalTrades) * 100
+        : 0;
 
-        await sendTradeOutcomeAlert({
+      console.log(`[${resolvedIst}] [Trade Resolved] [${finishedTrade.tradeId}] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} [${finalExitKind}] (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
+
+      const resolvedAtMs = Date.now();
+      todayIstResolvedResults.push({
+        istDay: istDayString(resolvedAtMs),
+        side: finishedTrade.decision,
+        outcome: resolvedOutcome,
+        pnlR,
+        resolvedAt: resolvedAtMs
+      });
+
+      if (mongoHistory.connected) {
+        void mongoHistory.saveLiveTradeJournal({
+          tradeId: finishedTrade.tradeId,
           symbol,
-          decision: finishedTrade.decision,
-          outcome: resolvedOutcome,
+          side: finishedTrade.decision,
           entryPrice: finishedTrade.entryPrice,
+          stopPrice: finishedTrade.initialStopPrice ?? finishedTrade.stopPrice,
+          initialRisk: finishedTrade.initialRisk,
+          targetPrice: finishedTrade.targetPrice,
+          targetR: finishedTrade.targetR,
           exitPrice,
+          outcome: resolvedOutcome,
+          exitKind: finalExitKind,
           pnlR,
           barsHeld: finishedTrade.barsHeld,
-          lessonLearned: insight
+          enteredAt: finishedTrade.enteredAt,
+          resolvedAt: resolvedAtMs,
+          macro1hTrend: finishedTrade.macro1hTrend,
+          macro4hTrend: finishedTrade.macro4hTrend,
+          strategies: finishedTrade.strategies,
+          reasons: finishedTrade.reasons,
+          summary: finishedTrade.summary,
+          audited: false
         });
-      }).catch((e) => console.warn('[AI Learning Warning]:', e instanceof Error ? e.message : e));
+      }
+
+      const statusNote = finalExitKind === 'TARGET'
+        ? 'Target hit! Setup logged for Nightly Audit reinforcement.'
+        : finalExitKind === 'EARLY_EXIT'
+          ? 'Trailing SL locked profit (+1.0R / +1.5R) hit. Queued for 1:30 AM IST Nightly Audit.'
+          : 'Queued for 1:30 AM IST Nightly Audit (checking 1H/4H + 4.5h pre-trade & 1h post-trade context).';
+
+      void sendTradeOutcomeAlert({
+        tradeId: finishedTrade.tradeId,
+        symbol,
+        decision: finishedTrade.decision,
+        outcome: resolvedOutcome,
+        entryPrice: finishedTrade.entryPrice,
+        exitPrice,
+        pnlR,
+        barsHeld: finishedTrade.barsHeld,
+        lessonLearned: statusNote,
+        sessionStats: {
+          totalTrades: sessionPerformance.totalTrades,
+          wins: sessionPerformance.wins,
+          losses: sessionPerformance.losses,
+          winRate,
+          netR: sessionPerformance.netR
+        }
+      }).catch(() => {});
 
       return;
     }
   }
 
-  // 2. Evaluate new setup across coins when no trade is active for this symbol
-  if (!liveActiveTrades.has(symbol) && !liveCouncilInFlight) {
-    const pipeline = marketPipelines.get(symbol);
-    if (!pipeline) return;
-
-    const recentBars = pipeline.footprints['1m'].getRecentBars(15);
-    if (recentBars.length < 6) return;
-
-    const lookback = recentBars.slice(-6);
-    const isLocalExtreme = bar.high >= Math.max(...lookback.map((b) => b.high)) ||
-                           bar.low <= Math.min(...lookback.map((b) => b.low));
-    const isDeltaSpike = Math.abs(bar.delta) >= 20;
-    const isFiveMinBoundary = bar.time % 300 === 0;
-
-    if (!isLocalExtreme && !isDeltaSpike && !isFiveMinBoundary) {
+  // 2. Evaluate new setup across coins (Per-symbol lock + overall concurrency limit + OrderBook sync gate)
+  if (
+    !liveActiveTrades.has(symbol) &&
+    !councilInFlightSymbols.has(symbol) &&
+    councilInFlightSymbols.size < MAX_CONCURRENT_COUNCILS
+  ) {
+    if (!isOrderBookSafe) {
+      return;
+    }
+    if (Date.now() < (symbolCooldownUntil.get(symbol) ?? 0)) {
       return;
     }
 
-    liveCouncilInFlight = true;
+    const recentBars = pipeline.footprints['1m'].getRecentBars(15);
+    if (recentBars.length < 12) return;
+
+    const avgVol = recentBars.reduce((s, b) => s + b.totalVolume, 0) / recentBars.length;
+    if (bar.totalVolume < avgVol * 0.75) {
+      return;
+    }
+
+    const lookback = recentBars.slice(-8);
+    const isLocalExtreme = bar.high >= Math.max(...lookback.map((b) => b.high)) ||
+                           bar.low <= Math.min(...lookback.map((b) => b.low));
+    const isSignificantDelta = Math.abs(bar.delta) >= avgVol * 0.22;
+
+    if (!isLocalExtreme && !isSignificantDelta) {
+      return;
+    }
+
+    councilInFlightSymbols.add(symbol);
     try {
-      const candles1m = pipeline.footprints['1m'].getRecentBars(40).map((b) => ({
+      const candles1m = pipeline.footprints['1m'].getRecentBars(300).map((b) => ({
         time: b.time,
         open: b.open,
         high: b.high,
@@ -987,12 +1342,17 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       if (mongoHistory.connected) {
         persistentLessons = await mongoHistory.getLearnedLessons(10);
       }
+      const [dailyRanges, macroTrends] = await Promise.all([
+        getDailyRanges(symbol),
+        getMacroTrends(symbol)
+      ]);
 
+      const todayResults = getTodayIstResults();
       const snapshot: AgentSnapshot = {
         symbol,
         timeframe: '1m',
-        feedStatus: currentMarketStatus,
-        lastTradeAt: lastTradeReceivedAt,
+        feedStatus: isOrderBookSafe ? symbolStatus : 'DESYNCHRONIZED',
+        lastTradeAt: symbolLastTradeAt,
         latestPrice: bar.close,
         profile: {
           poc: bar.pocPrice,
@@ -1000,46 +1360,73 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           val: Math.min(...recentBars.map((b) => b.low)),
           capturedBars: recentBars.length
         },
+        technicalContext: {
+          smc: { bias: 'UNAVAILABLE', events: [], zones: [], liquidity: [] },
+          ict: {
+            po3: [],
+            dailyRanges,
+            macro1hTrend: macroTrends.trend1h,
+            macro4hTrend: macroTrends.trend4h
+          }
+        },
         candles: candles1m,
+        candles5m: macroTrends.candles5m,
+        candles15m: macroTrends.candles15m,
+        candles1h: macroTrends.candles1h,
+        footprints5m: pipeline.footprints['5m'].getRecentBars(20).map((b) => pipeline.footprints['5m'].serializeBar(b)),
         footprints: recentBars.map((b) => pipeline.footprints['1m'].serializeBar(b)),
-        trades: [],
+        trades: tradeHistory.getHistory({ symbol, limit: 150 }),
         bids: pipeline.orderBook.getSortedBids(5),
         asks: pipeline.orderBook.getSortedAsks(5),
         paperPerformance: {
-          resolved: 0,
-          wins: 0,
-          losses: 0,
+          resolved: sessionPerformance.totalTrades,
+          wins: sessionPerformance.wins,
+          losses: sessionPerformance.losses,
           expired: 0,
-          winRate: null,
-          averageR: null,
-          recent: [],
+          winRate: sessionPerformance.totalTrades > 0 ? Number(((sessionPerformance.wins / sessionPerformance.totalTrades) * 100).toFixed(1)) : null,
+          averageR: sessionPerformance.totalTrades > 0 ? Number((sessionPerformance.netR / sessionPerformance.totalTrades).toFixed(2)) : null,
+          recent: todayResults,
           learnedLessons: [...persistentLessons, ...liveLearnedLessons]
         }
       };
 
       const councilResult = await runOrderFlowCouncil(snapshot);
       const plan = councilResult.plan;
-
+      const checkIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
+      const activeSignals = councilResult.reports.map((r) => `${r.agentId}:${r.bias}/${r.strength}`).join(' ');
+      console.log(`[${checkIst}] [Manager Check] ${symbol} | 15m/5m [${activeSignals}] -> Decision: ${plan.decision} (${plan.summary})`);
       if (plan.decision !== 'WAIT') {
-        console.log(`\n🚨 [LIVE TRADE TRIGGERED]: ${plan.decision} ${symbol} @ $${plan.entryPrice}`);
-        console.log(`   SL: $${plan.stopPrice} | TP: $${plan.targetPrice} (${plan.targetR}R)`);
+        const generatedTradeId = `#${symbol.replace('USDT', '')}-${Date.now().toString().slice(-4)}`;
+        const riskInfo = plan.riskAllocation
+          ? ` | Size: ${plan.riskAllocation.positionSizeUnits} units ($${plan.riskAllocation.notionalValueUsd} notional, Risk $${plan.riskAllocation.maxRiskUsd})`
+          : '';
+        console.log(`\n[${checkIst}] 🚨 [A+ PAPER TRADE TRIGGERED]: [${generatedTradeId}] ${plan.decision} ${symbol} @ $${plan.entryPrice} (15m/5m Flow)`);
+        console.log(`   SL: $${plan.stopPrice} | TP: $${plan.targetPrice} (${plan.targetR}R)${riskInfo}`);
 
         const newTrade: LiveActiveTrade = {
+          tradeId: generatedTradeId,
           symbol,
           decision: plan.decision,
           entryPrice: plan.entryPrice!,
           stopPrice: plan.stopPrice!,
+          initialStopPrice: plan.stopPrice!,
+          initialRisk: Math.abs(plan.entryPrice! - plan.stopPrice!) || (plan.entryPrice! * 0.0015),
           targetPrice: plan.targetPrice!,
           targetR: plan.targetR || 2,
+          riskAllocation: plan.riskAllocation ?? null,
+          macro1hTrend: macroTrends.trend1h,
+          macro4hTrend: macroTrends.trend4h,
           reasons: plan.reasons,
           strategies: plan.strategyNames || [],
           summary: plan.summary,
           barsHeld: 0,
           enteredAt: Date.now()
         };
+
         liveActiveTrades.set(symbol, newTrade);
 
         void sendTradeEntryAlert({
+          tradeId: generatedTradeId,
           symbol,
           decision: plan.decision,
           entryPrice: plan.entryPrice!,
@@ -1048,7 +1435,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           targetR: plan.targetR || 2,
           reasons: plan.reasons,
           strategies: plan.strategyNames || [],
-          summary: plan.summary
+          summary: `${plan.summary}${riskInfo}`
         }).catch((e) => console.warn('[Telegram Entry Alert Error]:', e instanceof Error ? e.message : e));
 
         if (mongoHistory.connected) {
@@ -1057,26 +1444,32 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
+      if (
+        msg.includes('429') ||
+        msg.toLowerCase().includes('quota') ||
+        msg.toLowerCase().includes('rate limit') ||
+        msg.includes('All Groq keys for')
+      ) {
         void handleQuotaExhaustedAlert(msg);
       }
-      if (msg.includes('No AI provider is configured')) {
+      if (isMissingProviderError(msg)) {
         const now = Date.now();
         if (now - lastMissingConfigLogAt > 60_000) {
           lastMissingConfigLogAt = now;
-          console.warn('[Live Council Error]: No AI provider is configured. Set your 4 role keys in .env, then restart the backend.');
+          console.warn('[Live Council Error]: No Groq provider is configured. Set GROQ_MANAGER_API_KEY in .env (or COUNCIL_MANAGER=off for math-only mode), then restart the backend.');
         }
       } else {
         console.warn('[Live Council Error]:', msg);
       }
     } finally {
-      liveCouncilInFlight = false;
+      councilInFlightSymbols.delete(symbol);
     }
   }
 }
 
-const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
+const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
   onStatusChange: (status: ConnectionStatus, message?: string) => {
+    for (const sym of CRYPTO_SYMBOLS) marketStatusBySymbol.set(sym, status);
     updateMarketStatus(status, message);
   },
   onMessage: (topic: string, payload: unknown) => {
@@ -1106,7 +1499,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
       const data = (payload as { data?: Record<string, unknown> }).data;
       const symbol = topic.split('.').pop();
       if (!symbol || !SUPPORTED_SYMBOLS.includes(symbol as typeof SUPPORTED_SYMBOLS[number])) return;
-      lastTradeReceivedAt = Date.now();
+      // Do NOT update trade freshness from ticker messages — only actual trades refresh trade timestamps
       const previous = liveTickerBySymbol.get(symbol) ?? { lastPrice: null, markPrice: null, indexPrice: null };
       const readPrice = (key: 'lastPrice' | 'markPrice' | 'indexPrice') => {
         const value = Number(data?.[key]);
@@ -1118,21 +1511,21 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
     } else if (topic.startsWith('publicTrade.')) {
       const trades = parsePublicTradePayload(payload);
       if (trades.length > 0) {
-        lastTradeReceivedAt = Date.now();
-        tradeHistory.save(trades);
-        if (process.env.MONGO_PERSIST_RAW_TRADES === 'true') queueMongoTrades(trades);
-
-        // BANDWIDTH SAVER: Raw tick trades broadcast disabled on cloud hosts
-        if (process.env.BROADCAST_RAW_TRADES === 'true') {
-          const tradeMsg: TradeGatewayMessage = {
-            type: 'TRADE',
-            data: trades,
-            timestamp: Date.now()
-          };
-          broadcast(tradeMsg);
+        const nowMs = Date.now();
+        lastTradeReceivedAt = nowMs;
+        for (const t of trades) {
+          lastTradeAtBySymbol.set(t.symbol, nowMs);
         }
+        tradeHistory.save(trades);
+        queueMongoTrades(trades);
 
-        // Process in Order Flow Aggregator
+        const tradeMsg: TradeGatewayMessage = {
+          type: 'TRADE',
+          data: trades,
+          timestamp: nowMs
+        };
+        broadcast(tradeMsg);
+
         for (const trade of trades) {
           const pipeline = marketPipelines.get(trade.symbol);
           if (!pipeline) continue;
@@ -1141,14 +1534,14 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
           if (fpBar1m) {
             const fpKey1m = `${trade.symbol}:1m`;
             if (prevBarTime1m === undefined && !firstFootprintBarByKey.has(fpKey1m)) firstFootprintBarByKey.set(fpKey1m, fpBar1m.time);
-            
+
             if (prevBarTime1m !== undefined && fpBar1m.time > prevBarTime1m) {
               const closedBar = pipeline.footprints['1m'].getRecentBars().find((b) => b.time === prevBarTime1m);
               if (closedBar) {
                 const serialized = pipeline.footprints['1m'].serializeBar(closedBar);
                 if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
                   footprintHistory.save(serialized);
-                  persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
+                  if (process.env.MONGO_PERSIST_1M_FOOTPRINTS === 'true') persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 }
                 broadcast({
                   type: 'FOOTPRINT_BAR',
@@ -1157,7 +1550,6 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
                   timestamp: Date.now()
                 });
 
-                // Auto Trading Trigger
                 void handleLiveBarAutonomousTrading(trade.symbol, serialized);
               }
             }
@@ -1166,7 +1558,7 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
               for (const corrected of pipeline.footprints['1m'].getRecentBars(200).filter((bar) => bar.time >= fpBar1m.time && bar.isClosed)) {
                 const serialized = pipeline.footprints['1m'].serializeBar(corrected);
                 footprintHistory.save(serialized);
-                persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
+                if (process.env.MONGO_PERSIST_1M_FOOTPRINTS === 'true') persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
                 broadcast({ type: 'FOOTPRINT_BAR', timeframe: '1m', data: serialized, timestamp: Date.now() });
               }
             }
@@ -1309,7 +1701,70 @@ const bybitClient = new BybitWebSocketClient([...SUPPORTED_SYMBOLS], {
   }
 });
 
-void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((exchangeTickSizes) => {
+const derivForexClient = new DerivForexClient(FOREX_SYMBOLS, {
+  onStatusChange: (status: ConnectionStatus, message?: string) => {
+    for (const sym of FOREX_SYMBOLS) marketStatusBySymbol.set(sym, status);
+    if (currentMarketStatus !== 'LIVE') updateMarketStatus(status, message);
+  },
+  onTrades: (trades: NormalizedTrade[]) => {
+    if (!trades.length) return;
+    const nowMs = Date.now();
+    lastTradeReceivedAt = nowMs;
+    for (const t of trades) {
+      lastTradeAtBySymbol.set(t.symbol, nowMs);
+    }
+    tradeHistory.save(trades);
+    queueMongoTrades(trades);
+    broadcast({ type: 'TRADE', data: trades, timestamp: nowMs });
+
+    for (const trade of trades) {
+      liveTickerBySymbol.set(trade.symbol, { lastPrice: trade.price, markPrice: trade.price, indexPrice: trade.price });
+      const pipeline = marketPipelines.get(trade.symbol);
+      if (!pipeline) continue;
+
+      const prevBarTime1m = pipeline.footprints['1m'].getCurrentBar()?.time;
+      const fpBar1m = pipeline.footprints['1m'].processTrade(trade);
+      if (fpBar1m) {
+        const fpKey1m = `${trade.symbol}:1m`;
+        if (prevBarTime1m === undefined && !firstFootprintBarByKey.has(fpKey1m)) firstFootprintBarByKey.set(fpKey1m, fpBar1m.time);
+        if (prevBarTime1m !== undefined && fpBar1m.time > prevBarTime1m) {
+          const closedBar = pipeline.footprints['1m'].getRecentBars().find((b) => b.time === prevBarTime1m);
+          if (closedBar) {
+            const serialized = pipeline.footprints['1m'].serializeBar(closedBar);
+            if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
+              footprintHistory.save(serialized);
+              if (process.env.MONGO_PERSIST_1M_FOOTPRINTS === 'true') persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
+            }
+            broadcast({ type: 'FOOTPRINT_BAR', timeframe: '1m', data: serialized, timestamp: Date.now() });
+            void handleLiveBarAutonomousTrading(trade.symbol, serialized);
+          }
+        }
+        if (prevBarTime1m === undefined || fpBar1m.time >= prevBarTime1m) queueFormingFootprint(pipeline.footprints['1m']);
+      }
+
+      const prevBarTime5m = pipeline.footprints['5m'].getCurrentBar()?.time;
+      const fpBar5m = pipeline.footprints['5m'].processTrade(trade);
+      if (fpBar5m) {
+        const fpKey5m = `${trade.symbol}:5m`;
+        if (prevBarTime5m === undefined && !firstFootprintBarByKey.has(fpKey5m)) firstFootprintBarByKey.set(fpKey5m, fpBar5m.time);
+        if (prevBarTime5m !== undefined && fpBar5m.time > prevBarTime5m) {
+          const closedBar = pipeline.footprints['5m'].getRecentBars().find((b) => b.time === prevBarTime5m);
+          if (closedBar) {
+            const serialized = pipeline.footprints['5m'].serializeBar(closedBar);
+            if (firstFootprintBarByKey.get(fpKey5m) !== closedBar.time) {
+              footprintHistory.save(serialized);
+              persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
+            }
+            broadcast({ type: 'FOOTPRINT_BAR', timeframe: '5m', data: serialized, timestamp: Date.now() });
+          }
+        }
+        if (prevBarTime5m === undefined || fpBar5m.time >= prevBarTime5m) queueFormingFootprint(pipeline.footprints['5m']);
+      }
+    }
+  }
+});
+
+void restService.fetchTickSizes([...CRYPTO_SYMBOLS]).then((exchangeTickSizes) => {
   resolvedTickSizes = { ...resolvedTickSizes, ...exchangeTickSizes };
   for (const [symbol, tickSize] of Object.entries(exchangeTickSizes)) {
     const pipeline = marketPipelines.get(symbol);
@@ -1324,8 +1779,25 @@ void restService.fetchTickSizes([...SUPPORTED_SYMBOLS]).then((exchangeTickSizes)
   console.warn('[FlowTerminal] Could not load instrument tick sizes; using configured fallback sizes.', error);
 }).finally(() => {
   void mongoHistory.connect()
+    .then(async () => {
+      await hydrateTodayIstResultsFromMongo();
+      for (const symbol of SUPPORTED_SYMBOLS) {
+        try {
+          const recentDbTrades = await mongoHistory.getTrades({ symbol, limit: 50 });
+          if (recentDbTrades.length > 0) {
+            tradeHistory.save(recentDbTrades);
+            console.log(`[Startup Tape] Preloaded ${recentDbTrades.length} trades for ${symbol} from local MongoDB.`);
+          }
+        } catch {
+          // ignore if collection warming up
+        }
+      }
+    })
     .catch((error: unknown) => console.error('[MongoDB] Connection failed; local recording remains active:', error))
-    .finally(() => bybitClient.connect());
+    .finally(() => {
+      bybitClient.connect();
+      derivForexClient.connect();
+    });
 });
 
 wss.on('connection', (ws: WebSocket) => {
@@ -1383,6 +1855,7 @@ function gracefulShutdown(): void {
   isShuttingDown = true;
   console.log('[FlowTerminal Gateway] Initiating graceful shutdown...');
   bybitClient.disconnect();
+  derivForexClient.disconnect();
   flushBufferedMongoTrades();
   updateMarketStatus('DISCONNECTED', 'Gateway shutting down');
 
@@ -1404,3 +1877,63 @@ process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
 server.listen(gatewayPort, '0.0.0.0');
+
+// --- ROLLING 1-2 HOUR POST-TRADE AUDIT SCHEDULER (Checks every 15 mins & feeds rules directly to Manager) ---
+let rollingAuditRunning = false;
+setInterval(() => {
+  if (rollingAuditRunning || !mongoHistory.connected) return;
+  rollingAuditRunning = true;
+  void runNightlyAuditCycle(mongoHistory, {
+    silentIfEmpty: true,
+    onNewRule: (rule) => {
+      rememberLesson(rule);
+      console.log(`[Manager Memory Updated] New post-trade audit rule active immediately: "${rule}"`);
+    }
+  })
+    .catch((err) => {
+      console.error('[Rolling Post-Trade Audit Error]:', err);
+    })
+    .finally(() => {
+      rollingAuditRunning = false;
+    });
+}, 15 * 60_000);
+
+
+// --- MOBILE LIVE P&L TELEGRAM TRACKER (Updates silently every 60s) ---
+let liveTrackerMessageId: number | null = null;
+setInterval(() => {
+  if (currentMarketStatus !== 'LIVE') return;
+
+  const activeList = [...liveActiveTrades.values()];
+  let openBlock = '💤 <i>No open trade right now (Scanning market...)</i>';
+
+  if (activeList.length > 0) {
+    openBlock = activeList.map((t) => {
+      const currentPrice = liveTickerBySymbol.get(t.symbol)?.lastPrice ?? t.entryPrice;
+      const diff = t.decision === 'LONG' ? currentPrice - t.entryPrice : t.entryPrice - currentPrice;
+      const liveR = Number((diff / t.initialRisk).toFixed(2));
+      const emoji = liveR >= 0 ? '🟢' : '🔴';
+      return `${emoji} <b>[${t.tradeId}] ${t.decision} ${t.symbol}</b>\n` +
+             `   • Entry: <code>$${t.entryPrice}</code> ➔ Now: <code>$${currentPrice}</code>\n` +
+             `   • Live PnL: <b>${liveR >= 0 ? '+' : ''}${liveR}R</b> | SL: <code>$${t.stopPrice}</code> | TP: <code>$${t.targetPrice}</code>`;
+    }).join('\n\n');
+  }
+
+  const timeIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const winRate = sessionPerformance.totalTrades > 0
+    ? ((sessionPerformance.wins / sessionPerformance.totalTrades) * 100).toFixed(0)
+    : '0';
+
+  const statusHtml = `📱 <b>FLOWTERMINAL LIVE POCKET MONITOR</b>
+━━━━━━━━━━━━━━━━━━━━
+${openBlock}
+
+📊 <b>Today's Session:</b>
+• Net PnL: <b>${sessionPerformance.netR >= 0 ? '+' : ''}${sessionPerformance.netR.toFixed(2)}R</b> (${sessionPerformance.wins}W - ${sessionPerformance.losses}L | ${winRate}% WR)
+• Feed: <b>${currentMarketStatus}</b> | Auto-Trader: <b>${isAutoTradingEnabled ? 'ON' : 'PAUSED'}</b>
+🕒 <i>Updated: ${timeIst} IST</i>`;
+
+  void sendOrEditLiveStatusMessage(statusHtml, liveTrackerMessageId).then((id) => {
+    if (id) liveTrackerMessageId = id;
+  });
+}, 60_000);

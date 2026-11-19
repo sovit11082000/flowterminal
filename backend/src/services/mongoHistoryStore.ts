@@ -41,6 +41,41 @@ export interface LearnedLessonRecord {
   expiresAt?: Date;
 }
 
+export interface LiveTradeJournalRecord {
+  tradeId: string;
+  symbol: string;
+  side: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopPrice: number;
+  initialRisk: number;
+  targetPrice: number;
+  targetR: number;
+  exitPrice: number;
+  outcome: 'WIN' | 'LOSS';
+  exitKind: 'TARGET' | 'STOP' | 'EARLY_EXIT' | 'SCRATCH_EXIT' | 'TIMEOUT';
+  pnlR: number;
+  barsHeld: number;
+  enteredAt: number;
+  resolvedAt: number;
+  macro1hTrend: string;
+  macro4hTrend: string;
+  strategies: string[];
+  reasons: string[];
+  summary: string;
+  audited: boolean;
+}
+
+export interface SystemAuditLogRecord {
+  auditDateIst: string;
+  tradeId: string;
+  symbol: string;
+  category: 'SL_TOO_TIGHT' | 'STRATEGY_FAILURE' | 'EARLY_EXIT_SAVED' | 'EARLY_EXIT_PREMATURE' | 'WINNING_PATTERN' | 'SYSTEM_ISSUE';
+  problemDetected: string;
+  rootCause: string;
+  recommendedFix: string;
+  createdAt?: Date;
+}
+
 /** MongoDB persistence for records captured after the service connects. */
 export class MongoHistoryStore {
   private readonly client: MongoClient | null;
@@ -51,7 +86,9 @@ export class MongoHistoryStore {
     trades: 'trades',
     orderBooks: 'order_books',
     liquidations: 'liquidations',
-    learnedRules: 'learned_rules'
+    learnedRules: 'learned_rules',
+    tradeJournal: 'live_trade_journal',
+    auditLogs: 'system_audit_logs'
   } as const;
   private lastCapCheckAt = new Map<string, number>();
   private readonly lastOrderBookSavedAt = new Map<string, number>();
@@ -85,7 +122,10 @@ export class MongoHistoryStore {
       this.collection('agent_decisions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.collection('agent_decisions').createIndex({ symbol: 1, timeframe: 1, status: 1, generatedAt: 1 }),
       this.collection('learned_rules' as any).createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
-      this.collection('learned_rules' as any).createIndex({ createdAt: -1 })
+      this.collection('learned_rules' as any).createIndex({ createdAt: -1 }),
+      this.collection('tradeJournal').createIndex({ audited: 1, resolvedAt: 1 }),
+      this.collection('tradeJournal').createIndex({ tradeId: 1 }, { unique: true }),
+      this.collection('auditLogs').createIndex({ createdAt: -1 })
     ]);
     try {
       await this.applyRetentionPolicy();
@@ -161,19 +201,91 @@ export class MongoHistoryStore {
     }
   }
 
-  async getLearnedLessons(limit = 10): Promise<string[]> {
+  async getLearnedLessons(limit = 8): Promise<string[]> {
     if (!this.db) return [];
     try {
-      const docs = await this.collection('learned_rules' as any)
-        .find({ outcome: 'LOSS' })
-        .sort({ createdAt: -1 })
-        .limit(limit)
-        .toArray();
-      return docs.map((d: any) => String(d.lesson)).filter(Boolean);
+      const half = Math.max(2, Math.floor(limit / 2));
+      const [losses, wins] = await Promise.all([
+        this.collection('learned_rules' as any).find({ outcome: 'LOSS' }).sort({ createdAt: -1 }).limit(half).toArray(),
+        this.collection('learned_rules' as any).find({ outcome: 'WIN' }).sort({ createdAt: -1 }).limit(half).toArray()
+      ]);
+      return [
+        ...wins.map((d: any) => `[PROVEN WINNER] ${String(d.lesson)}`).filter(Boolean),
+        ...losses.map((d: any) => `[AVOID LOSS] ${String(d.lesson)}`).filter(Boolean)
+      ];
     } catch (err) {
       console.warn('[MongoDB] Could not load learned lessons:', err instanceof Error ? err.message : err);
       return [];
     }
+  }
+
+  async saveLiveTradeJournal(entry: LiveTradeJournalRecord): Promise<void> {
+    if (!this.db) return;
+    try {
+      await this.collection('tradeJournal').replaceOne(
+        { tradeId: entry.tradeId },
+        { ...entry, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000) },
+        { upsert: true }
+      );
+    } catch (err) {
+      console.warn('[MongoDB] Could not save live trade journal:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  async getRecentLiveTrades(limit = 500): Promise<LiveTradeJournalRecord[]> {
+    if (!this.db) return [];
+    const docs = await this.collection('tradeJournal')
+      .find({})
+      .sort({ resolvedAt: -1 })
+      .limit(limit)
+      .toArray();
+    return docs.map((doc) => this.clean<LiveTradeJournalRecord>(doc));
+  }
+
+  async getLiveTradesSince(sinceResolvedAtMs: number): Promise<LiveTradeJournalRecord[]> {
+    if (!this.db) return [];
+    const docs = await this.collection('tradeJournal')
+      .find({ resolvedAt: { $gte: sinceResolvedAtMs } })
+      .sort({ resolvedAt: 1 })
+      .toArray();
+    return docs.map((doc) => this.clean<LiveTradeJournalRecord>(doc));
+  }
+
+  async getUnauditedTrades(maxResolvedAtMs: number): Promise<LiveTradeJournalRecord[]> {
+    if (!this.db) return [];
+    const docs = await this.collection('tradeJournal')
+      .find({ audited: false, resolvedAt: { $lte: maxResolvedAtMs } })
+      .sort({ resolvedAt: 1 })
+      .limit(100)
+      .toArray();
+    return docs.map((doc) => this.clean<LiveTradeJournalRecord>(doc));
+  }
+
+  async markTradesAudited(tradeIds: string[]): Promise<void> {
+    if (!this.db || !tradeIds.length) return;
+    await this.collection('tradeJournal').updateMany(
+      { tradeId: { $in: tradeIds } },
+      { $set: { audited: true } }
+    );
+  }
+
+  async saveSystemAuditLogs(logs: SystemAuditLogRecord[]): Promise<void> {
+    if (!this.db || !logs.length) return;
+    const now = new Date();
+    await this.collection('auditLogs').insertMany(
+      logs.map((log) => ({ ...log, createdAt: now }))
+    );
+    await this.enforceCap('auditLogs', 2_000);
+  }
+
+  async getSystemAuditLogs(limit = 100): Promise<SystemAuditLogRecord[]> {
+    if (!this.db) return [];
+    const docs = await this.collection('auditLogs')
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+    return docs.map((doc) => this.clean<SystemAuditLogRecord>(doc));
   }
 
   /**

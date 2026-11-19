@@ -12,8 +12,17 @@ export const BYBIT_LINEAR_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
 
 // Phase 1 Target Contract
 export const DEFAULT_SYMBOL = 'BTCUSDT';
-export const SUPPORTED_SYMBOLS = [
+export const CRYPTO_SYMBOLS = [
   'BTCUSDT', 'ETHUSDT', 'SOLUSDT'
+] as const;
+
+export const FOREX_SYMBOLS = [
+  'XAUUSD', 'EURUSD', 'GBPUSD'
+] as const;
+
+export const SUPPORTED_SYMBOLS = [
+  ...CRYPTO_SYMBOLS,
+  ...FOREX_SYMBOLS
 ] as const;
 
 // Heartbeat & Timeout Parameters (Bybit V5 Documented: Ping every 20s)

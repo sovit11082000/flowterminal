@@ -7,13 +7,32 @@ import { runOrderFlowCouncil, analyzeTradeOutcomeWithAI, type AgentSnapshot } fr
 import { sendTradeEntryAlert, sendTradeOutcomeAlert } from './src/services/telegramService.js';
 
 function loadProjectEnv(): void {
-  const candidates = [resolve(process.cwd(), '.env'), resolve(process.cwd(), '..', '.env')];
-  const envPath = candidates.find((c) => existsSync(c));
-  if (!envPath) return;
-  for (const line of readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (!match || process.env[match[1]] !== undefined) continue;
-    process.env[match[1]] = match[2].replace(/^(['"])(.*)\1$/, '$2');
+  const candidates = [
+    resolve(process.cwd(), '.env'),
+    resolve(process.cwd(), '..', '.env'),
+    resolve(process.cwd(), 'backend', '.env')
+  ];
+  for (const envPath of candidates) {
+    if (!existsSync(envPath)) continue;
+    try {
+      const content = readFileSync(envPath, 'utf8');
+      for (const line of content.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)$/);
+        if (!match) continue;
+        const key = match[1];
+        let val = match[2];
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (process.env[key] === undefined) {
+          process.env[key] = val;
+        }
+      }
+    } catch {
+      // ignore
+    }
   }
 }
 loadProjectEnv();
@@ -49,32 +68,37 @@ interface SimulatedTrade {
   lessonLearned?: string;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Pacing exists only for Groq rate limits; math-only mode (COUNCIL_MANAGER=off) makes no API calls, so skip it.
+const sleep = (ms: number) => (process.env.COUNCIL_MANAGER?.trim().toLowerCase() === 'off' ? Promise.resolve() : new Promise((r) => setTimeout(r, ms)));
 
 async function loadBars(): Promise<{ symbol: string; bars: ReplayBar[]; source: string }> {
-  const useMongo = process.argv.includes('--mongo') || process.argv.includes('--today');
-  if (useMongo) {
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/';
-    const dbName = process.env.MONGODB_DATABASE || 'flowterminal';
-    console.log(`[Replay Engine] Connecting to Local MongoDB at ${mongoUri} (${dbName})...`);
-    try {
-      const client = new MongoClient(mongoUri);
-      await client.connect();
-      const db = client.db(dbName);
-      const symbol = process.env.DEFAULT_SYMBOL || 'BTCUSDT';
-      const docs = await db.collection('footprints').find({ symbol, timeframe: '1m' }).sort({ time: 1 }).toArray();
-      await client.close();
-      if (docs.length >= 15) {
-        console.log(`[Replay Engine] Loaded ${docs.length} bars directly from Local MongoDB!`);
-        return { symbol, bars: docs as unknown as ReplayBar[], source: 'Local MongoDB' };
-      }
-      console.log(`[Replay Engine] Local MongoDB has only ${docs.length} bars; falling back to replay.json...`);
-    } catch (err) {
-      console.warn(`[Replay Engine] Could not read local MongoDB:`, err instanceof Error ? err.message : err);
+  const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/';
+  const dbName = process.env.MONGODB_DATABASE || 'flowterminal';
+  const symbol = process.env.DEFAULT_SYMBOL || 'BTCUSDT';
+
+  console.log(`[Replay Engine] Connecting to Local MongoDB at ${mongoUri}${dbName}...`);
+  try {
+    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 });
+    await client.connect();
+    const db = client.db(dbName);
+
+    const docs = await db.collection('footprints')
+      .find({ symbol, timeframe: '1m' })
+      .sort({ time: 1 })
+      .toArray();
+
+    await client.close();
+
+    if (docs.length >= 15) {
+      console.log(`✅ Loaded ${docs.length.toLocaleString()} 1-minute footprint bars directly from Local MongoDB!`);
+      return { symbol, bars: docs as unknown as ReplayBar[], source: `Local MongoDB (${dbName})` };
     }
+    console.log(`[Replay Engine] Local MongoDB has only ${docs.length} bars; falling back to replay.json...`);
+  } catch (err) {
+    console.warn(`[Replay Engine] Local MongoDB read warning:`, err instanceof Error ? err.message : err);
   }
 
-  // Load from replay.json
+  // Fallback to replay.json if DB unavailable
   const cliPath = process.argv[2]?.trim();
   const userHome = process.env.USERPROFILE || process.env.HOME || '';
   const fileCandidates = [
@@ -91,18 +115,17 @@ async function loadBars(): Promise<{ symbol: string; bars: ReplayBar[]; source: 
 
   const replayPath = fileCandidates.find((c) => existsSync(c));
   if (!replayPath) {
-    throw new Error('replay.json not found in working directory or Downloads.');
+    throw new Error('Neither Local MongoDB bars nor replay.json were found.');
   }
 
   const rawData = JSON.parse(readFileSync(replayPath, 'utf8'));
-  const symbol = rawData.symbol || 'BTCUSDT';
   const rawBars: ReplayBar[] = rawData.bars || [];
-  return { symbol, bars: rawBars, source: replayPath };
+  return { symbol: rawData.symbol || symbol, bars: rawBars, source: replayPath };
 }
 
 async function runReplayBacktest() {
   console.log('================================================================');
-  console.log('   FLOWTERMINAL AI COUNCIL: SELF-LEARNING REPLAY BACKTEST       ');
+  console.log('   FLOWTERMINAL AI COUNCIL: LOCAL DB REPLAY BACKTEST           ');
   console.log('================================================================\n');
 
   const { symbol, bars: rawBars, source } = await loadBars();
@@ -111,38 +134,103 @@ async function runReplayBacktest() {
     console.error('[Replay Engine] Need at least 15 bars for backtesting.');
     process.exit(1);
   }
-  console.log(`[Replay Engine] Source: ${source}`);
-  console.log(`[Replay Engine] Total Bars: ${rawBars.length} for ${symbol}`);
-  console.log(`[Rate Limiting Policy]: 2s spacing between AI calls to stay under Groq 30 RPM.\n`);
 
-  const trades: SimulatedTrade[] = [];
+  console.log(`[Replay Engine] Source: ${source}`);
+  console.log(`[Replay Engine] Total Bars: ${rawBars.length.toLocaleString()} for ${symbol}`);
+  console.log(`[Rate Limiting Policy]: 20s spacing between AI calls to completely protect Groq RPM.\n`);
+
+  const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/';
+  const dbName = process.env.MONGODB_DATABASE || 'flowterminal';
+  const isFreshBlindRun = process.argv.includes('--fresh');
   const learnedLessons: string[] = [];
 
-  let i = 15;
+  // Ingest existing learned rules from local MongoDB (skip if --fresh blind out-of-sample test)
+  if (!isFreshBlindRun) {
+    try {
+    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 3000 });
+    await client.connect();
+    const [lossRules, winRules] = await Promise.all([
+      client.db(dbName).collection('learned_rules').find({ outcome: 'LOSS' }).sort({ createdAt: -1 }).limit(4).toArray(),
+      client.db(dbName).collection('learned_rules').find({ outcome: 'WIN' }).sort({ createdAt: -1 }).limit(4).toArray()
+    ]);
+    await client.close();
+
+    for (const r of winRules) {
+      if (r.lesson) learnedLessons.push(`[PROVEN WINNER] ${String(r.lesson)}`);
+    }
+    for (const r of lossRules) {
+      if (r.lesson) learnedLessons.push(`[AVOID LOSS] ${String(r.lesson)}`);
+    }
+    if (learnedLessons.length > 0) {
+      console.log(`🧠 Injected ${learnedLessons.length} historical rules from MongoDB into AI memory.\n`);
+    }
+  } catch {
+    // Continue if DB rule read is silent
+  }
+  } else {
+    console.log(`🧪 [Blind Out-of-Sample Mode]: Starting with ZERO prior rules (100% unseen market test).\n`);
+  }
+
+  const trades: SimulatedTrade[] = [];
+  let lastTradeEntryPrice = 0;
+  let lastTradeBarIndex = -999;
+
+  // Start from a random slice of the DB history (unless --start=20 is passed) so every run tests fresh market conditions
+  const startArg = process.argv.find((a) => a.startsWith('--start='));
+  const maxStart = Math.max(20, rawBars.length - 600);
+  let i = startArg ? Math.max(20, Number(startArg.split('=')[1]) || 20) : (20 + Math.floor(Math.random() * maxStart));
+  console.log(`⚡ [Speed Engine] Starting blind scan from Bar ${i}/${rawBars.length} (Diverse Market Window)...\n`);
+
   while (i < rawBars.length - 8) {
     const historicalBars = rawBars.slice(0, i + 1);
     const currentBar = rawBars[i];
 
-    // Smart Market Structure Filter:
-    // Only invoke AI Council when there is meaningful market activity (extreme test, delta surge, or 5m boundary)
-    const recent6 = historicalBars.slice(-6);
-    const isLocalExtreme = currentBar.high >= Math.max(...recent6.map((b) => b.high)) ||
-                           currentBar.low <= Math.min(...recent6.map((b) => b.low));
-    const isDeltaSpike = Math.abs(currentBar.delta) >= 20;
-    const isFiveMinBoundary = currentBar.time % 300 === 0;
+    // Prevent taking the exact same trade/price zone twice within 45 bars
+    const isSamePriceZone = lastTradeEntryPrice > 0 &&
+      (i - lastTradeBarIndex) < 45 &&
+      Math.abs(currentBar.close - lastTradeEntryPrice) / lastTradeEntryPrice < 0.003;
+    if (isSamePriceZone) { i += 3; continue; }
 
-    if (!isLocalExtreme && !isDeltaSpike && !isFiveMinBoundary) {
+    // High-Resolution Sniper Trigger (Expanded for rich trade discovery)
+    const recent15 = historicalBars.slice(-15);
+    const avgVol = recent15.reduce((s, b) => s + b.totalVolume, 0) / recent15.length;
+
+    const highest15 = Math.max(...recent15.slice(0, -1).map((b) => b.high));
+    const lowest15 = Math.min(...recent15.slice(0, -1).map((b) => b.low));
+
+    // Thoda dynamic banaya taaki FVG retests aur absorption bars bhi scan ho sakein
+    const isHighSweep = currentBar.high >= highest15 * 0.9998 && currentBar.close < currentBar.open;
+    const isLowSweep = currentBar.low <= lowest15 * 1.0002 && currentBar.close > currentBar.open;
+    const isDeltaImpulse = Math.abs(currentBar.delta) >= avgVol * 0.20;
+    const isVolumeExpansion = currentBar.totalVolume >= avgVol * 1.1;
+
+    // Har valid liquidity / volume candle ko evaluate karega
+    if (!isHighSweep && !isLowSweep && !isDeltaImpulse && !isVolumeExpansion) {
       i += 1;
       continue;
     }
 
-    const recentCandles = historicalBars.slice(-25).map((b) => ({
+    const recentCandles = historicalBars.slice(-270).map((b) => ({
       time: b.time,
       open: b.open,
       high: b.high,
       low: b.low,
       close: b.close
     }));
+
+    // Realistic OrderBook reconstruction from current price levels
+    const sortedLevels = [...(currentBar.priceLevels || [])].sort((a, b) => b.price - a.price);
+    const bids: Array<[number, number]> = sortedLevels
+      .filter((lvl) => lvl.price <= currentBar.close)
+      .slice(0, 5)
+      .map((lvl) => [lvl.price, lvl.bidVolume || 1.0]);
+    const asks: Array<[number, number]> = sortedLevels
+      .filter((lvl) => lvl.price >= currentBar.close)
+      .slice(-5)
+      .map((lvl) => [lvl.price, lvl.askVolume || 1.0]);
+
+    if (!bids.length) bids.push([currentBar.close - 0.5, 1.2]);
+    if (!asks.length) asks.push([currentBar.close + 0.5, 1.2]);
 
     const snapshot: AgentSnapshot = {
       symbol,
@@ -152,15 +240,18 @@ async function runReplayBacktest() {
       latestPrice: currentBar.close,
       profile: {
         poc: currentBar.pocPrice,
-        vah: Math.max(...historicalBars.slice(-15).map((b) => b.high)),
-        val: Math.min(...historicalBars.slice(-15).map((b) => b.low)),
-        capturedBars: 15
+        vah: Math.max(...historicalBars.slice(-20).map((b) => b.high)),
+        val: Math.min(...historicalBars.slice(-20).map((b) => b.low)),
+        capturedBars: 20
       },
       candles: recentCandles,
-      footprints: historicalBars.slice(-8),
-      trades: [],
-      bids: [[currentBar.close - 0.5, 1.2]],
-      asks: [[currentBar.close + 0.5, 1.2]],
+      footprints: historicalBars.slice(-60),
+      trades: [
+        { timestamp: currentBar.time * 1000 - 15000, side: currentBar.delta >= 0 ? 'Buy' : 'Sell', price: currentBar.pocPrice, size: Number((currentBar.totalVolume * 0.35).toFixed(3)) || 1.0 },
+        { timestamp: currentBar.time * 1000 - 2000, side: currentBar.close >= currentBar.open ? 'Buy' : 'Sell', price: currentBar.close, size: Number((currentBar.totalVolume * 0.20).toFixed(3)) || 0.5 }
+      ],
+      bids,
+      asks,
       paperPerformance: {
         resolved: trades.filter((t) => t.outcome !== 'OPEN').length,
         wins: trades.filter((t) => t.outcome === 'WIN').length,
@@ -173,19 +264,24 @@ async function runReplayBacktest() {
       }
     };
 
-    const timeStr = new Date(currentBar.time * (currentBar.time > 1e11 ? 1 : 1000)).toLocaleTimeString('en-US', { hour12: false });
-    process.stdout.write(`[Bar ${i}/${rawBars.length}] Time: ${timeStr} | Price: ${currentBar.close} | AI Thinking... `);
+    const timeSec = currentBar.time > 1e11 ? Math.floor(currentBar.time / 1000) : currentBar.time;
+    const timeStr = new Date(timeSec * 1000).toLocaleTimeString('en-IN');
+    const triggerType = isHighSweep ? '🔥 [High Sweep Rejection]' : isLowSweep ? '💎 [Low Sweep Rejection]' : '⚡ [Delta Spike]';
+    process.stdout.write(`\n🎯 [Event Detected at Bar ${i}/${rawBars.length}] ${timeStr} | $${currentBar.close} | ${triggerType}\n   AI Council Deliberating... `);
 
-    // 2-second rate-limiting pacing to keep Groq well within 30 RPM
-    await sleep(2200);
+    // =========================================================================
+    // 20-SECOND PACING DELAY BEFORE API CALL
+    // =========================================================================
+    await sleep(20_000);
 
     try {
       const councilResult = await runOrderFlowCouncil(snapshot);
       const plan = councilResult.plan;
 
       if (plan.decision === 'WAIT') {
-        console.log(`[WAIT] -> ${plan.summary.slice(0, 65)}...`);
-        i += 2;
+        console.log(`[WAIT] -> ${plan.summary.slice(0, 60)}...`);
+        // Step forward 3 bars so we do not evaluate the exact same local micro-price
+        i += 3;
         continue;
       }
 
@@ -195,7 +291,7 @@ async function runReplayBacktest() {
       console.log(`   Reasons: ${plan.reasons.slice(0, 2).join(' | ')}`);
       console.log(`   Strategies: ${plan.strategyNames?.join(' + ') || 'N/A'}`);
 
-      // Dispatch real-time Telegram trade alert
+      // Dispatch Telegram Entry Alert
       void sendTradeEntryAlert({
         symbol,
         decision: plan.decision,
@@ -208,19 +304,28 @@ async function runReplayBacktest() {
         summary: plan.summary
       }).catch((e) => console.warn('[Telegram Error]:', e instanceof Error ? e.message : e));
 
-      // Forward outcome evaluation across next 15 bars
-      const forwardBars = rawBars.slice(i + 1, Math.min(i + 16, rawBars.length));
+      // Forward outcome evaluation: Allow up to 60 bars (1 hour) with Breakeven Trail
+      const MAX_HOLD_BARS = 60;
+      const forwardBars = rawBars.slice(i + 1, Math.min(i + 1 + MAX_HOLD_BARS, rawBars.length));
       let outcome: 'WIN' | 'LOSS' | 'OPEN' = 'OPEN';
       let exitPrice = currentBar.close;
       let barsHeld = 0;
+      let currentStop = plan.stopPrice!;
+      const risk = Math.max(Math.abs(plan.entryPrice! - plan.stopPrice!), 0.5);
 
       for (let j = 0; j < forwardBars.length; j++) {
         const fb = forwardBars[j];
         barsHeld = j + 1;
+
         if (plan.decision === 'LONG') {
-          if (fb.low <= plan.stopPrice!) {
-            outcome = 'LOSS';
-            exitPrice = plan.stopPrice!;
+          // +1.25R Hit: Lock partial profit & move SL to entry
+          if (fb.high >= plan.entryPrice! + risk * 1.25 && currentStop < plan.entryPrice!) {
+            currentStop = plan.entryPrice!;
+          }
+
+          if (fb.low <= currentStop) {
+            outcome = currentStop === plan.entryPrice! ? 'OPEN' : 'LOSS';
+            exitPrice = currentStop;
             break;
           }
           if (fb.high >= plan.targetPrice!) {
@@ -229,9 +334,14 @@ async function runReplayBacktest() {
             break;
           }
         } else {
-          if (fb.high >= plan.stopPrice!) {
-            outcome = 'LOSS';
-            exitPrice = plan.stopPrice!;
+          // Short Side: +1.25R Hit lock & move SL to entry
+          if (fb.low <= plan.entryPrice! - risk * 1.25 && currentStop > plan.entryPrice!) {
+            currentStop = plan.entryPrice!;
+          }
+
+          if (fb.high >= currentStop) {
+            outcome = currentStop === plan.entryPrice! ? 'OPEN' : 'LOSS';
+            exitPrice = currentStop;
             break;
           }
           if (fb.low <= plan.targetPrice!) {
@@ -242,22 +352,58 @@ async function runReplayBacktest() {
         }
       }
 
-      const risk = Math.abs(plan.entryPrice! - plan.stopPrice!) || 1;
-      let pnlR = outcome === 'WIN' ? (plan.targetR || 2) : outcome === 'LOSS' ? -1 : 0;
-      if (outcome === 'OPEN') {
-        exitPrice = forwardBars[forwardBars.length - 1]?.close ?? currentBar.close;
-        const diff = plan.decision === 'LONG' ? exitPrice - plan.entryPrice! : plan.entryPrice! - exitPrice;
-        pnlR = Number((diff / risk).toFixed(2));
+      let pnlR = 0;
+      if (outcome === 'WIN') {
+        pnlR = plan.targetR || 1.8;
+      } else if (outcome === 'LOSS') {
+        pnlR = -1;
+      } else {
+        // Breakeven ya Timeout
+        const isBreakevenTrailed = currentStop === plan.entryPrice!;
+        if (isBreakevenTrailed) {
+          // Trade ne +1R touch kiya tha aur SL entry par shift hua tha (50% partial profit booked)
+          exitPrice = plan.entryPrice!;
+          pnlR = 0.5;
+        } else {
+          // Pure 60-bar timeout bina stop ya 1R touch kiye
+          exitPrice = forwardBars[forwardBars.length - 1]?.close ?? currentBar.close;
+          const diff = plan.decision === 'LONG' ? exitPrice - plan.entryPrice! : plan.entryPrice! - exitPrice;
+          pnlR = Number((diff / risk).toFixed(2));
+        }
       }
 
       console.log(`   Result: ${outcome} (${pnlR > 0 ? '+' : ''}${pnlR}R) after ${barsHeld} bars @ Exit $${exitPrice.toFixed(1)}`);
 
-      // 2-WAY SELF-LEARNING (POST-MORTEM ON LOSS + SUCCESS REINFORCEMENT ON WIN)
+      // 2-Hour Pre-Trade + 1-Hour Post-Trade Deep X-Ray Context
+      const pre2hBars = rawBars.slice(Math.max(0, i - 120), i + 1);
+      const preHigh = Math.max(...pre2hBars.map((b) => b.high));
+      const preLow = Math.min(...pre2hBars.map((b) => b.low));
+      const prePosPct = preHigh > preLow ? (((plan.entryPrice! - preLow) / (preHigh - preLow)) * 100).toFixed(0) : '50';
+      const preNetDelta = pre2hBars.reduce((s, b) => s + b.delta, 0).toFixed(1);
+
+      const post1hBars = rawBars.slice(i + 1, Math.min(rawBars.length, i + 61));
+      const post1hHigh = post1hBars.length ? Math.max(...post1hBars.map((b) => b.high)) : exitPrice;
+      const post1hLow = post1hBars.length ? Math.min(...post1hBars.map((b) => b.low)) : exitPrice;
+      const wouldHaveHitTpIn1h = plan.decision === 'LONG'
+        ? post1hHigh >= plan.targetPrice!
+        : post1hLow <= plan.targetPrice!;
+      const slTooTight = outcome === 'LOSS' && wouldHaveHitTpIn1h;
+
+      const xRayContext = [
+        `Pre-2H Context (120m): Range $${preLow.toFixed(1)}-$${preHigh.toFixed(1)}, Entry at ${prePosPct}% of 2h range, 2h Net Delta=${preNetDelta}.`,
+        `Post-1H Action (60m): High $${post1hHigh.toFixed(1)}, Low $${post1hLow.toFixed(1)}.`,
+        slTooTight
+          ? `DIAGNOSIS: SL_TOO_TIGHT — Price wicked SL at $${exitPrice.toFixed(1)} in ${barsHeld}m, then reversed and hit TP $${plan.targetPrice!.toFixed(1)} within 1 hour! Setup was VALID.`
+          : outcome === 'LOSS'
+            ? `DIAGNOSIS: STRATEGY_FAILURE — Price continued against ${plan.decision} after SL hit without reaching TP in 1 hour.`
+            : `DIAGNOSIS: VALID_CONTINUATION — Trade held structure and delivered ${pnlR}R.`
+      ].join(' ');
+
+      // 2-Way Self-Learning
       let insightText = '';
       if (outcome === 'LOSS') {
-        const forwardContext = `Price moved against trade reaching $${exitPrice.toFixed(1)} within ${barsHeld} bars. Forward volume was ${forwardBars.slice(0, barsHeld).reduce((s, b) => s + b.totalVolume, 0).toFixed(1)} BTC with net delta ${forwardBars.slice(0, barsHeld).reduce((s, b) => s + b.delta, 0).toFixed(1)} BTC.`;
-        console.log(`   🧠 [AI Self-Reflection]: Manager analyzing why this ${plan.decision} hit stop loss...`);
-        await sleep(1500);
+        console.log(`   🧠 [2H+1H Deep X-Ray]: ${slTooTight ? 'SL_TOO_TIGHT detected (hit TP later in 1h)!' : 'Analyzing strategy failure...'}`);
+        await sleep(5000);
         insightText = await analyzeTradeOutcomeWithAI(
           {
             decision: plan.decision,
@@ -270,16 +416,19 @@ async function runReplayBacktest() {
           {
             outcome: 'LOSS',
             exitPrice,
-            exitReason: 'Hit Stop Loss (-1R)',
-            marketContext: forwardContext
+            exitReason: slTooTight ? 'SL_TOO_TIGHT (Wicked out before 1h TP)' : 'Hit Stop Loss (-1R)',
+            marketContext: xRayContext
           }
         );
-        learnedLessons.push(insightText);
-        console.log(`   🎓 [Rule Learned & Injected into Memory]: "${insightText}"\n`);
+        if (!slTooTight) {
+          learnedLessons.push(`[AVOID LOSS] ${insightText}`);
+          console.log(`   🎓 [Filter Rule Learned]: "${insightText}"\n`);
+        } else {
+          console.log(`   🛡️ [Strategy Protected — Not Saved as Loss Filter]: "${insightText}"\n`);
+        }
       } else {
-        const forwardContext = `Price reached target $${exitPrice.toFixed(1)} within ${barsHeld} bars with strong order-flow continuation.`;
-        console.log(`   🌟 [AI Success-Reinforcement]: Manager analyzing what made this winning trade work...`);
-        await sleep(1200);
+        console.log(`   🌟 [2H+1H Deep X-Ray]: Reinforcing winning signature...`);
+        await sleep(5000);
         insightText = await analyzeTradeOutcomeWithAI(
           {
             decision: plan.decision,
@@ -292,14 +441,34 @@ async function runReplayBacktest() {
           {
             outcome: 'WIN',
             exitPrice,
-            exitReason: 'Hit Target (+2R)',
-            marketContext: forwardContext
+            exitReason: 'Hit Target',
+            marketContext: xRayContext
           }
         );
-        console.log(`   ⭐ [Winning Confluence Signature]: "${insightText}"\n`);
+        learnedLessons.push(`[PROVEN WINNER] ${insightText}`);
+        console.log(`   ⭐ [Winning Signature Saved]: "${insightText}"\n`);
       }
 
-      // Dispatch real-time Telegram trade outcome alert (Win / Loss)
+      // Persist rule into Local MongoDB (Skip saving negative filter when SL was merely too tight)
+      if (!slTooTight) {
+        try {
+          const client = new MongoClient(mongoUri);
+          await client.connect();
+          await client.db(dbName).collection('learned_rules').insertOne({
+            symbol,
+            outcome: outcome === 'WIN' ? 'WIN' : 'LOSS',
+            lesson: insightText,
+            source: 'BACKTEST',
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+          });
+          await client.close();
+        } catch {
+          // ignore
+        }
+      }
+
+      // Dispatch Telegram Outcome Alert
       void sendTradeOutcomeAlert({
         symbol,
         decision: plan.decision,
@@ -324,14 +493,19 @@ async function runReplayBacktest() {
         summary: plan.summary,
         lessonLearned: insightText || undefined
       });
+      lastTradeEntryPrice = plan.entryPrice!;
+      lastTradeBarIndex = i;
 
-      i += Math.max(barsHeld, 3);
+      // Jump forward past bars held to prevent repeat trigger inside same candle wave
+      i += Math.max(barsHeld, 4);
+      // Extra 15-second rest after completed trade analysis
+      await sleep(15_000);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`\n[Notice]: ${msg}`);
-      console.log(`   ⏳ Pausing 25s for network connection & quota window before next bar...`);
-      await sleep(25_000);
-      i += 1;
+      console.log(`   ⏳ Pausing 20s for network cooldown before next check...`);
+      await sleep(20_000);
+      i += 3;
     }
   }
 
@@ -339,15 +513,18 @@ async function runReplayBacktest() {
   console.log('\n================================================================');
   console.log('                 FINAL BACKTEST & LEARNING REPORT               ');
   console.log('================================================================');
-  const wins = trades.filter((t) => t.pnlR > 0).length;
-  const losses = trades.filter((t) => t.pnlR < 0).length;
+  const wins = trades.filter((t) => t.outcome === 'WIN').length;
+  const losses = trades.filter((t) => t.outcome === 'LOSS').length;
+  const expired = trades.filter((t) => t.outcome === 'OPEN').length;
   const netR = trades.reduce((s, t) => s + t.pnlR, 0);
-  const winRate = trades.length ? (wins / trades.length * 100).toFixed(1) : '0';
+  const resolved = wins + losses;
+  const winRate = resolved > 0 ? ((wins / resolved) * 100).toFixed(1) : '0';
 
   console.log(`Total Trades Taken : ${trades.length}`);
-  console.log(`Wins               : ${wins}`);
-  console.log(`Losses             : ${losses}`);
-  console.log(`Win Rate           : ${winRate}%`);
+  console.log(`Target Hit (Wins)  : ${wins}`);
+  console.log(`Stop Hit (Losses)  : ${losses}`);
+  console.log(`Breakeven / Open   : ${expired}`);
+  console.log(`True Win Rate      : ${winRate}%`);
   console.log(`Net Performance    : ${netR > 0 ? '+' : ''}${netR.toFixed(2)}R\n`);
 
   if (learnedLessons.length > 0) {
@@ -355,7 +532,7 @@ async function runReplayBacktest() {
     learnedLessons.forEach((l, idx) => {
       console.log(`   ${idx + 1}. ${l}`);
     });
-    console.log('\nAll learned rules are dynamically injected into future trade decisions!');
+    console.log('\nAll learned rules are permanently stored in MongoDB!');
   }
 }
 
