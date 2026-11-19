@@ -863,11 +863,16 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     return { blocked: `Data quality gate: market feed stale (${staleSec}s since last trade).`, permitted: none, denied: {} };
   }
 
-  // 2. Account-Level Risk Circuit Breaker (Daily Loss / Consecutive Loss Guard)
+  // 2. Account-Level Risk Circuit Breaker (45-min cooldown after 3 consecutive losses, not permanent day lock)
   const recentTrades = snapshot.paperPerformance?.recent ?? [];
   const lastThree = recentTrades.slice(-3);
   if (lastThree.length === 3 && lastThree.every((t) => t.outcome === 'LOSS')) {
-    return { blocked: 'Risk circuit breaker: 3 consecutive losses recorded; pausing new entries until regime resets.', permitted: none, denied: {} };
+    const lastLossAt = (lastThree[2] as { resolvedAt?: number }).resolvedAt ?? 0;
+    const elapsedMin = lastLossAt > 0 ? (Date.now() - lastLossAt) / 60_000 : 999;
+    if (elapsedMin < 45) {
+      const waitMin = Math.ceil(45 - elapsedMin);
+      return { blocked: `Risk circuit breaker: 3 consecutive losses; cooling down for ${waitMin}m more.`, permitted: none, denied: {} };
+    }
   }
   const recentNetR = recentTrades.reduce((sum, t) => sum + t.pnlR, 0);
   if (recentNetR <= -cfg.maxDailyLossR) {
@@ -884,11 +889,9 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const sweep = derived.sweepReclaim ?? detectSweepReclaim(snapshot.candles, derived);
   const absorption = derived.orderFlowSummary?.absorptionSignal ?? 'NONE';
   const isChopRegime = derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop;
-  const hasChopLong = sweep.long || absorption === 'BULLISH_ABSORPTION';
-  const hasChopShort = sweep.short || absorption === 'BEARISH_ABSORPTION';
 
-  if (isChopRegime && !hasChopLong && !hasChopShort) {
-    return { blocked: 'CHOP_COMPRESSION: volume is below baseline and range is compressed (no sweep or absorption); standing aside.', permitted: none, denied: {} };
+  if (isChopRegime) {
+    return { blocked: 'CHOP_COMPRESSION: sideways/low-volume market detected; standing aside completely.', permitted: none, denied: {} };
   }
 
   const sweptLevels = sweep.levels ?? [];
@@ -896,13 +899,6 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH');
 
   const denied: Partial<Record<Direction, string>> = {};
-
-  if (isChopRegime && !hasChopLong) {
-    denied.LONG = 'CHOP_COMPRESSION: LONG blocked without bullish sweep or bullish absorption.';
-  }
-  if (isChopRegime && !hasChopShort) {
-    denied.SHORT = 'CHOP_COMPRESSION: SHORT blocked without bearish sweep or bearish absorption.';
-  }
 
   const activityScan = scanMarketActivity(snapshot);
   const is15mBullish = activityScan.structure15m === 'UPTREND_STRUCTURE' || activityScan.structure15m === 'DIP_IN_UPTREND';
@@ -950,6 +946,14 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   }
   if (activityScan.blockedDirection === 'SHORT' && !denied.SHORT) {
     denied.SHORT = activityScan.blockReason ?? 'Blocked by Pre-Trade Market Activity Scanner.';
+  }
+
+  // Hard 1H Macro Trend Guard (prevents counter-1H entries without major HTF sweep + delta flip)
+  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !(hasMajorSweepLong && recent15Delta > 0)) {
+    denied.LONG = 'Macro 1H trend is BEARISH; LONG blocked without major PDL/PWL sweep + positive 15m delta.';
+  }
+  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !(hasMajorSweepShort && recent15Delta < 0)) {
+    denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without major PDH/PWH sweep + negative 15m delta.';
   }
 
   const permitted = (['LONG', 'SHORT'] as Direction[]).filter((dir) => !denied[dir]);
@@ -1699,13 +1703,19 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
 // Post-trade learning
 // ===========================================================================
 export function cleanLesson(text: string): string {
-  return text
+  const cleaned = text
     .replace(/[\u0000-\u001f]+/g, ' ')
     .replace(/^["'`\s]+|["'`\s]+$/g, '')
     .replace(/\$?\d[\d,]{3,}(?:\.\d+)?/g, 'the level')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 220);
+
+  // Never allow blanket strategy/symbol bans from a single loss
+  if (/\b(never\s+trade|ban\s+|disable\s+|stop\s+using|avoid\s+all)\b/i.test(cleaned)) {
+    return '';
+  }
+  return cleaned;
 }
 
 export async function analyzeTradeOutcomeWithAI(
@@ -1795,7 +1805,12 @@ function getAuditProviderConfigs(): ProviderConfig[] {
     });
   }
 
-  return configured.length > 0 ? configured : getProviderConfigs('manager');
+  for (const fallback of getProviderConfigs('manager')) {
+    if (!configured.some((c) => c.provider === fallback.provider && c.key === fallback.key)) {
+      configured.push(fallback);
+    }
+  }
+  return configured;
 }
 
 export interface AuditTradeInput {

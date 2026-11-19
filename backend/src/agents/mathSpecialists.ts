@@ -97,15 +97,10 @@ function finalize(input: FinalizeInput): SpecialistReport {
     }
   }
 
-  // P0 Fix: Allow BOTH sweep AND key-level absorption setups in compression/chop (capped at strength 1)
-  const hasDerivedSweep = dir === 'LONG' ? !!derived.sweepReclaim?.long : !!derived.sweepReclaim?.short;
-  const chopExceptionOk = hasDerivedSweep || hasSweepOrAbsorptionEvidence;
-  if ((derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop) && !chopExceptionOk) {
-    if (strength > 0) concerns.push('Chop/compression regime without sweep or absorption: standing aside.');
+  // P0 Fix: Strictly stand aside in CHOP_COMPRESSION / low-volume sideways markets
+  if (derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop) {
+    if (strength > 0) concerns.push('Sideways/Chop regime detected: standing aside completely.');
     strength = 0;
-  } else if ((derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop) && chopExceptionOk) {
-    strength = Math.min(strength, 1);
-    concerns.push('Chop regime sweep/absorption setup: strength restricted to 1.');
   }
 
   const bias: SpecialistReport['bias'] = dir && strength > 0 ? dir : 'NEUTRAL';

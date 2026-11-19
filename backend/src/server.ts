@@ -339,6 +339,7 @@ interface LiveActiveTrade {
 
 const liveActiveTrades = new Map<string, LiveActiveTrade>();
 const symbolCooldownUntil = new Map<string, number>();
+const lastSlDirectionBySymbol = new Map<string, { side: 'LONG' | 'SHORT'; at: number }>();
 const liveLearnedLessons: string[] = [];
 
 // IST Calendar-Day Persistent Trade History (Survives restarts via MongoDB reload)
@@ -351,13 +352,13 @@ interface TodayResolvedRecord {
 }
 const todayIstResolvedResults: TodayResolvedRecord[] = [];
 
-function getTodayIstResults(): Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }> {
+function getTodayIstResults(): Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number; resolvedAt: number }> {
   const today = istDayString();
   // Prune any previous IST day entries
   while (todayIstResolvedResults.length && todayIstResolvedResults[0].istDay !== today) {
     todayIstResolvedResults.shift();
   }
-  return todayIstResolvedResults.map(({ side, outcome, pnlR }) => ({ side, outcome, pnlR }));
+  return todayIstResolvedResults.map(({ side, outcome, pnlR, resolvedAt }) => ({ side, outcome, pnlR, resolvedAt }));
 }
 
 async function hydrateTodayIstResultsFromMongo(): Promise<void> {
@@ -1146,7 +1147,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
   const bookStatus = pipeline.orderBook.getStatus();
   const isOrderBookSafe = !isCrypto || bookStatus.isSynchronized;
 
-  // 1. Check open paper position for this specific symbol (0 API calls)
+  // 1. Smart Active Trade Management (0 API calls: Breakeven at 1.2R + Runner Protection + Confirmed Reversal Exit)
   const currentTrade = liveActiveTrades.get(symbol);
   if (currentTrade) {
     currentTrade.barsHeld += 1;
@@ -1163,13 +1164,17 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       ? (bar.high - currentTrade.entryPrice) / initialRisk
       : (currentTrade.entryPrice - bar.low) / initialRisk;
 
+    const beLocked = isLong
+      ? currentTrade.stopPrice >= currentTrade.entryPrice + initialRisk * 0.10
+      : currentTrade.stopPrice <= currentTrade.entryPrice - initialRisk * 0.10;
+
     if (isLong) {
-      if (currentTrade.targetR >= 2.5 && peakR >= 2.4 && currentTrade.stopPrice < currentTrade.entryPrice + initialRisk * 1.0) {
+      if (currentTrade.targetR >= 2.2 && peakR >= 2.1 && currentTrade.stopPrice < currentTrade.entryPrice + initialRisk * 1.0) {
         currentTrade.stopPrice = currentTrade.entryPrice + initialRisk * 1.0;
-        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.4R -> SL moved up to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
-      } else if (peakR >= 1.5 && currentTrade.stopPrice < currentTrade.entryPrice + initialRisk * 0.15) {
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.1R -> SL moved up to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
+      } else if (peakR >= 1.2 && !beLocked) {
         currentTrade.stopPrice = currentTrade.entryPrice + initialRisk * 0.15;
-        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.5R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.2R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
       }
 
       if (bar.low <= currentTrade.stopPrice) {
@@ -1183,12 +1188,12 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         exitKind = 'TARGET';
       }
     } else {
-      if (currentTrade.targetR >= 2.5 && peakR >= 2.4 && currentTrade.stopPrice > currentTrade.entryPrice - initialRisk * 1.0) {
+      if (currentTrade.targetR >= 2.2 && peakR >= 2.1 && currentTrade.stopPrice > currentTrade.entryPrice - initialRisk * 1.0) {
         currentTrade.stopPrice = currentTrade.entryPrice - initialRisk * 1.0;
-        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.4R -> SL moved down to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
-      } else if (peakR >= 1.5 && currentTrade.stopPrice > currentTrade.entryPrice - initialRisk * 0.15) {
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 2.1R -> SL moved down to +1.0R ($${currentTrade.stopPrice.toFixed(4)})`);
+      } else if (peakR >= 1.2 && !beLocked) {
         currentTrade.stopPrice = currentTrade.entryPrice - initialRisk * 0.15;
-        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.5R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
+        console.log(`[Trailing SL] [${currentTrade.tradeId}] ${symbol} hit 1.2R -> SL moved to Breakeven +0.15R ($${currentTrade.stopPrice.toFixed(4)})`);
       }
 
       if (bar.high >= currentTrade.stopPrice) {
@@ -1203,11 +1208,28 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       }
     }
 
-    const macroNow = macroTrendCache.get(symbol);
-    const htfAligned = (isLong && macroNow?.trend1h === 'BULLISH') || (!isLong && macroNow?.trend1h === 'BEARISH');
-    const maxHoldBars = (currentR > 0.25 && htfAligned) ? 90 : 60;
+    // Confirmed Reversal Guard (ONLY after 1.1R+ profit so normal pullbacks never get cut prematurely)
+    if (outcome === 'OPEN' && currentR >= 1.1) {
+      const recent4 = pipeline.footprints['1m'].getRecentBars(4);
+      if (recent4.length === 4) {
+        const prev3 = recent4.slice(0, 3);
+        const avgVol4 = recent4.reduce((s, b) => s + b.totalVolume, 0) / 4;
+        const brokeDown = isLong && bar.close < Math.min(...prev3.map((b) => b.low)) && bar.delta < -avgVol4 * 0.30;
+        const brokeUp = !isLong && bar.close > Math.max(...prev3.map((b) => b.high)) && bar.delta > avgVol4 * 0.30;
+        if (brokeDown || brokeUp) {
+          outcome = 'WIN';
+          exitPrice = bar.close;
+          exitKind = 'EARLY_EXIT';
+          console.log(`[Reversal Guard] [${currentTrade.tradeId}] ${symbol} structure broke after +1.1R -> Locking profit @ $${exitPrice}`);
+        }
+      }
+    }
 
-    if (outcome !== 'OPEN' || currentTrade.barsHeld >= maxHoldBars) {
+    // Never timeout a protected runner (beLocked or currentR >= 0.8R); only expire stagnant trades after 60m
+    const isProtectedRunner = beLocked || currentR >= 0.8;
+    const isStagnantTimeout = !isProtectedRunner && currentTrade.barsHeld >= 60;
+
+    if (outcome !== 'OPEN' || isStagnantTimeout) {
       const diff = isLong ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
       const rawR = diff / initialRisk;
       const feeSlippageR = 0.05; // Realistic round-trip maker/taker fee + spread slippage deduction
@@ -1220,7 +1242,11 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
 
       const resolvedIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
       if (resolvedOutcome === 'LOSS' && finalExitKind === 'STOP') {
-        symbolCooldownUntil.set(symbol, Date.now() + 5 * 60_000);
+        symbolCooldownUntil.set(symbol, Date.now() + 10 * 60_000);
+        lastSlDirectionBySymbol.set(symbol, { side: finishedTrade.decision, at: Date.now() });
+        macroTrendCache.delete(symbol);
+      } else if (resolvedOutcome === 'WIN') {
+        lastSlDirectionBySymbol.delete(symbol);
       }
 
       sessionPerformance.totalTrades += 1;
@@ -1395,6 +1421,11 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       const checkIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
       const activeSignals = councilResult.reports.map((r) => `${r.agentId}:${r.bias}/${r.strength}`).join(' ');
       console.log(`[${checkIst}] [Manager Check] ${symbol} | 15m/5m [${activeSignals}] -> Decision: ${plan.decision} (${plan.summary})`);
+      const prevSl = lastSlDirectionBySymbol.get(symbol);
+      if (plan.decision !== 'WAIT' && prevSl && prevSl.side === plan.decision && (Date.now() - prevSl.at) < 45 * 60_000) {
+        console.log(`[${checkIst}] [Anti-Revenge Block] ${symbol} ${plan.decision} blocked (same direction hit SL ${Math.round((Date.now() - prevSl.at) / 60_000)}m ago).`);
+        return;
+      }
       if (plan.decision !== 'WAIT') {
         const generatedTradeId = `#${symbol.replace('USDT', '')}-${Date.now().toString().slice(-4)}`;
         const riskInfo = plan.riskAllocation
