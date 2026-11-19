@@ -1225,9 +1225,10 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       }
     }
 
-    // Never timeout a protected runner (beLocked or currentR >= 0.8R); only expire stagnant trades after 60m
-    const isProtectedRunner = beLocked || currentR >= 0.8;
-    const isStagnantTimeout = !isProtectedRunner && currentTrade.barsHeld >= 60;
+    // Never cut winning runners early: let profitable trades (beLocked or currentR > 0.15R) run up to 180m; close flat/losing trades after 75m
+    const isProfitableRunner = beLocked || currentR > 0.15;
+    const maxAllowedBars = isProfitableRunner ? 180 : 75;
+    const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars;
 
     if (outcome !== 'OPEN' || isStagnantTimeout) {
       const diff = isLong ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;

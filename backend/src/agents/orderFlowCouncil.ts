@@ -929,8 +929,25 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
   } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
     denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
-  } else if (!macroBullish && recent15Delta <= 0 && rangePosPct !== null && rangePosPct > 78) {
-    denied.LONG = `Top chasing blocked: price at ${rangePosPct.toFixed(0)}% of 4.5h range without bullish 15m delta.`;
+  } else if (rangePosPct !== null && rangePosPct > 75 && !hasMajorSweepLong) {
+    denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range; wait for pullback to FVG/OB.`;
+  }
+
+  // Short-term 30-bar extension check: never buy the top of a vertical rally or sell the bottom of a dump
+  const shortWindow = snapshot.candles.slice(-30);
+  if (shortWindow.length >= 15 && lastPrice !== null) {
+    const sHigh = Math.max(...shortWindow.map((c) => c.high));
+    const sLow = Math.min(...shortWindow.map((c) => c.low));
+    const sSpan = sHigh - sLow;
+    if (sSpan > 0) {
+      const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
+      if (shortPosPct > 80 && !denied.LONG) {
+        denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
+      }
+      if (shortPosPct < 20 && !denied.SHORT) {
+        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
+      }
+    }
   }
 
   if (macroBullish && !hasReversalTriggerShort) {
