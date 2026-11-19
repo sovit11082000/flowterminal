@@ -439,14 +439,13 @@ export function detectSidewaysMarket(
   }
 
   const isQuietSession = activeSession === 'ASIA' || activeSession === 'OFF_HOURS' || activeSession === 'NY_LUNCH';
-  const isTightSessionGrind = isQuietSession && rangePct < 0.30;
-  const isDeadRangeAnySession = rangePct < 0.20;
+  const isTightSessionGrind = isQuietSession && rangePct < 0.22 && efficiencyRatio < 0.11;
+  const isDeadRangeAnySession = rangePct < 0.15;
   const isChop =
     isTightSessionGrind ||
     isDeadRangeAnySession ||
-    (chopIndex >= 66.0 && efficiencyRatio < 0.14) ||
-    efficiencyRatio < 0.10 ||
-    (pocOverlap && chopIndex >= 63.0);
+    (chopIndex >= 68.5 && efficiencyRatio < 0.09) ||
+    efficiencyRatio < 0.075;
 
   const reason = isChop
     ? `Sideways Regime (${windowSize}m Range: ${rangePct.toFixed(2)}%, Session: ${activeSession}, ChopIndex: ${chopIndex.toFixed(1)}, ER: ${efficiencyRatio.toFixed(2)})`
@@ -965,12 +964,16 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = activityScan.blockReason ?? 'Blocked by Pre-Trade Market Activity Scanner.';
   }
 
-  // Hard 1H Macro Trend Guard (prevents counter-1H entries without major HTF sweep + delta flip)
-  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !(hasMajorSweepLong && recent15Delta > 0)) {
-    denied.LONG = 'Macro 1H trend is BEARISH; LONG blocked without major PDL/PWL sweep + positive 15m delta.';
+  // 1H Macro Trend Guard: allow early reversal if price broke EMA50 with matching 15m delta & sweep/rejection
+  const emaAlign = derived.independentContext?.emaAlignment ?? 'MIXED_CROSSOVER';
+  const earlyBullFlip = emaAlign === 'BULLISH_ABOVE_50_200' && recent15Delta > 0 && (sweep.long || absorption === 'BULLISH_ABSORPTION');
+  const earlyBearFlip = emaAlign === 'BEARISH_BELOW_50_200' && recent15Delta < 0 && (sweep.short || absorption === 'BEARISH_ABSORPTION');
+
+  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !(hasMajorSweepLong && recent15Delta > 0)) {
+    denied.LONG = 'Macro 1H trend is BEARISH; LONG blocked without EMA50 reclaim + sweep/delta flip.';
   }
-  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !(hasMajorSweepShort && recent15Delta < 0)) {
-    denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without major PDH/PWH sweep + negative 15m delta.';
+  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !(hasMajorSweepShort && recent15Delta < 0)) {
+    denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without EMA50 breakdown + sweep/delta flip.';
   }
 
   const permitted = (['LONG', 'SHORT'] as Direction[]).filter((dir) => !denied[dir]);
