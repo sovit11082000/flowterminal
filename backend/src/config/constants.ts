@@ -8,7 +8,7 @@
 
 // Official Bybit V5 Public Linear WebSocket Endpoint
 
-export const BYBIT_LINEAR_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
+export const BYBIT_LINEAR_WS_URL = process.env.BYBIT_WS_URL?.trim() || 'wss://stream.bytick.com/v5/public/linear';
 
 // Phase 1 Target Contract
 export const DEFAULT_SYMBOL = 'BTCUSDT';
