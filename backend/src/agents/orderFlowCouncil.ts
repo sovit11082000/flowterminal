@@ -865,7 +865,7 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   if (snapshot.lastTradeAt === null || !Number.isFinite(snapshot.lastTradeAt)) {
     return { blocked: 'Data quality gate: missing lastTradeAt market timestamp.', permitted: none, denied: {} };
   }
-  if (Date.now() - snapshot.lastTradeAt > 30_000) {
+  if (Date.now() - snapshot.lastTradeAt > 120_000) {
     const staleSec = Math.round((Date.now() - snapshot.lastTradeAt) / 1000);
     return { blocked: `Data quality gate: market feed stale (${staleSec}s since last trade).`, permitted: none, denied: {} };
   }
@@ -948,10 +948,10 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      if (shortPosPct > 90 && !denied.LONG) {
+      if (shortPosPct > 97 && !denied.LONG) {
         denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
       }
-      if (shortPosPct < 10 && !denied.SHORT) {
+      if (shortPosPct < 3 && !denied.SHORT) {
         denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
       }
     }
@@ -1540,7 +1540,7 @@ export function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], sn
     'SMC09', 'SMC10', 'SMC11', 'SMC12', 'SMC13', 'SMC14', 'SMC15', 'SMC17',
     'ICT01', 'ICT02', 'ICT03', 'ICT04', 'ICT05', 'ICT06', 'ICT11', 'ICT12',
     'ICT13', 'ICT14', 'ICT15', 'ICT16', 'ICT19',
-    'OF01', 'OF02', 'OF03', 'OF04', 'OF13', 'OF14', 'OF21', 'OF23'
+    'OF01', 'OF02', 'OF03', 'OF04', 'OF13', 'OF14', 'OF21', 'OF23', 'OF24', 'OF25', 'OF26', 'OF27'
   ];
   const hasAPlusTrigger = aPlusTriggers.some((id) => eligibleCandidates.has(id));
   if (!hasAPlusTrigger) {
