@@ -206,7 +206,7 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   const staleErr = validateSnapshotData(snapshot);
   if (staleErr) return insufficient('smc', staleErr);
 
-  const candles = snapshot.candles;
+  const candles = (snapshot.candles5m && snapshot.candles5m.length >= 20) ? snapshot.candles5m : snapshot.candles;
   const n = candles.length;
   if (n < 12) return insufficient('smc', `Only ${n} candles supplied (need 12).`);
 
@@ -520,7 +520,7 @@ export function ictMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   const staleErr = validateSnapshotData(snapshot);
   if (staleErr) return insufficient('ict', staleErr);
 
-  const candles = snapshot.candles;
+  const candles = (snapshot.candles5m && snapshot.candles5m.length >= 20) ? snapshot.candles5m : snapshot.candles;
   const n = candles.length;
   if (n < 12) return insufficient('ict', `Only ${n} candles supplied (need 12).`);
   const last = candles[n - 1];
