@@ -6,3 +6,7 @@ data/*.jsonl
 backend/data/*.jsonl
 
 backend/check_*.ts
+
+.env
+backend/.env
+*.env
