@@ -936,7 +936,7 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
   } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
     denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
-  } else if (rangePosPct !== null && rangePosPct > 75 && !hasMajorSweepLong) {
+  } else if (rangePosPct !== null && rangePosPct > 92 && !hasMajorSweepLong) {
     denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range; wait for pullback to FVG/OB.`;
   }
 
@@ -961,7 +961,7 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = `Intraday 15m/5m trend is BULLISH (${activityScan.structure15m}); SHORTs blocked unless sweep-rejection or absorption occurs.`;
   } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0) {
     denied.SHORT = `Counter-trend SHORT blocked: 15m/5m BULLISH and both 60m (+${fpNetDelta.toFixed(1)}) and 15m (+${recent15Delta.toFixed(1)}) delta remain positive.`;
-  } else if (!macroBearish && recent15Delta >= 0 && rangePosPct !== null && rangePosPct < 22) {
+  } else if (!macroBearish && recent15Delta >= 0 && rangePosPct !== null && rangePosPct < 8) {
     denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of 4.5h range without bearish 15m delta.`;
   }
 

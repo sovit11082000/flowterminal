@@ -22,8 +22,8 @@ export async function runNightlyAuditCycle(
 
 
 
-  // Audit any trade resolved at least 65 minutes ago so full 1h post-trade price action is available
-  const cutoffMs = options?.forceAllRecent ? Date.now() : Date.now() - 65 * 60_000;
+  // Always require at least 65 minutes after trade exit so full 1h post-trade follow-through is finalized
+  const cutoffMs = Date.now() - 65 * 60_000;
   const rawTrades = await mongoHistory.getUnauditedTrades(cutoffMs);
 
   // Double-lock: Check existing audit logs so an already-audited tradeId is NEVER re-audited
@@ -138,17 +138,11 @@ export async function runNightlyAuditCycle(
       await mongoHistory.markTradesAudited([singleTrade.tradeId]);
       savedLogs.push(logRecord);
 
+      // Keep audit purely diagnostic so LLM-generated rules never block valid live setups
       if (item.category === 'STRATEGY_FAILURE' && item.verifiedRuleToSave) {
         const clean = cleanLesson(item.verifiedRuleToSave);
         if (clean) {
-          await mongoHistory.saveLearnedLesson({
-            symbol: item.symbol,
-            outcome: 'LOSS',
-            lesson: clean,
-            source: 'LIVE'
-          });
           newRules.push(clean);
-          options?.onNewRule?.(clean);
           newRulesCount += 1;
         }
       }
