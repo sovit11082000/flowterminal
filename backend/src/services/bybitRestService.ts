@@ -329,32 +329,45 @@ export class BybitRestService {
     endMs: number,
     limit: number
   ): Promise<HistoryFetchResult> {
+    const fsym = symbol.replace(/USDT$/i, '');
+    const endpointMap: Record<CandleTimeframe, { path: string; aggregate: number }> = {
+      '1m': { path: 'histominute', aggregate: 1 },
+      '3m': { path: 'histominute', aggregate: 3 },
+      '5m': { path: 'histominute', aggregate: 5 },
+      '15m': { path: 'histominute', aggregate: 15 },
+      '30m': { path: 'histominute', aggregate: 30 },
+      '1h': { path: 'histohour', aggregate: 1 },
+      '4h': { path: 'histohour', aggregate: 4 },
+      '1d': { path: 'histoday', aggregate: 1 }
+    };
+    const spec = endpointMap[timeframe];
     const query = new URLSearchParams({
-      symbol,
-      interval: timeframe,
-      startTime: String(startMs),
-      endTime: String(endMs),
-      limit: String(Math.min(limit, 1000))
+      fsym,
+      tsym: 'USDT',
+      limit: String(Math.min(limit, 300)),
+      aggregate: String(spec.aggregate),
+      toTs: String(Math.floor(endMs / 1000))
     });
-    const res = await this.fetchFn(`https://fapi.binance.com/fapi/v1/klines?${query.toString()}`, {
+    const res = await this.fetchFn(`https://min-api.cryptocompare.com/data/v2/${spec.path}?${query.toString()}`, {
       method: 'GET',
       headers: { Accept: 'application/json' }
     });
     if (!res.ok) {
-      throw new BybitRestServiceError(`Binance fallback HTTP error: ${res.status}`, 'HTTP_ERROR', res.status);
+      throw new BybitRestServiceError(`CryptoCompare fallback HTTP error: ${res.status}`, 'HTTP_ERROR', res.status);
     }
-    const rawRows = (await res.json()) as unknown[][];
+    const payload = (await res.json()) as { Data?: { Data?: Array<{ time: number; open: number; high: number; low: number; close: number; volumefrom?: number; volumeto?: number }> } };
+    const rawRows = Array.isArray(payload?.Data?.Data) ? payload.Data.Data : [];
     const candles: HistoricalCandle[] = [];
-    for (const r of Array.isArray(rawRows) ? rawRows : []) {
-      const tMs = Number(r[0]);
-      const open = Number(r[1]);
-      const high = Number(r[2]);
-      const low = Number(r[3]);
-      const close = Number(r[4]);
-      const volume = Number(r[5]);
-      const turnover = Number(r[7] ?? 0);
-      if ([tMs, open, high, low, close].every(Number.isFinite) && open > 0 && high > 0 && low > 0 && close > 0) {
-        candles.push({ symbol, timeframe, time: Math.floor(tMs / 1000), open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+    for (const r of rawRows) {
+      const tSec = Number(r.time);
+      const open = Number(r.open);
+      const high = Number(r.high);
+      const low = Number(r.low);
+      const close = Number(r.close);
+      const volume = Number(r.volumefrom ?? 0);
+      const turnover = Number(r.volumeto ?? 0);
+      if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
+        candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
       }
     }
     candles.sort((a, b) => a.time - b.time);
