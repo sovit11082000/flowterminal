@@ -206,7 +206,15 @@ export class BybitRestService {
       });
 
       const url = `${this.baseUrl}/v5/market/kline?${queryParams.toString()}`;
-      const responseData = await this.executeFetchWithRetry(url);
+      let responseData: BybitKlineResponseRaw;
+      try {
+        responseData = await this.executeFetchWithRetry(url);
+      } catch (err) {
+        if (err instanceof BybitRestServiceError && (err.status === 403 || err.code === 'HTTP_ERROR')) {
+          return await this.fetchBinanceFuturesFallback(symbol, timeframe, startMs, endMs, limitPerPage);
+        }
+        throw err;
+      }
 
       if (!responseData.result || typeof responseData.result !== 'object') {
         throw new BybitRestServiceError('Bybit response is missing the required "result" container.', 'MALFORMED_RESPONSE');
@@ -310,6 +318,61 @@ export class BybitRestService {
         hasCorruptRows,
         isComplete,
         terminationReason
+      }
+    };
+  }
+
+  private async fetchBinanceFuturesFallback(
+    symbol: string,
+    timeframe: CandleTimeframe,
+    startMs: number,
+    endMs: number,
+    limit: number
+  ): Promise<HistoryFetchResult> {
+    const query = new URLSearchParams({
+      symbol,
+      interval: timeframe,
+      startTime: String(startMs),
+      endTime: String(endMs),
+      limit: String(Math.min(limit, 1000))
+    });
+    const res = await this.fetchFn(`https://fapi.binance.com/fapi/v1/klines?${query.toString()}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' }
+    });
+    if (!res.ok) {
+      throw new BybitRestServiceError(`Binance fallback HTTP error: ${res.status}`, 'HTTP_ERROR', res.status);
+    }
+    const rawRows = (await res.json()) as unknown[][];
+    const candles: HistoricalCandle[] = [];
+    for (const r of Array.isArray(rawRows) ? rawRows : []) {
+      const tMs = Number(r[0]);
+      const open = Number(r[1]);
+      const high = Number(r[2]);
+      const low = Number(r[3]);
+      const close = Number(r[4]);
+      const volume = Number(r[5]);
+      const turnover = Number(r[7] ?? 0);
+      if ([tMs, open, high, low, close].every(Number.isFinite) && open > 0 && high > 0 && low > 0 && close > 0) {
+        candles.push({ symbol, timeframe, time: Math.floor(tMs / 1000), open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+      }
+    }
+    candles.sort((a, b) => a.time - b.time);
+    return {
+      symbol,
+      timeframe,
+      candles,
+      metadata: {
+        requestedRange: { startMs, endMs },
+        actualRange: {
+          firstCandleTimeSec: candles[0]?.time ?? null,
+          lastCandleTimeSec: candles[candles.length - 1]?.time ?? null
+        },
+        totalPagesFetched: 1,
+        totalCandlesReturned: candles.length,
+        hasCorruptRows: false,
+        isComplete: true,
+        terminationReason: 'RANGE_EXHAUSTED'
       }
     };
   }

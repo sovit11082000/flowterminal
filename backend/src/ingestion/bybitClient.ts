@@ -258,9 +258,11 @@ export class BybitWebSocketClient {
         const tickerAt = this.lastTickerAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         const tradeAt = this.lastPublicTradeAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         if (now - tickerAt >= 45_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
-        // The UI pauses paper analysis after 15 seconds without a trade for
-        // the selected symbol. Recover that topic on the same cadence instead
-        // of waiting 60 seconds while the overall multi-symbol socket stays LIVE.
+        if (now - tradeAt >= 35_000) {
+          this.callbacks.onStatusChange('STALE', `Trade stream stalled for ${symbol} (${Math.round((now - tradeAt) / 1000)}s); reconnecting socket`);
+          this.ws?.terminate();
+          return;
+        }
         if (now - tradeAt >= 15_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
         for (const interval of ['1', '3', '5', '15', '30', '60', '240', 'D'] as const) {
           const topic = TOPIC_KLINE(interval, symbol);

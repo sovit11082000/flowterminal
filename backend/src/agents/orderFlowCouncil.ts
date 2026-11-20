@@ -129,6 +129,13 @@ export interface AgentSnapshot {
     cumulativeDelta: number; pocPrice: number; isClosed: boolean;
     priceLevels: Array<{ price: number; bidVolume: number; askVolume: number; totalVolume: number }>;
   }>;
+  derivativesContext?: {
+    openInterest: number | null;
+    oiChangePct: number | null;
+    fundingRate: number | null;
+    btcLeaderBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  } | null;
+  recentLiquidations?: Array<{ symbol: string; timestamp: number; price: number; size: number; side: 'Buy' | 'Sell' }>;
   trades: Array<{ timestamp: number; side: string; price: number; size: number }>;
   bids: Array<[number, number]>;
   asks: Array<[number, number]>;
@@ -744,7 +751,8 @@ export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketConte
   let isLowVolumeChop = false;
   const recentFp = snapshot.footprints.slice(-15);
 
-  const chopAnalysis = detectSidewaysMarket(candles, snapshot.footprints, 45, activeSession);
+  const chopSourceCandles = (snapshot.candles5m && snapshot.candles5m.length >= 20) ? snapshot.candles5m : candles;
+  const chopAnalysis = detectSidewaysMarket(chopSourceCandles, snapshot.footprints, 24, activeSession);
 
   if (chopAnalysis.isChop) {
     marketRegime = 'CHOP_COMPRESSION';
@@ -940,10 +948,10 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      if (shortPosPct > 80 && !denied.LONG) {
+      if (shortPosPct > 90 && !denied.LONG) {
         denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
       }
-      if (shortPosPct < 20 && !denied.SHORT) {
+      if (shortPosPct < 10 && !denied.SHORT) {
         denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
       }
     }
@@ -974,6 +982,23 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   }
   if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !(hasMajorSweepShort && recent15Delta < 0)) {
     denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without EMA50 breakdown + sweep/delta flip.';
+  }
+
+  // 4. Open Interest + Funding Rate Trap Filter & BTC Market-Leader Correlation Guard
+  const deriv = snapshot.derivativesContext;
+  if (deriv) {
+    // Block chasing a rally driven purely by falling OI (short-covering squeeze without fresh longs)
+    if (deriv.oiChangePct !== null && deriv.oiChangePct <= -0.45 && recent15Delta > 0 && !hasMajorSweepLong && !denied.LONG) {
+      denied.LONG = `OI Squeeze Trap blocked: Open Interest dropping (${deriv.oiChangePct.toFixed(2)}%) on rally (short-covering only, no fresh longs).`;
+    }
+    // Altcoin correlation: never buy ETH/SOL into an active BTC dump or short into an active BTC pump
+    const isAltCrypto = /^(ETHUSDT|SOLUSDT)$/i.test(snapshot.symbol);
+    if (isAltCrypto && deriv.btcLeaderBias === 'BEARISH' && !hasMajorSweepLong && !denied.LONG) {
+      denied.LONG = `BTC Correlation Guard: BTCUSDT is actively dumping; ${snapshot.symbol} LONG blocked.`;
+    }
+    if (isAltCrypto && deriv.btcLeaderBias === 'BULLISH' && !hasMajorSweepShort && !denied.SHORT) {
+      denied.SHORT = `BTC Correlation Guard: BTCUSDT is actively pumping; ${snapshot.symbol} SHORT blocked.`;
+    }
   }
 
   const permitted = (['LONG', 'SHORT'] as Direction[]).filter((dir) => !denied[dir]);
@@ -1691,6 +1716,8 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
     independentContext: derived.independentContext ?? null,
     marketActivityScan: scanMarketActivity(input),
     activeSession: derived.activeSession,
+    derivativesContext: input.derivativesContext ?? null,
+    recentLiquidationCount30m: input.recentLiquidations?.length ?? 0,
     liquidationSignal: derived.liquidationSignal,
     sweepReclaim: derived.sweepReclaim,
     dealingRange: derived.dealingRange ?? null,

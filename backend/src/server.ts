@@ -264,7 +264,16 @@ async function readMongoOrLocal<T>(label: string, readMongo: () => Promise<T>, r
   }
 }
 
-const liveTickerBySymbol = new Map<string, { lastPrice: number | null; markPrice: number | null; indexPrice: number | null }>();
+interface LiveTickerMetrics {
+  lastPrice: number | null;
+  markPrice: number | null;
+  indexPrice: number | null;
+  openInterest: number | null;
+  oiBaseline: number | null;
+  oiBaselineAt: number;
+  fundingRate: number | null;
+}
+const liveTickerBySymbol = new Map<string, LiveTickerMetrics>();
 const latestExchangeCandles = new Map<string, NormalizedCandle>();
 const firstFootprintBarByKey = new Map<string, number>();
 const derivativesHistoryCache = new Map<string, { expiresAt: number; points: Array<{ openInterest: string; timestamp: string }> }>();
@@ -1375,9 +1384,37 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       ]);
 
       const todayResults = getTodayIstResults();
+      const symTicker = liveTickerBySymbol.get(symbol);
+      const oiChangePct = (symTicker?.openInterest && symTicker?.oiBaseline && symTicker.oiBaseline > 0)
+        ? Number((((symTicker.openInterest - symTicker.oiBaseline) / symTicker.oiBaseline) * 100).toFixed(3))
+        : null;
+
+      // Compute BTC Market Leader status for altcoin correlation (ETHUSDT / SOLUSDT)
+      let btcLeaderBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
+      const btcPipe = marketPipelines.get('BTCUSDT');
+      if (btcPipe) {
+        const btcBars = btcPipe.footprints['1m'].getRecentBars(15);
+        if (btcBars.length >= 10) {
+          const btcDelta15 = btcBars.reduce((s, b) => s + b.delta, 0);
+          const btcVol15 = btcBars.reduce((s, b) => s + b.totalVolume, 0);
+          const btcMovePct = ((btcBars[btcBars.length - 1].close - btcBars[0].open) / Math.max(btcBars[0].open, 1)) * 100;
+          if (btcMovePct <= -0.25 && btcDelta15 < -btcVol15 * 0.08) btcLeaderBias = 'BEARISH';
+          else if (btcMovePct >= 0.25 && btcDelta15 > btcVol15 * 0.08) btcLeaderBias = 'BULLISH';
+        }
+      }
+
+      const recentLiqs = liquidationHistory.getHistory(symbol, Date.now() - 30 * 60_000, Date.now(), 50);
+
       const snapshot: AgentSnapshot = {
         symbol,
         timeframe: '1m',
+        derivativesContext: {
+          openInterest: symTicker?.openInterest ?? null,
+          oiChangePct,
+          fundingRate: symTicker?.fundingRate ?? null,
+          btcLeaderBias
+        },
+        recentLiquidations: recentLiqs,
         feedStatus: isOrderBookSafe ? symbolStatus : 'DESYNCHRONIZED',
         lastTradeAt: symbolLastTradeAt,
         latestPrice: bar.close,
@@ -1532,12 +1569,32 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
       const symbol = topic.split('.').pop();
       if (!symbol || !SUPPORTED_SYMBOLS.includes(symbol as typeof SUPPORTED_SYMBOLS[number])) return;
       // Do NOT update trade freshness from ticker messages — only actual trades refresh trade timestamps
-      const previous = liveTickerBySymbol.get(symbol) ?? { lastPrice: null, markPrice: null, indexPrice: null };
-      const readPrice = (key: 'lastPrice' | 'markPrice' | 'indexPrice') => {
-        const value = Number(data?.[key]);
-        return Number.isFinite(value) && value > 0 ? value : previous[key];
+      const previous = liveTickerBySymbol.get(symbol) ?? {
+        lastPrice: null, markPrice: null, indexPrice: null,
+        openInterest: null, oiBaseline: null, oiBaselineAt: Date.now(), fundingRate: null
       };
-      const ticker = { lastPrice: readPrice('lastPrice'), markPrice: readPrice('markPrice'), indexPrice: readPrice('indexPrice') };
+      const readNum = (key: string) => {
+        const value = Number(data?.[key]);
+        return Number.isFinite(value) ? value : null;
+      };
+      const lastPrice = readNum('lastPrice');
+      const markPrice = readNum('markPrice');
+      const indexPrice = readNum('indexPrice');
+      const rawOi = readNum('openInterest');
+      const rawFunding = readNum('fundingRate');
+      const currentOi = rawOi !== null && rawOi > 0 ? rawOi : previous.openInterest;
+      const shouldResetBaseline = previous.oiBaseline === null || (Date.now() - previous.oiBaselineAt > 30 * 60_000);
+      const oiBaseline = shouldResetBaseline ? currentOi : previous.oiBaseline;
+      const oiBaselineAt = shouldResetBaseline ? Date.now() : previous.oiBaselineAt;
+      const ticker: LiveTickerMetrics = {
+        lastPrice: lastPrice !== null && lastPrice > 0 ? lastPrice : previous.lastPrice,
+        markPrice: markPrice !== null && markPrice > 0 ? markPrice : previous.markPrice,
+        indexPrice: indexPrice !== null && indexPrice > 0 ? indexPrice : previous.indexPrice,
+        openInterest: currentOi,
+        oiBaseline,
+        oiBaselineAt,
+        fundingRate: rawFunding !== null ? rawFunding : previous.fundingRate
+      };
       liveTickerBySymbol.set(symbol, ticker);
       broadcast({ type: 'TICKER', data: { symbol, ...ticker }, timestamp: Date.now() });
     } else if (topic.startsWith('publicTrade.')) {
@@ -1750,7 +1807,10 @@ const derivForexClient = new DerivForexClient(FOREX_SYMBOLS, {
     broadcast({ type: 'TRADE', data: trades, timestamp: nowMs });
 
     for (const trade of trades) {
-      liveTickerBySymbol.set(trade.symbol, { lastPrice: trade.price, markPrice: trade.price, indexPrice: trade.price });
+      liveTickerBySymbol.set(trade.symbol, {
+        lastPrice: trade.price, markPrice: trade.price, indexPrice: trade.price,
+        openInterest: null, oiBaseline: null, oiBaselineAt: Date.now(), fundingRate: null
+      });
       const pipeline = marketPipelines.get(trade.symbol);
       if (!pipeline) continue;
 
