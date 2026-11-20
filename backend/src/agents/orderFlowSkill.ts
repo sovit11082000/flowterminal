@@ -64,7 +64,11 @@ export const STRATEGY_CATALOG: readonly StrategyRule[] = [
   { id: 'OF20', family: 'orderflow', direction: 'BOTH', name: 'OI & liquidation exhaustion', rule: 'Distinguish real breakouts from fake liquidation pumps. If price moves into heavy liquidations or OI drops on pump, seek reversal or wait.' },
   { id: 'OF21', family: 'orderflow', direction: 'BOTH', name: 'Institutional passive volume defense', rule: 'High volume (>=1.8x avg) and extreme opposing delta (>=1.8x avg) absorbed with close defending bar midpoint.' },
   { id: 'OF22', family: 'orderflow', direction: 'BOTH', name: 'Unfinished auction magnet', rule: 'Non-zero two-sided volume at bar high/low extreme acting as a liquidity re-test magnet.' },
-  { id: 'OF23', family: 'orderflow', direction: 'BOTH', name: '4-step level absorption + CVD divergence', rule: 'Key ceiling/floor absorbs aggressive orders, 2nd test fails with CVD divergence, and aggressive opposing delta triggers breakdown/reclaim.' }
+  { id: 'OF23', family: 'orderflow', direction: 'BOTH', name: '4-step level absorption + CVD divergence', rule: 'Key ceiling/floor absorbs aggressive orders, 2nd test fails with CVD divergence, and aggressive opposing delta triggers breakdown/reclaim.' },
+  { id: 'OF24', family: 'orderflow', direction: 'LONG', name: 'True Bid Iceberg Refill', rule: '25+ repeated passive limit fills at an exact support price tick soak aggressive sell sweeps and hold close above.' },
+  { id: 'OF25', family: 'orderflow', direction: 'SHORT', name: 'True Ask Iceberg Refill', rule: '25+ repeated passive limit fills at an exact resistance price tick soak aggressive buy sweeps and hold close below.' },
+  { id: 'OF26', family: 'orderflow', direction: 'LONG', name: 'Whale Tape Sweep (Buy)', rule: 'Individual institutional market buy prints (>= 8x average trade size) dominate bar flow and sweep offers with bullish close.' },
+  { id: 'OF27', family: 'orderflow', direction: 'SHORT', name: 'Whale Tape Sweep (Sell)', rule: 'Individual institutional market sell prints (>= 8x average trade size) dominate bar flow and hit bids with bearish close.' }
 ] as const;
 
 export function strategiesFor(family: StrategyFamily): readonly StrategyRule[] {
