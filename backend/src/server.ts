@@ -1128,7 +1128,7 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
 }
 
 // --- MULTI-COIN LIVE BAR PROCESSING & LEARNING (STRICTLY PAPER + TELEGRAM) ---
-async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar): Promise<void> {
+async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar, allowNewEntry = false): Promise<void> {
   if (!isAutoTradingEnabled) {
     return;
   }
@@ -1138,7 +1138,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
   const symbolLastTradeAt = lastTradeAtBySymbol.get(symbol) ?? null;
   const isSymbolFeedFresh = symbolStatus === 'LIVE' &&
                             symbolLastTradeAt !== null &&
-                            (Date.now() - symbolLastTradeAt < 25_000);
+                            (Date.now() - symbolLastTradeAt < 120_000);
 
   if (!isSymbolFeedFresh) {
     const now = Date.now();
@@ -1334,8 +1334,9 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     }
   }
 
-  // 2. Evaluate new setup across coins (Per-symbol lock + overall concurrency limit + OrderBook sync gate)
+  // 2. Evaluate new setup across coins (ONLY on 5m bar close to eliminate 1m noise)
   if (
+    allowNewEntry &&
     !liveActiveTrades.has(symbol) &&
     !councilInFlightSymbols.has(symbol) &&
     councilInFlightSymbols.size < MAX_CONCURRENT_COUNCILS
@@ -1675,6 +1676,8 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
                   data: serialized,
                   timestamp: Date.now()
                 });
+
+                void handleLiveBarAutonomousTrading(trade.symbol, serialized, true);
               }
             }
 
@@ -1828,7 +1831,7 @@ const derivForexClient = new DerivForexClient(FOREX_SYMBOLS, {
               if (process.env.MONGO_PERSIST_1M_FOOTPRINTS === 'true') persistToMongo('footprint bar', () => mongoHistory.saveFootprint(serialized));
             }
             broadcast({ type: 'FOOTPRINT_BAR', timeframe: '1m', data: serialized, timestamp: Date.now() });
-            void handleLiveBarAutonomousTrading(trade.symbol, serialized);
+            // Forex auto-trading paused while focusing exclusively on Crypto (BTC/ETH/SOL)
           }
         }
         if (prevBarTime1m === undefined || fpBar1m.time >= prevBarTime1m) queueFormingFootprint(pipeline.footprints['1m']);

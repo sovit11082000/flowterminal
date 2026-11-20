@@ -136,7 +136,7 @@ function validateSnapshotData(snapshot: AgentSnapshot): string | null {
   if (snapshot.lastTradeAt === null || !Number.isFinite(snapshot.lastTradeAt)) {
     return 'Missing lastTradeAt market timestamp.';
   }
-  if (Date.now() - snapshot.lastTradeAt > 30_000) {
+  if (Date.now() - snapshot.lastTradeAt > 120_000) {
     return `Market feed stale (${Math.round((Date.now() - snapshot.lastTradeAt) / 1000)}s old).`;
   }
   return null;
@@ -837,9 +837,20 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     }
   }
 
+  const syn5mBearish = syn ? (syn.close < syn.open && syn.delta < 0) : false;
+  const syn5mBullish = syn ? (syn.close > syn.open && syn.delta > 0) : false;
+  const hasInstitutionalLong = evidence.LONG.some((e) => ['OF01', 'OF21', 'OF23', 'OF24', 'OF26'].includes(e.strategy ?? ''));
+  const hasInstitutionalShort = evidence.SHORT.some((e) => ['OF02', 'OF21', 'OF23', 'OF25', 'OF27'].includes(e.strategy ?? ''));
+
   const caps: Record<Dir, Cap[]> = {
-    LONG: [{ when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD', cap: 1, concern: 'Long capped: 5m synthetic POC is overhead.' }],
-    SHORT: [{ when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT', cap: 1, concern: 'Short capped: 5m synthetic POC is underfoot.' }]
+    LONG: [
+      { when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD', cap: 1, concern: 'Long capped: 5m synthetic POC is overhead.' },
+      { when: Boolean(syn) && !syn5mBullish && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 5m footprint close/delta has not confirmed bullish flow yet.' }
+    ],
+    SHORT: [
+      { when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT', cap: 1, concern: 'Short capped: 5m synthetic POC is underfoot.' },
+      { when: Boolean(syn) && !syn5mBearish && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 5m footprint close/delta has not confirmed bearish flow yet.' }
+    ]
   };
 
   return finalize({

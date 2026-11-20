@@ -717,7 +717,7 @@ export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketConte
 
   let htfTrend: DerivedMarketContext['htfTrend'] = 'NEUTRAL';
   if (candles.length >= 30) {
-    const span = Math.min(candles.length, 240);
+    const span = Math.min(candles.length, 75);
     const sub = candles.slice(-span);
     const htfBars: Array<{ high: number; low: number; close: number; open: number }> = [];
     for (let k = 0; k < sub.length; k += 15) {
@@ -972,6 +972,23 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = activityScan.blockReason ?? 'Blocked by Pre-Trade Market Activity Scanner.';
   }
 
+  // Higher-Low / Lower-High Micro-Structure Guard (prevents shorting higher lows like 15:51 BTC trap)
+  if (snapshot.candles.length >= 45 && lastPrice !== null) {
+    const prev30to15 = snapshot.candles.slice(-45, -15);
+    const last15 = snapshot.candles.slice(-15);
+    const priorLow = Math.min(...prev30to15.map((c) => c.low));
+    const recentLow = Math.min(...last15.map((c) => c.low));
+    const priorHigh = Math.max(...prev30to15.map((c) => c.high));
+    const recentHigh = Math.max(...last15.map((c) => c.high));
+
+    if (recentLow > priorLow && lastPrice > recentLow && !hasMajorSweepShort && !denied.SHORT) {
+      denied.SHORT = `Higher-Low Guard: recent 15m low (${recentLow}) is above prior low (${priorLow}); SHORT blocked without PDH/PWH sweep.`;
+    }
+    if (recentHigh < priorHigh && lastPrice < recentHigh && !hasMajorSweepLong && !denied.LONG) {
+      denied.LONG = `Lower-High Guard: recent 15m high (${recentHigh}) is below prior high (${priorHigh}); LONG blocked without PDL/PWL sweep.`;
+    }
+  }
+
   // 1H Macro Trend Guard: allow early reversal if price broke EMA50 with matching 15m delta & sweep/rejection
   const emaAlign = derived.independentContext?.emaAlignment ?? 'MIXED_CROSSOVER';
   const earlyBullFlip = emaAlign === 'BULLISH_ABOVE_50_200' && recent15Delta > 0 && (sweep.long || absorption === 'BULLISH_ABSORPTION');
@@ -1117,8 +1134,7 @@ export function resolveTradeLevels(
       target = dol;
       notes.push('Target taken from next draw on liquidity.');
     } else {
-      target = entry + dir * risk * 1.35;
-      notes.push('Local DOL too tight; defaulted to 1.8R structural target.');
+      return { ok: false, reason: `Nearest Draw on Liquidity is less than minimum ${cfg.minRR}R; skipping trade instead of forcing an artificial target.` };
     }
   }
 
