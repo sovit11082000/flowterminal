@@ -1071,6 +1071,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
     denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
   } else if (rangePosPct !== null && rangePosPct > 88 && !hasMajorSweepLong) {
+    // Top-chasing: only block LONG when price is at extreme top of range AND trend is NOT already bullish
+    // (In a real uptrend, being at 88%+ is fine — we only block if no sweep exists)
     denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range; wait for pullback to FVG/OB.`;
   }
 
@@ -1082,13 +1084,13 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      // Raised from 97% to 88% — buying above 88% of 30m range is late chase
       if (shortPosPct > 88 && !denied.LONG) {
         denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
       }
-      // Raised from 3% to 12% — selling below 12% of 30m range sells into exhaustion
-      if (shortPosPct < 12 && !denied.SHORT) {
-        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
+      // Bottom of 30m dump: only block SHORT if trend is NOT bearish (i.e., counter-trend short into exhaustion)
+      // If trend IS bearish (macroBearish=true), selling into a dump is TREND-FOLLOWING — ALLOW IT
+      if (shortPosPct < 12 && !denied.SHORT && !macroBearish) {
+        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce (counter-trend short into exhaustion).`;
       }
     }
   }
@@ -1097,8 +1099,10 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = `Intraday 15m/5m trend is BULLISH (${activityScan.structure15m}); SHORTs blocked unless sweep-rejection or absorption occurs.`;
   } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0) {
     denied.SHORT = `Counter-trend SHORT blocked: 15m/5m BULLISH and both 60m (+${fpNetDelta.toFixed(1)}) and 15m (+${recent15Delta.toFixed(1)}) delta remain positive.`;
-  } else if (rangePosPct !== null && rangePosPct < 12 && !hasMajorSweepShort) {
-    denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of dealing range; wait for bounce or OTE retest.`;
+  } else if (rangePosPct !== null && rangePosPct < 12 && !hasMajorSweepShort && !macroBearish) {
+    // Bottom-chasing: only block SHORT when trend is NOT already bearish
+    // In a real downtrend, price IS at the bottom — that's the trade! Block only counter-trend shorts into dumps
+    denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of dealing range in a neutral/bullish market; wait for bounce or OTE retest.`;
   }
 
   if (activityScan.blockedDirection === 'LONG' && !denied.LONG) {
@@ -1260,12 +1264,23 @@ export function resolveTradeLevels(
   const effectiveMinRiskPct = isForex ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
   const effectiveMaxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
 
-  // Volatility noise floor: scaled to 1.2x ATR (was too aggressive at 2.0x ATR, which doubled stops and crushed R:R)
-  const minRisk = Math.max((entry * effectiveMinRiskPct) / 100, atr !== null ? atr * 1.2 : 0);
+  // Structural Stop Floor: Stop must be BEYOND the recent swing high/low that caused the setup
+  // This prevents "noise stops" that get hit instantly by normal market breathing
+  const structuralStopLong = swingLow - buffer;   // For LONG: below the wick that swept lows
+  const structuralStopShort = swingHigh + buffer;  // For SHORT: above the wick that swept highs
+  const structuralStop = dir === 1 ? structuralStopLong : structuralStopShort;
+  const structuralRisk = Math.abs(entry - structuralStop);
+
+  // Volatility noise floor: 1.5x ATR minimum (raised from 1.2x — 1.2x was too tight for crypto volatility)
+  const minRisk = Math.max(
+    (entry * effectiveMinRiskPct) / 100,
+    atr !== null ? atr * 1.5 : 0,
+    structuralRisk  // Stop must be AT LEAST beyond the structural swing
+  );
   if (risk < minRisk) {
     stopPrice = entry - dir * minRisk;
     risk = minRisk;
-    notes.push('Stop was inside normal noise; widened to the volatility floor.');
+    notes.push(`Stop widened to structural/volatility floor (structural swing: ${dir === 1 ? swingLow.toFixed(2) : swingHigh.toFixed(2)}, ATR floor: ${atr !== null ? (atr * 1.5).toFixed(2) : 'n/a'}).`);
   }
   const riskPct = (risk / entry) * 100;
   if (riskPct > effectiveMaxRiskPct) {

@@ -68,26 +68,47 @@ function finalize(input: FinalizeInput): SpecialistReport {
 
   if (dir) {
     const htf = derived.htfTrend; // Intraday 15m/5m trend
+    const macro4h = derived.macro4hTrend; // 4H Macro Trend
     const sweptLevels = derived.sweepReclaim?.levels ?? [];
-    const sweepOk = dir === 'LONG'
-      ? (Boolean(derived.sweepReclaim?.long) || sweptLevels.some((l) => l === 'PDL' || l === 'PWL') || hasSweepOrAbsorptionEvidence)
-      : (Boolean(derived.sweepReclaim?.short) || sweptLevels.some((l) => l === 'PDH' || l === 'PWH') || hasSweepOrAbsorptionEvidence);
+
+    // Institutional-grade sweep: only PDL/PWL/PDH/PWH level sweeps count for counter-trend permission
+    // Micro swing sweeps (SMC05 alone) in a trending market are NOT enough to allow counter-trend trades
+    const institutionalSweepOk = dir === 'LONG'
+      ? (Boolean(derived.sweepReclaim?.long) || sweptLevels.some((l) => l === 'PDL' || l === 'PWL'))
+      : (Boolean(derived.sweepReclaim?.short) || sweptLevels.some((l) => l === 'PDH' || l === 'PWH'));
+
+    // For general alignment check, micro sweeps + absorption still count
+    const sweepOk = institutionalSweepOk || hasSweepOrAbsorptionEvidence;
 
     const aligned = (dir === 'LONG' && htf === 'BULLISH') || (dir === 'SHORT' && htf === 'BEARISH');
     const counter = (dir === 'LONG' && htf === 'BEARISH') || (dir === 'SHORT' && htf === 'BULLISH');
 
-    // Counter-trend against 15m/5m without sweep/absorption is neutralized; with sweep/absorption it is capped at strength 2
+    // 4H Macro Trend override: if 4H is strongly against us, neutralize unless institutional-level sweep exists
+    const counter4h = (dir === 'LONG' && macro4h === 'BEARISH') || (dir === 'SHORT' && macro4h === 'BULLISH');
+    if (counter4h && !institutionalSweepOk) {
+      strength = Math.min(strength, 1);
+      concerns.push(`${dir} capped at 1: Counter 4H macro trend (${macro4h}) without PDL/PDH/PWL/PWH institutional sweep.`);
+    }
+
+    // Counter-trend against 15m/5m:
+    // - Without ANY sweep → neutralized (strength 0)
+    // - With micro sweep ONLY (no institutional sweep) in a 4H downtrend → still neutralized
+    // - With institutional PDL/PWL sweep → capped at strength 2
     if (counter && !sweepOk) {
       strength = 0;
       concerns.push(`${dir} is strictly counter-trend against 15m/5m ${htf} without sweep/reclaim; neutralized.`);
-    } else if (counter && sweepOk) {
+    } else if (counter && sweepOk && !institutionalSweepOk) {
+      // Micro swing sweep in counter-trend — cap at 1, not 2
+      strength = Math.min(strength, 1);
+      concerns.push(`${dir} counter-trend: only micro swing swept (no PDL/PWL/PDH/PWH); capped at strength 1.`);
+    } else if (counter && institutionalSweepOk) {
       strength = Math.min(strength, 2);
-      concerns.push(`${dir} counter-trend sweep/absorption confirmed: capped at strength 2.`);
+      concerns.push(`${dir} counter-trend institutional sweep confirmed: capped at strength 2.`);
     }
 
-    if (strength === 3 && !(aligned || sweepOk)) {
+    if (strength === 3 && !(aligned || institutionalSweepOk)) {
       strength = 2;
-      concerns.push('Strength 3 requires 15m/5m alignment or confirmed sweep/absorption; capped at 2.');
+      concerns.push('Strength 3 requires 15m/5m alignment or confirmed institutional sweep (PDL/PWL/PDH/PWH); capped at 2.');
     }
     for (const cap of input.caps?.[dir] ?? []) {
       if (cap.when && strength > cap.cap) {
@@ -360,6 +381,17 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   const candles5m = snapshot.candles5m?.length ? snapshot.candles5m : aggregateCandles(candles, 300);
   const candles15m = snapshot.candles15m?.length ? snapshot.candles15m : aggregateCandles(candles, 900);
 
+  // Build 15m structure to gate MTF LONG setups in bearish environments
+  const { highs: h15gate, lows: l15gate } = findPivots(candles15m.length >= 6 ? candles15m : candles15m, 2);
+  const lastH15gate = h15gate[h15gate.length - 1];
+  const prevH15gate = h15gate[h15gate.length - 2];
+  const lastL15gate = l15gate[l15gate.length - 1];
+  const prevL15gate = l15gate[l15gate.length - 2];
+  const structure15m: 'BULLISH' | 'BEARISH' | 'MIXED' | 'UNKNOWN' = lastH15gate && prevH15gate && lastL15gate && prevL15gate
+    ? (lastH15gate.price > prevH15gate.price && lastL15gate.price > prevL15gate.price ? 'BULLISH'
+      : lastH15gate.price < prevH15gate.price && lastL15gate.price < prevL15gate.price ? 'BEARISH' : 'MIXED')
+    : 'UNKNOWN';
+
   const checkStep1HtfPoiOrLiquidity = (dir: Dir): { ok: boolean; label: string } => {
     const recent1mWindow = candles.slice(-20);
     const recentLow = Math.min(...recent1mWindow.map((c) => c.low));
@@ -371,20 +403,27 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
       const tfTol = price * (tfName === '15m' ? 0.0012 : 0.0008);
 
       if (dir === 'LONG') {
+        // In 15m BEARISH structure, only Equal Lows (institutional SSL pools) count as valid Step 1
+        // Single swing low sweeps in a downtrend are dead-cat traps, NOT reversals
         for (let idx = htfL.length - 1; idx >= Math.max(0, htfL.length - 6); idx--) {
           const lvl = htfL[idx].price;
           const isEqualLows = htfL.filter((p) => Math.abs(p.price - lvl) <= tfTol).length >= 2;
           if (recentLow <= lvl && last.close > lvl) {
-            return { ok: true, label: `[Step 1: ${tfName} ${isEqualLows ? 'Equal Lows SL Pool' : 'Swing Low'} ${f(lvl)} Swept & Reclaimed]` };
+            // In bearish 15m structure: only EQL (institutional pool) qualifies, not regular swing low
+            if (structure15m === 'BEARISH' && !isEqualLows) continue;
+            return { ok: true, label: `[Step 1: ${tfName} ${isEqualLows ? 'Equal Lows SSL Pool' : 'Swing Low'} ${f(lvl)} Swept & Reclaimed]` };
           }
         }
-        const tfAvg = meanBody(tfData);
-        for (let i = tfData.length - 2; i >= Math.max(2, tfData.length - 14); i--) {
-          if (tfAvg > 0 && Math.abs(tfData[i - 1].close - open(tfData[i - 1])) < tfAvg * 1.2) continue;
-          const bot = tfData[i - 2].high;
-          const top = tfData[i].low;
-          if (bot < top && recentLow <= top && last.close >= bot) {
-            return { ok: true, label: `[Step 1: ${tfName} Bullish FVG POI ${f(bot)}-${f(top)} Tapped]` };
+        // FVG retest for LONG — only valid if 15m structure is BULLISH or MIXED (not BEARISH)
+        if (structure15m !== 'BEARISH') {
+          const tfAvg = meanBody(tfData);
+          for (let i = tfData.length - 2; i >= Math.max(2, tfData.length - 14); i--) {
+            if (tfAvg > 0 && Math.abs(tfData[i - 1].close - open(tfData[i - 1])) < tfAvg * 1.2) continue;
+            const bot = tfData[i - 2].high;
+            const top = tfData[i].low;
+            if (bot < top && recentLow <= top && last.close >= bot) {
+              return { ok: true, label: `[Step 1: ${tfName} Bullish FVG POI ${f(bot)}-${f(top)} Tapped]` };
+            }
           }
         }
       } else {

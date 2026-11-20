@@ -1345,7 +1345,12 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     }
 
     const recentBars = pipeline.footprints['1m'].getRecentBars(15);
-    if (recentBars.length < 12) return;
+    if (recentBars.length < 12) {
+      if (symbol === 'BTCUSDT' && recentBars.length > 0 && recentBars.length % 2 === 0) {
+        console.log(`[FlowTerminal Warmup] Ingestion active: ${recentBars.length}/12 closed 1m bars recorded for ${symbol} (AI Council activates at 12 bars)...`);
+      }
+      return;
+    }
 
     const avgVol = recentBars.reduce((s, b) => s + b.totalVolume, 0) / recentBars.length;
     if (bar.totalVolume < avgVol * 0.75) {
@@ -1550,6 +1555,9 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
   onStatusChange: (status: ConnectionStatus, message?: string) => {
     for (const sym of CRYPTO_SYMBOLS) marketStatusBySymbol.set(sym, status);
     updateMarketStatus(status, message);
+    if (status === 'LIVE') {
+      console.log('[Bybit Feed] Live crypto WebSocket connected & streaming (BTCUSDT, ETHUSDT, SOLUSDT)');
+    }
   },
   onMessage: (topic: string, payload: unknown) => {
     if (topic.startsWith('kline.')) {
@@ -1834,7 +1842,7 @@ const derivForexClient = new DerivForexClient(FOREX_SYMBOLS, {
         if (prevBarTime1m === undefined && !firstFootprintBarByKey.has(fpKey1m)) firstFootprintBarByKey.set(fpKey1m, fpBar1m.time);
         if (prevBarTime1m !== undefined && fpBar1m.time > prevBarTime1m) {
           const closedBar = pipeline.footprints['1m'].getRecentBars().find((b) => b.time === prevBarTime1m);
-          if (closedBar) {
+          if (closedBar) {  
             const serialized = pipeline.footprints['1m'].serializeBar(closedBar);
             if (firstFootprintBarByKey.get(fpKey1m) !== closedBar.time) {
               footprintHistory.save(serialized);
