@@ -1050,6 +1050,7 @@ export default function App() {
               setLastUpdateTs(msg.timestamp);
               const newestExchangeTrade = Math.max(...selectedTrades.map((trade) => trade.timestamp));
               setLastTradeAt((previous) => previous === null ? newestExchangeTrade : Math.max(previous, newestExchangeTrade));
+              // Push live trades into local state
               setTrades((prev) => [...selectedTrades, ...prev].slice(0, 100));
             }
           } else if (msg.type === 'ORDERBOOK_SNAPSHOT' || msg.type === 'ORDERBOOK_DELTA') {

@@ -65,8 +65,8 @@ export async function runNightlyAuditCycle(
       preTradeSummary = `4.5h Range: $${low4h.toFixed(2)} - $${high4h.toFixed(2)} | Entry at ${posPct}% of range | 4.5h Net Delta: ${netDelta.toFixed(1)} | SL Width: ${slPct}%`;
     }
 
-    // 2. Fetch 1 hour post-trade 1m footprints
-    const postEndMs = t.resolvedAt + 60 * 60_000;
+    // 2. Fetch 2 hours post-trade 1m footprints (was 1H — extended for better follow-through analysis)
+    const postEndMs = t.resolvedAt + 120 * 60_000;
     const postBars = await mongoHistory.getFootprints({
       symbol: t.symbol,
       timeframe: '1m',

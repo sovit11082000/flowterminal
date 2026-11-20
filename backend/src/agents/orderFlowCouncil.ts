@@ -27,6 +27,7 @@ export interface OrderFlowMicrostructureSummary {
     pocPrice: number;
     pocPosition: 'POC_TRAPPED_OVERHEAD' | 'POC_SUPPORT_UNDERFOOT' | 'POC_CENTERED';
     signal: string;
+    cvdTrend?: 'RISING' | 'FALLING' | 'FLAT' | null;
   } | null;
   buyImbalanceLevels?: number[];
   sellImbalanceLevels?: number[];
@@ -305,41 +306,92 @@ function computeSimpleEma(values: number[], period: number): number | null {
   return Number(ema.toFixed(6));
 }
 
+/**
+ * Wilder's Smoothed RSI (industry-standard implementation).
+ *
+ * Steps:
+ *  1. Need at least (period + 1) closes to compute first diff, so minimum
+ *     length required = period + 1 for the seed average.
+ *  2. Seed: simple average of gains/losses over the first `period` diffs.
+ *  3. Smooth: for every subsequent close apply Wilder's EMA:
+ *       avgGain = (prevAvgGain * (period - 1) + currentGain) / period
+ *       avgLoss = (prevAvgLoss * (period - 1) + currentLoss) / period
+ *  4. RS = avgGain / avgLoss  →  RSI = 100 - 100 / (1 + RS)
+ *
+ * Returns null when there is not enough data.
+ */
 function computeRsi(closes: number[], period = 14): number | null {
-  if (closes.length <= period) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
+  // Need period diffs for the seed + at least 1 more diff to smooth over
+  if (closes.length < period + 1) return null;
+
+  // --- Step 1: Seed average (simple mean over first `period` diffs) ---
+  let avgGain = 0;
+  let avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
     const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff;
-    else losses -= diff;
+    if (diff > 0) avgGain += diff;
+    else avgLoss -= diff; // store as positive
   }
-  if (losses === 0) return 100;
-  const rs = gains / losses;
+  avgGain /= period;
+  avgLoss /= period;
+
+  // --- Step 2: Wilder's smoothing for all remaining closes ---
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
   return Number((100 - 100 / (1 + rs)).toFixed(1));
 }
 
 function computeAdx(candles: AgentSnapshot['candles'], period = 14): number | null {
-  if (candles.length < period + 2) return null;
-  const slice = candles.slice(-(period * 2));
-  let trSum = 0;
-  let plusDmSum = 0;
-  let minusDmSum = 0;
-  for (let i = 1; i < slice.length; i++) {
-    const curr = slice[i];
-    const prev = slice[i - 1];
+  // Wilder's Smoothed ADX — same exponential smoothing as RSI uses for avgGain/avgLoss.
+  // Requires period*2 + 1 bars: first period bars seed the Wilder smoothed ATR/+DM/-DM,
+  // then we iterate the remaining bars to converge DX before returning the final ADX value.
+  if (candles.length < period * 2 + 1) return null;
+
+  // Helper: single bar TR / +DM / -DM
+  const barMetrics = (curr: typeof candles[0], prev: typeof candles[0]) => {
+    const tr = Math.max(curr.high - curr.low, Math.abs(curr.high - prev.close), Math.abs(curr.low - prev.close));
     const upMove = curr.high - prev.high;
     const downMove = prev.low - curr.low;
-    plusDmSum += upMove > downMove && upMove > 0 ? upMove : 0;
-    minusDmSum += downMove > upMove && downMove > 0 ? downMove : 0;
-    trSum += Math.max(curr.high - curr.low, Math.abs(curr.high - prev.close), Math.abs(curr.low - prev.close));
+    const plusDm = upMove > downMove && upMove > 0 ? upMove : 0;
+    const minusDm = downMove > upMove && downMove > 0 ? downMove : 0;
+    return { tr, plusDm, minusDm };
+  };
+
+  // Seed: simple sum of first `period` bars
+  let smTr = 0, smPlusDm = 0, smMinusDm = 0;
+  for (let i = 1; i <= period; i++) {
+    const m = barMetrics(candles[i], candles[i - 1]);
+    smTr += m.tr; smPlusDm += m.plusDm; smMinusDm += m.minusDm;
   }
-  if (trSum <= 0) return null;
-  const plusDi = (plusDmSum / trSum) * 100;
-  const minusDi = (minusDmSum / trSum) * 100;
-  const diSum = plusDi + minusDi;
-  if (diSum <= 0) return 0;
-  return Number(((Math.abs(plusDi - minusDi) / diSum) * 100).toFixed(1));
+
+  // Wilder smooth the rest
+  let dxSum = 0;
+  let dxCount = 0;
+  for (let i = period + 1; i < candles.length; i++) {
+    const m = barMetrics(candles[i], candles[i - 1]);
+    smTr     = smTr     - smTr / period     + m.tr;
+    smPlusDm = smPlusDm - smPlusDm / period + m.plusDm;
+    smMinusDm = smMinusDm - smMinusDm / period + m.minusDm;
+    if (smTr <= 0) continue;
+    const plusDi  = (smPlusDm  / smTr) * 100;
+    const minusDi = (smMinusDm / smTr) * 100;
+    const diSum   = plusDi + minusDi;
+    if (diSum <= 0) continue;
+    // Accumulate DX values to smooth into ADX
+    dxSum += (Math.abs(plusDi - minusDi) / diSum) * 100;
+    dxCount++;
+  }
+
+  if (dxCount === 0) return null;
+  return Number((dxSum / dxCount).toFixed(1));
 }
 
 function buildIndependentContext(snapshot: AgentSnapshot): IndependentContextMetrics {
@@ -384,11 +436,13 @@ function buildIndependentContext(snapshot: AgentSnapshot): IndependentContextMet
 
 /**
  * A real liquidity sweep needs a wick through the level AND a later closed reclaim back across it.
+ * lookback=30 covers a full 30-minute window on 1m charts — enough to catch session sweeps
+ * that mature over several candles rather than the previous too-tight 10-bar window.
  */
 export function detectSweepReclaim(
   candles: AgentSnapshot['candles'],
   levels: { pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null },
-  lookback = 10
+  lookback = 30
 ): { long: boolean; short: boolean; levels: string[] } {
   const out = { long: false, short: false, levels: [] as string[] };
   const recent = candles.slice(-lookback);
@@ -468,9 +522,11 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
 
   const latest = bars[bars.length - 1];
   const prev = bars.length >= 2 ? bars[bars.length - 2] : latest;
-  const lookback = bars.slice(-6);
+  // Extended lookback: 10 bars (was 6) for better local high/low context — avoids
+  // flagging absorption at mid-range when real structure has shifted further out
+  const lookback = bars.slice(-10);
   const localHigh = Math.max(...lookback.map((b) => b.high));
-  const localLow = Math.min(...lookback.map((b) => b.low));
+  const localLow  = Math.min(...lookback.map((b) => b.low));
 
   const barSpan = Math.max(latest.high - latest.low, 1e-6);
   const pocOffsetFromClose = latest.pocPrice - latest.close;
@@ -481,16 +537,20 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
         ? 'POC_SUPPORT_UNDERFOOT'
         : 'POC_CENTERED';
 
-  const refBar = bars[Math.max(0, bars.length - 4)];
-  const cvdChange3Bar = Number((latest.cumulativeDelta - refBar.cumulativeDelta).toFixed(3));
+  // CVD change over last 5 bars (was 3) — more reliable trend signal, less noise from single spike bar.
+  // Also normalize against avgVol of lookback window (not just latest bar volume) to avoid
+  // a single high-volume bar making everything else look FLAT.
+  const refBar5 = bars[Math.max(0, bars.length - 6)];
+  const cvdChange3Bar = Number((latest.cumulativeDelta - refBar5.cumulativeDelta).toFixed(3));
+  const avgLookbackVol = lookback.reduce((s, b) => s + b.totalVolume, 0) / Math.max(lookback.length, 1);
   const cvdTrend: OrderFlowMicrostructureSummary['cvdTrend'] =
-    cvdChange3Bar > Math.abs(latest.totalVolume) * 0.08
+    cvdChange3Bar > avgLookbackVol * 0.08
       ? 'RISING'
-      : cvdChange3Bar < -Math.abs(latest.totalVolume) * 0.08
+      : cvdChange3Bar < -avgLookbackVol * 0.08
         ? 'FALLING'
         : 'FLAT';
 
-  const avgVol = lookback.reduce((sum, b) => sum + b.totalVolume, 0) / lookback.length;
+  const avgVol = avgLookbackVol;
 
   let absorptionSignal: OrderFlowMicrostructureSummary['absorptionSignal'] = 'NONE';
   if (
@@ -510,18 +570,24 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
   }
 
   let deltaBreakoutSignal: OrderFlowMicrostructureSummary['deltaBreakoutSignal'] = 'NONE';
+  // Require 2 consecutive bars with aligned delta (not just latest bar) to reduce false spikes.
+  // prev bar must also be bearish/bullish delta-aligned to confirm institutional commitment.
+  const prevDeltaAlignsBear = prev.delta < -avgVol * 0.10;
+  const prevDeltaAlignsBull = prev.delta > avgVol * 0.10;
   if (
     lookback.length >= 3 &&
     latest.low <= Math.min(...lookback.slice(0, -1).map((b) => b.low)) &&
     latest.delta < -avgVol * 0.25 &&
-    latest.close < latest.pocPrice
+    latest.close < latest.pocPrice &&
+    prevDeltaAlignsBear                                     // ← 2nd bar confirms bear pressure
   ) {
     deltaBreakoutSignal = 'BEARISH_DELTA_BREAKDOWN';
   } else if (
     lookback.length >= 3 &&
     latest.high >= Math.max(...lookback.slice(0, -1).map((b) => b.high)) &&
     latest.delta > avgVol * 0.25 &&
-    latest.close > latest.pocPrice
+    latest.close > latest.pocPrice &&
+    prevDeltaAlignsBull                                     // ← 2nd bar confirms bull pressure
   ) {
     deltaBreakoutSignal = 'BULLISH_DELTA_IMPULSE';
   }
@@ -552,7 +618,51 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
   const stackedSell = stackedRuns(sellFlags);
 
   let synthetic5mSummary: OrderFlowMicrostructureSummary['synthetic5mSummary'] = null;
-  if (snapshot.timeframe === '1m' && bars.length >= 2) {
+  // Prefer REAL 5-minute closed footprints from the 5m OrderFlowAggregator if supplied
+  const real5mBars = (snapshot.footprints5m ?? []).filter((b) => b.isClosed);
+  const useReal5m = real5mBars.length >= 2;
+  const bar5 = useReal5m ? real5mBars[real5mBars.length - 1] : null;
+  const prevBar5 = useReal5m ? real5mBars[real5mBars.length - 2] : null;
+
+  if (useReal5m && bar5 && prevBar5) {
+    const span5 = Math.max(bar5.high - bar5.low, 1e-6);
+    const pocPos5: 'POC_TRAPPED_OVERHEAD' | 'POC_SUPPORT_UNDERFOOT' | 'POC_CENTERED' =
+      bar5.pocPrice - bar5.close > span5 * 0.15
+        ? 'POC_TRAPPED_OVERHEAD'
+        : bar5.close - bar5.pocPrice > span5 * 0.15
+          ? 'POC_SUPPORT_UNDERFOOT'
+          : 'POC_CENTERED';
+
+    let sig5 = 'NEUTRAL_CONSOLIDATION';
+    if (bar5.close < bar5.open && pocPos5 === 'POC_TRAPPED_OVERHEAD' && bar5.delta > 0) {
+      sig5 = 'BEARISH_TRAPPED_BUYERS_OVERHEAD_POC';
+    } else if (bar5.close < bar5.open && pocPos5 === 'POC_TRAPPED_OVERHEAD' && bar5.delta < -bar5.totalVolume * 0.12) {
+      sig5 = 'BEARISH_5M_DELTA_BREAKDOWN';
+    } else if (bar5.close > bar5.open && pocPos5 === 'POC_SUPPORT_UNDERFOOT' && bar5.delta < 0) {
+      sig5 = 'BULLISH_SELLER_ABSORPTION_UNDERFOOT_POC';
+    } else if (bar5.close > bar5.open && pocPos5 === 'POC_SUPPORT_UNDERFOOT' && bar5.delta > bar5.totalVolume * 0.12) {
+      sig5 = 'BULLISH_5M_DELTA_IMPULSE';
+    }
+
+    const cvdTrend5m = bar5.cumulativeDelta > prevBar5.cumulativeDelta
+      ? 'RISING'
+      : bar5.cumulativeDelta < prevBar5.cumulativeDelta
+        ? 'FALLING'
+        : 'FLAT';
+
+    synthetic5mSummary = {
+      open: bar5.open,
+      high: bar5.high,
+      low: bar5.low,
+      close: bar5.close,
+      totalVolume: Number(bar5.totalVolume.toFixed(3)),
+      delta: Number(bar5.delta.toFixed(3)),
+      pocPrice: bar5.pocPrice,
+      pocPosition: pocPos5,
+      signal: sig5,
+      cvdTrend: cvdTrend5m
+    };
+  } else if (snapshot.timeframe === '1m' && bars.length >= 2) {
     const last5 = bars.slice(-5);
     const open5 = last5[0].open;
     const close5 = last5[last5.length - 1].close;
@@ -593,6 +703,9 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
       sig5 = 'BULLISH_5M_DELTA_IMPULSE';
     }
 
+    const cvdTrendFallback: 'RISING' | 'FALLING' | 'FLAT' =
+      delta5 > vol5 * 0.05 ? 'RISING' : delta5 < -vol5 * 0.05 ? 'FALLING' : 'FLAT';
+
     synthetic5mSummary = {
       open: open5,
       high: high5,
@@ -602,7 +715,8 @@ export function buildOrderFlowMicrostructureSummary(snapshot: AgentSnapshot): Or
       delta: delta5,
       pocPrice: poc5,
       pocPosition: pocPos5,
-      signal: sig5
+      signal: sig5,
+      cvdTrend: cvdTrendFallback
     };
   }
 
@@ -646,11 +760,21 @@ export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketConte
   const nyTimeFormatted = `${partMap.year}-${partMap.month}-${partMap.day} ${String(nyHour).padStart(2, '0')}:${String(nyMinute).padStart(2, '0')} ET`;
 
   let activeSession: DerivedMarketContext['activeSession'] = 'OFF_HOURS';
-  if (nyHour >= 20) activeSession = 'ASIA';
-  else if (nyHour >= 2 && nyHour < 5) activeSession = 'LONDON';
+  // ET Session map (all times in New York local hour, 24h):
+  //   0–1   : NY late-night / very early Asia pre-market → OFF_HOURS
+  //   2–4   : Frankfurt open + London pre-market overlap → LONDON
+  //   5–7   : London peak hours (5 AM–8 AM ET) → LONDON (was OFF_HOURS — fixed!)
+  //   8–11  : NY AM session
+  //   12    : NY Lunch
+  //   13–15 : NY PM session
+  //   16–19 : US after-hours / early Asia pre-market → ASIA (was OFF_HOURS — fixed!)
+  //   20–23 : Asia main session
+  if (nyHour >= 20 || nyHour < 2) activeSession = 'ASIA';
+  else if (nyHour >= 2 && nyHour < 8) activeSession = 'LONDON';
   else if (nyHour >= 8 && nyHour < 12) activeSession = 'NY_AM';
   else if (nyHour >= 12 && nyHour < 13) activeSession = 'NY_LUNCH';
   else if (nyHour >= 13 && nyHour < 16) activeSession = 'NY_PM';
+  else activeSession = 'ASIA'; // 16–19: US after-hours bleeds into early Asia
 
   let silverBulletWindow: DerivedMarketContext['silverBulletWindow'] = 'NONE';
   if (nyHour === 3) silverBulletWindow = 'LONDON_SB';
@@ -837,7 +961,7 @@ export function councilConfig() {
     maxEntryDriftPct: num('COUNCIL_MAX_ENTRY_DRIFT_PCT', 0.25),
     accountBalanceUsd: num('ACCOUNT_BALANCE_USD', 1000),
     riskPerTradePct: num('RISK_PER_TRADE_PCT', 0.5),
-    maxDailyLossR: num('MAX_DAILY_LOSS_R', 3.0),
+    maxDailyLossR: num('MAX_DAILY_LOSS_R', 8.0),
     managerMode: (process.env.COUNCIL_MANAGER ?? '').trim().toLowerCase() === 'off' ? 'off' as const : 'llm' as const,
     reasoningEffort: (process.env.GROQ_REASONING_EFFORT ?? '').trim().toLowerCase()
   };
@@ -914,6 +1038,16 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const macroBearish = is15mBearish && !is15mBullish;
   const macroBullish = is15mBullish && !is15mBearish;
 
+  // Flow Conflict Guard: If 15m structure says BULLISH but delta says BEARISH (or vice-versa),
+  // the market is sending contradictory signals — downgrade to soft warning on the weaker direction.
+  if (activityScan.flowConflictWarning) {
+    const conflictDir: Direction = (activityScan.dominantFlow === 'BULLISH' && activityScan.cumDelta15m < 0) ? 'LONG'
+      : (activityScan.dominantFlow === 'BEARISH' && activityScan.cumDelta15m > 0) ? 'SHORT' : null as unknown as Direction;
+    if (conflictDir && !denied[conflictDir] && !hasMajorSweepLong && !hasMajorSweepShort) {
+      denied[conflictDir] = `Flow Conflict: 15m structure (${activityScan.dominantFlow}) contradicted by delta (${activityScan.cumDelta15m}); ${conflictDir} needs sweep/absorption to override.`;
+    }
+  }
+
   const rangeBars = (snapshot.candles5m && snapshot.candles5m.length >= 20)
     ? snapshot.candles5m.slice(-54)
     : snapshot.candles.slice(-270);
@@ -936,7 +1070,7 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
   } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
     denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
-  } else if (rangePosPct !== null && rangePosPct > 92 && !hasMajorSweepLong) {
+  } else if (rangePosPct !== null && rangePosPct > 88 && !hasMajorSweepLong) {
     denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range; wait for pullback to FVG/OB.`;
   }
 
@@ -948,10 +1082,12 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      if (shortPosPct > 97 && !denied.LONG) {
+      // Raised from 97% to 88% — buying above 88% of 30m range is late chase
+      if (shortPosPct > 88 && !denied.LONG) {
         denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
       }
-      if (shortPosPct < 3 && !denied.SHORT) {
+      // Raised from 3% to 12% — selling below 12% of 30m range sells into exhaustion
+      if (shortPosPct < 12 && !denied.SHORT) {
         denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
       }
     }
@@ -961,8 +1097,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = `Intraday 15m/5m trend is BULLISH (${activityScan.structure15m}); SHORTs blocked unless sweep-rejection or absorption occurs.`;
   } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0) {
     denied.SHORT = `Counter-trend SHORT blocked: 15m/5m BULLISH and both 60m (+${fpNetDelta.toFixed(1)}) and 15m (+${recent15Delta.toFixed(1)}) delta remain positive.`;
-  } else if (!macroBearish && recent15Delta >= 0 && rangePosPct !== null && rangePosPct < 8) {
-    denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of 4.5h range without bearish 15m delta.`;
+  } else if (rangePosPct !== null && rangePosPct < 12 && !hasMajorSweepShort) {
+    denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of dealing range; wait for bounce or OTE retest.`;
   }
 
   if (activityScan.blockedDirection === 'LONG' && !denied.LONG) {
@@ -1001,6 +1137,14 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without EMA50 breakdown + sweep/delta flip.';
   }
 
+  // 4H Directional Gate: never counter-trade 4H macro bias without confirmed HTF liquidity raid
+  if (derived.macro4hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !hasMajorSweepLong) {
+    denied.LONG = 'Macro 4H trend is BEARISH; counter-trend LONG blocked without confirmed HTF liquidity sweep.';
+  }
+  if (derived.macro4hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !hasMajorSweepShort) {
+    denied.SHORT = 'Macro 4H trend is BULLISH; counter-trend SHORT blocked without confirmed HTF liquidity raid.';
+  }
+
   // 4. Open Interest + Funding Rate Trap Filter & BTC Market-Leader Correlation Guard
   const deriv = snapshot.derivativesContext;
   if (deriv) {
@@ -1027,20 +1171,25 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
 // ===========================================================================
 export function computeConsensus(reports: SpecialistReport[]): { bias: Direction | null; reason: string } {
   const cfg = councilConfig();
-  const tally = (dir: Direction) => reports.filter((r) => r.bias === dir && r.strength >= 1);
+  // Count agrees: a specialist must have strength >= 2 to be a "real" vote.
+  // Strength-1 reporters are weak/uncertain and should not drive trade decisions on their own.
+  const tally = (dir: Direction) => reports.filter((r) => r.bias === dir && r.strength >= 2);
+  // Any specialist opposing at strength >= opposeVetoStrength kills the consensus.
   const vetoed = (dir: Direction) => reports.some((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= cfg.opposeVetoStrength);
 
   for (const dir of ['LONG', 'SHORT'] as Direction[]) {
     const supporters = tally(dir);
+    // Allow a strength-1 specialist to still count as "tie-breaker" when all 3 agree (unanimous)
+    const allThreeAgree = reports.filter((r) => r.bias === dir && r.strength >= 1).length >= 3;
     const opposing = reports.filter((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= 1);
-    const hasLeadOrUnanimous = supporters.some((r) => r.strength >= cfg.minLeadStrength) || supporters.length >= 3;
+    const hasLeadOrUnanimous = supporters.some((r) => r.strength >= cfg.minLeadStrength) || allThreeAgree;
     const unopposedPair = supporters.length >= 2 && opposing.length === 0;
     if (supporters.length >= cfg.minAgreeing && (hasLeadOrUnanimous || unopposedPair) && !vetoed(dir)) {
       return { bias: dir, reason: `${supporters.map((r) => r.name).join(' + ')} agree on ${dir}.` };
     }
   }
   const summary = reports.map((r) => `${r.agentId}:${r.bias}/${r.strength}`).join(', ');
-  return { bias: null, reason: `No qualifying consensus (${summary}). Need ${cfg.minAgreeing}+ aligned specialists, one with strength >= ${cfg.minLeadStrength}, and no opposing specialist at strength >= ${cfg.opposeVetoStrength}.` };
+  return { bias: null, reason: `No qualifying consensus (${summary}). Need ${cfg.minAgreeing}+ specialists at strength >= 2, one with strength >= ${cfg.minLeadStrength}, and no opposing specialist at strength >= ${cfg.opposeVetoStrength}.` };
 }
 
 // ===========================================================================
@@ -1111,7 +1260,8 @@ export function resolveTradeLevels(
   const effectiveMinRiskPct = isForex ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
   const effectiveMaxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
 
-  const minRisk = Math.max((entry * effectiveMinRiskPct) / 100, atr !== null ? atr * 2.0 : 0);
+  // Volatility noise floor: scaled to 1.2x ATR (was too aggressive at 2.0x ATR, which doubled stops and crushed R:R)
+  const minRisk = Math.max((entry * effectiveMinRiskPct) / 100, atr !== null ? atr * 1.2 : 0);
   if (risk < minRisk) {
     stopPrice = entry - dir * minRisk;
     risk = minRisk;
@@ -1170,7 +1320,7 @@ export function resolveTradeLevels(
 // ===========================================================================
 // Lessons memory hygiene
 // ===========================================================================
-export function normalizeLessons(lessons: readonly string[] | undefined, max = 6): string[] {
+export function normalizeLessons(lessons: readonly string[] | undefined, max = 15): string[] {
   const seen = new Set<string>();
   const clean: string[] = [];
   for (const raw of lessons ?? []) {
@@ -1195,16 +1345,20 @@ function lessonsBlock(lessons: string[], title: string): string {
 // ===========================================================================
 function compactSnapshot(snapshot: AgentSnapshot): AgentSnapshot {
   const derivedContext = buildDerivedContext(snapshot);
+  const latestPrice = snapshot.latestPrice ?? snapshot.candles[snapshot.candles.length - 1]?.close ?? 0;
   return {
     ...snapshot,
     derivedContext,
     candles: snapshot.candles.slice(-300),
-    footprints: snapshot.footprints.filter((bar) => bar.isClosed).slice(-12).map((bar) => ({
-      ...bar,
-      priceLevels: [...bar.priceLevels]
-        .sort((a, b) => b.totalVolume - a.totalVolume)
-        .slice(0, 14)
-    })),
+    footprints: snapshot.footprints.filter((bar) => bar.isClosed).slice(-12).map((bar) => {
+      // Sort price levels by proximity to current price (key area first) rather than raw volume.
+      // This ensures the LLM sees levels AROUND the current price (imbalances, POC area, key S/R)
+      // instead of only the highest-volume cluster which may be far from price action.
+      const byProximity = [...bar.priceLevels]
+        .sort((a, b) => Math.abs(a.price - latestPrice) - Math.abs(b.price - latestPrice))
+        .slice(0, 20);                     // keep 20 levels (was 14, sorted by volume)
+      return { ...bar, priceLevels: byProximity };
+    }),
     trades: [...snapshot.trades]
       .sort((a, b) => b.size - a.size)
       .slice(0, 25),

@@ -245,7 +245,7 @@ export class BybitWebSocketClient {
     this.marketDataWatchdog = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       const silentForMs = Date.now() - this.lastMarketDataAt;
-      if (silentForMs >= 60_000) {
+      if (silentForMs >= 90_000) {
         this.callbacks.onStatusChange('STALE', `No Bybit market-data messages for ${Math.floor(silentForMs / 1000)}s; reconnecting`);
         this.ws.terminate();
         return;
@@ -254,21 +254,26 @@ export class BybitWebSocketClient {
       // Other topics (for example klines) can keep the socket looking healthy
       // while a ticker or public-trade subscription has silently stalled.
       const now = Date.now();
+      let allTradesStalled = true;
       for (const symbol of this.symbols) {
         const tickerAt = this.lastTickerAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
         const tradeAt = this.lastPublicTradeAtBySymbol.get(symbol) ?? this.lastMarketDataAt;
-        if (now - tickerAt >= 45_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
-        if (now - tradeAt >= 35_000) {
-          this.callbacks.onStatusChange('STALE', `Trade stream stalled for ${symbol} (${Math.round((now - tradeAt) / 1000)}s); reconnecting socket`);
-          this.ws?.terminate();
-          return;
+        if (now - tickerAt >= 60_000) this.resubscribeTopic(TOPIC_TICKER(symbol));
+        if (now - tradeAt >= 45_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
+        if (now - tradeAt < 120_000) {
+          allTradesStalled = false;
         }
-        if (now - tradeAt >= 15_000) this.resubscribeTopic(TOPIC_PUBLIC_TRADE(symbol));
         for (const interval of ['1', '3', '5', '15', '30', '60', '240', 'D'] as const) {
           const topic = TOPIC_KLINE(interval, symbol);
           const lastAt = this.lastKlineAtByTopic.get(topic) ?? this.lastMarketDataAt;
-          if (now - lastAt >= 90_000) this.resubscribeTopic(topic);
+          if (now - lastAt >= 120_000) this.resubscribeTopic(topic);
         }
+      }
+
+      // Only terminate the entire socket if ALL symbols have stopped receiving trades for 120s+ and socket is quiet
+      if (allTradesStalled && now - this.lastMarketDataAt >= 60_000) {
+        this.callbacks.onStatusChange('STALE', `All Bybit trade streams quiet for 120s; reconnecting socket`);
+        this.ws?.terminate();
       }
     }, 15_000);
   }

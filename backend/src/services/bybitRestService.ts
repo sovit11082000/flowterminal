@@ -348,27 +348,63 @@ export class BybitRestService {
       aggregate: String(spec.aggregate),
       toTs: String(Math.floor(endMs / 1000))
     });
-    const res = await this.fetchFn(`https://min-api.cryptocompare.com/data/v2/${spec.path}?${query.toString()}`, {
-      method: 'GET',
-      headers: { Accept: 'application/json' }
-    });
-    if (!res.ok) {
-      throw new BybitRestServiceError(`CryptoCompare fallback HTTP error: ${res.status}`, 'HTTP_ERROR', res.status);
-    }
-    const payload = (await res.json()) as { Data?: { Data?: Array<{ time: number; open: number; high: number; low: number; close: number; volumefrom?: number; volumeto?: number }> } };
-    const rawRows = Array.isArray(payload?.Data?.Data) ? payload.Data.Data : [];
+
     const candles: HistoricalCandle[] = [];
-    for (const r of rawRows) {
-      const tSec = Number(r.time);
-      const open = Number(r.open);
-      const high = Number(r.high);
-      const low = Number(r.low);
-      const close = Number(r.close);
-      const volume = Number(r.volumefrom ?? 0);
-      const turnover = Number(r.volumeto ?? 0);
-      if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
-        candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+
+    // Fallback 1: CryptoCompare
+    try {
+      const res = await this.fetchFn(`https://min-api.cryptocompare.com/data/v2/${spec.path}?${query.toString()}`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' }
+      });
+      if (res.ok) {
+        const payload = (await res.json()) as { Data?: { Data?: Array<{ time: number; open: number; high: number; low: number; close: number; volumefrom?: number; volumeto?: number }> } };
+        const rawRows = Array.isArray(payload?.Data?.Data) ? payload.Data.Data : [];
+        for (const r of rawRows) {
+          const tSec = Number(r.time);
+          const open = Number(r.open);
+          const high = Number(r.high);
+          const low = Number(r.low);
+          const close = Number(r.close);
+          const volume = Number(r.volumefrom ?? 0);
+          const turnover = Number(r.volumeto ?? 0);
+          if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
+            candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+          }
+        }
       }
+    } catch {}
+
+    // Fallback 2: Binance Public Klines (Free, zero API key required, reliable on cloud/Render)
+    if (!candles.length) {
+      try {
+        const bTimeframe = timeframe === '1d' ? '1d' : timeframe === '4h' ? '4h' : timeframe === '1h' ? '1h' : '15m';
+        const bRes = await this.fetchFn(`https://api.binance.com/api/v3/klines?symbol=${fsym}USDT&interval=${bTimeframe}&limit=${Math.min(limit, 100)}`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' }
+        });
+        if (bRes.ok) {
+          const bRows = (await bRes.json()) as Array<[number, string, string, string, string, string, number, string]>;
+          if (Array.isArray(bRows)) {
+            for (const r of bRows) {
+              const tSec = Math.floor(Number(r[0]) / 1000);
+              const open = Number(r[1]);
+              const high = Number(r[2]);
+              const low = Number(r[3]);
+              const close = Number(r[4]);
+              const volume = Number(r[5]);
+              const turnover = Number(r[7]);
+              if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
+                candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (!candles.length) {
+      throw new BybitRestServiceError(`All historical candle providers failed for ${symbol}`, 'HTTP_ERROR', 502);
     }
     candles.sort((a, b) => a.time - b.time);
     return {

@@ -228,9 +228,11 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   const evidence = emptyEvidence();
 
   // 1) Body-Close Confirmed BOS / CHoCH (rejects wick-only fake breakouts)
+  // Cap raised to 0.4% (was 0.25%) — BTC can close 0.3-0.5% above a swing on a real BOS;
+  // the old 0.25% cap silently dropped valid crypto breakouts.
   if (lastHigh && lastHigh.index <= n - 2 && last.close > lastHigh.price && last.close > open(last)) {
     const breakoutDistance = (last.close - lastHigh.price) / lastHigh.price;
-    if (breakoutDistance <= 0.0025) {
+    if (breakoutDistance <= 0.004) {
       const choch = structure === 'BEARISH';
       evidence.LONG.push({
         pts: 1,
@@ -242,7 +244,7 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   }
   if (lastLow && lastLow.index <= n - 2 && last.close < lastLow.price && last.close < open(last)) {
     const breakdownDistance = (lastLow.price - last.close) / lastLow.price;
-    if (breakdownDistance <= 0.0025) {
+    if (breakdownDistance <= 0.004) {
       const choch = structure === 'BULLISH';
       evidence.SHORT.push({
         pts: 1,
@@ -656,9 +658,16 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
   const domAskDominant = bidVolTop5 > 0 && askVolTop5 > 0 && askVolTop5 >= bidVolTop5 * 1.75;
 
   // 1) Key-Level Institutional Absorption + Price Response Confirmation
-  const keyLevels = [snapshot.profile?.vah, snapshot.profile?.val, derived.pdh, derived.pdl, derived.sessionHigh, derived.sessionLow]
-    .filter((v): v is number => v !== null && v !== undefined && Number.isFinite(v));
-  const nearKeyLevel = keyLevels.some((lvl) => Math.abs(latest.close - lvl) / latest.close <= 0.0025);
+  // nearKeyLevel proximity widened to 0.4% (was 0.25%) — matches BOS cap change.
+  // Also include swing highs/lows from derived context as key levels.
+  const keyLevels = [
+    snapshot.profile?.vah, snapshot.profile?.val,
+    derived.pdh, derived.pdl,
+    derived.sessionHigh, derived.sessionLow,
+    derived.recentSwingHigh, derived.recentSwingLow,
+    derived.pwh, derived.pwl
+  ].filter((v): v is number => v !== null && v !== undefined && Number.isFinite(v));
+  const nearKeyLevel = keyLevels.some((lvl) => Math.abs(latest.close - lvl) / latest.close <= 0.004);
 
   if (micro.absorptionSignal === 'BULLISH_ABSORPTION' && nearKeyLevel && latest.close > open(latest)) {
     evidence.LONG.push({
@@ -757,7 +766,10 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     }
   }
 
-  // 2.2) True Iceberg Order Refill Detection (25+ repeated limit fills at exact price tick)
+  // 2.2) True Iceberg Order Refill Detection (OF24 / OF25)
+  // NOTE: bidIcebergPrice / askIcebergPrice are optional extension fields populated by
+  // OrderFlowAggregator when iceberg detection is enabled. They default to null until
+  // that feature is wired up — the guard below keeps the code safe and ready.
   const bidIceberg = (latest as { bidIcebergPrice?: number | null }).bidIcebergPrice ?? null;
   const askIceberg = (latest as { askIcebergPrice?: number | null }).askIcebergPrice ?? null;
   if (bidIceberg !== null && latest.close > open(latest)) {
@@ -777,11 +789,23 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     });
   }
 
-  // 2.3) Big Orders / Whale Tape Sweeps (Individual prints >= 8x avg size dominating bar flow)
-  const whaleBuyVol = (latest as { whaleBuyVolume?: number }).whaleBuyVolume ?? 0;
-  const whaleSellVol = (latest as { whaleSellVolume?: number }).whaleSellVolume ?? 0;
-  const whaleBuyCount = (latest as { whaleBuyCount?: number }).whaleBuyCount ?? 0;
-  const whaleSellCount = (latest as { whaleSellCount?: number }).whaleSellCount ?? 0;
+  // 2.3) Whale Tape Sweeps — approximate from raw trade list (OF26 / OF27)
+  // Since whaleBuyVolume is not yet a first-class field on SerializedFootprintBar,
+  // we derive a proxy from snapshot.trades: sum trades >= 8× median size in this bar's window.
+  const barTrades = snapshot.trades.filter(
+    (t) => t.timestamp >= latest.time * 1000 && t.timestamp < (latest.time + 60) * 1000
+  );
+  let whaleBuyVol = 0, whaleSellVol = 0, whaleBuyCount = 0, whaleSellCount = 0;
+  if (barTrades.length >= 5) {
+    const sizes = barTrades.map((t) => t.size).sort((a, b) => a - b);
+    const median = sizes[Math.floor(sizes.length / 2)];
+    const threshold = median * 8;
+    for (const t of barTrades) {
+      if (t.size < threshold) continue;
+      if (t.side === 'Buy') { whaleBuyVol += t.size; whaleBuyCount++; }
+      else { whaleSellVol += t.size; whaleSellCount++; }
+    }
+  }
   if (latest.totalVolume > 0) {
     if (whaleBuyVol >= latest.totalVolume * 0.18 && whaleBuyVol > whaleSellVol * 1.5 && latest.close > open(latest)) {
       evidence.LONG.push({
@@ -837,19 +861,103 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     }
   }
 
-  const syn5mBearish = syn ? (syn.close < syn.open && syn.delta < 0) : false;
-  const syn5mBullish = syn ? (syn.close > syn.open && syn.delta > 0) : false;
-  const hasInstitutionalLong = evidence.LONG.some((e) => ['OF01', 'OF21', 'OF23', 'OF24', 'OF26'].includes(e.strategy ?? ''));
-  const hasInstitutionalShort = evidence.SHORT.some((e) => ['OF02', 'OF21', 'OF23', 'OF25', 'OF27'].includes(e.strategy ?? ''));
+  // 6) 5-MINUTE FOOTPRINT MACRO ANALYSIS & DIRECTIONAL CONFLUENCE
+  // 5m Footprint establishes institutional order flow: 5m Delta, 5m CVD trend, 5m POC position
+  const syn5mBullish = syn ? (syn.delta > 0 && (syn.close >= syn.open || syn.pocPosition === 'POC_SUPPORT_UNDERFOOT')) : false;
+  const syn5mBearish = syn ? (syn.delta < 0 && (syn.close <= syn.open || syn.pocPosition === 'POC_TRAPPED_OVERHEAD')) : false;
+
+  if (syn) {
+    if (syn5mBullish) {
+      evidence.LONG.push({
+        pts: 2,
+        category: 'FLOW',
+        strategy: 'OF_5M_MACRO',
+        text: `5m Footprint Institutional Accumulation: 5m Delta (+${f(syn.delta)}), CVD ${syn.cvdTrend ?? 'RISING'}, 5m POC support underfoot (${f(syn.pocPrice)}).`
+      });
+    }
+    if (syn.signal === 'BULLISH_SELLER_ABSORPTION_UNDERFOOT_POC' || syn.signal === 'BULLISH_5M_DELTA_IMPULSE') {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'LIQUIDITY',
+        strategy: 'OF_5M_SIG',
+        text: `5m Institutional Footprint Signal: ${syn.signal}.`
+      });
+    }
+
+    if (syn5mBearish) {
+      evidence.SHORT.push({
+        pts: 2,
+        category: 'FLOW',
+        strategy: 'OF_5M_MACRO',
+        text: `5m Footprint Institutional Distribution: 5m Delta (${f(syn.delta)}), CVD ${syn.cvdTrend ?? 'FALLING'}, 5m POC trapped overhead (${f(syn.pocPrice)}).`
+      });
+    }
+    if (syn.signal === 'BEARISH_TRAPPED_BUYERS_OVERHEAD_POC' || syn.signal === 'BEARISH_5M_DELTA_BREAKDOWN') {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'LIQUIDITY',
+        strategy: 'OF_5M_SIG',
+        text: `5m Institutional Footprint Signal: ${syn.signal}.`
+      });
+    }
+  }
+
+  // 7) 1-MINUTE SNIPER ENTRY TRIGGER & RE-TEST CONFIRMATION
+  // The entry is planned and triggered on the 1m candle close once 5m macro flow aligns
+  const is1m = snapshot.timeframe === '1m';
+  if (is1m) {
+    // 1m Bullish Entry Trigger
+    if (latest.close > open(latest) && latest.delta > 0) {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'MOMENTUM',
+        strategy: 'OF_1M_TRIGGER',
+        text: `1m Sniper Entry Trigger: Closed bullish (${f(latest.close)}) with positive delta (+${f(latest.delta)}).`
+      });
+    }
+    // 1m Retest of 5m POC as dynamic support
+    if (syn && Math.abs(latest.low - syn.pocPrice) / syn.pocPrice <= 0.003 && latest.close >= syn.pocPrice) {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'POI',
+        strategy: 'OF_5M_POC_RETEST',
+        text: `1m Pullback & Bounce off 5m POC (${f(syn.pocPrice)}) held as dynamic support.`
+      });
+    }
+
+    // 1m Bearish Entry Trigger
+    if (latest.close < open(latest) && latest.delta < 0) {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'MOMENTUM',
+        strategy: 'OF_1M_TRIGGER',
+        text: `1m Sniper Entry Trigger: Closed bearish (${f(latest.close)}) with negative delta (${f(latest.delta)}).`
+      });
+    }
+    // 1m Retest of 5m POC as dynamic resistance
+    if (syn && Math.abs(latest.high - syn.pocPrice) / syn.pocPrice <= 0.003 && latest.close <= syn.pocPrice) {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'POI',
+        strategy: 'OF_5M_POC_RETEST',
+        text: `1m Pullback & Rejection from 5m POC (${f(syn.pocPrice)}) held as dynamic ceiling.`
+      });
+    }
+  }
+
+  const hasInstitutionalLong = evidence.LONG.some((e) => ['OF01', 'OF21', 'OF23', 'OF24', 'OF26', 'OF_5M_MACRO'].includes(e.strategy ?? ''));
+  const hasInstitutionalShort = evidence.SHORT.some((e) => ['OF02', 'OF21', 'OF23', 'OF25', 'OF27', 'OF_5M_MACRO'].includes(e.strategy ?? ''));
 
   const caps: Record<Dir, Cap[]> = {
     LONG: [
-      { when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD', cap: 1, concern: 'Long capped: 5m synthetic POC is overhead.' },
-      { when: Boolean(syn) && !syn5mBullish && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 5m footprint close/delta has not confirmed bullish flow yet.' }
+      { when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD' && latest.close < (syn.pocPrice * 0.9985), cap: 1, concern: 'Long capped: 5m high-volume POC is trapped overhead.' },
+      { when: Boolean(syn) && syn!.delta < 0 && syn!.cvdTrend === 'FALLING', cap: 1, concern: 'Long capped: 5m footprint delta is negative and 5m CVD is falling.' },
+      { when: is1m && latest.close < open(latest) && latest.delta < 0 && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 1m trigger candle closed bearish with negative delta.' }
     ],
     SHORT: [
-      { when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT', cap: 1, concern: 'Short capped: 5m synthetic POC is underfoot.' },
-      { when: Boolean(syn) && !syn5mBearish && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 5m footprint close/delta has not confirmed bearish flow yet.' }
+      { when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT' && latest.close > (syn.pocPrice * 1.0015), cap: 1, concern: 'Short capped: 5m high-volume POC is acting as support underfoot.' },
+      { when: Boolean(syn) && syn!.delta > 0 && syn!.cvdTrend === 'RISING', cap: 1, concern: 'Short capped: 5m footprint delta is positive and 5m CVD is rising.' },
+      { when: is1m && latest.close > open(latest) && latest.delta > 0 && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 1m trigger candle closed bullish with positive delta.' }
     ]
   };
 
