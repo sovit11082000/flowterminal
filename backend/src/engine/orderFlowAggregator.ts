@@ -33,6 +33,12 @@ export interface FootprintBar {
   pocPrice: number;        // Price level with maximum volume
   pocVolume: number;       // Volume executed at POC
   tradesCount: number;
+  whaleBuyVolume: number;  // Big single tape prints (Ask sweeps >= 8x avg print)
+  whaleSellVolume: number; // Big single tape prints (Bid sweeps >= 8x avg print)
+  whaleBuyCount: number;
+  whaleSellCount: number;
+  bidIcebergPrice: number | null; // Price level showing repeated passive Bid refill absorption
+  askIcebergPrice: number | null; // Price level showing repeated passive Ask refill absorption
   priceLevels: Map<number, PriceLevelVolume>;
   isClosed: boolean;
 }
@@ -62,6 +68,12 @@ export interface SerializedFootprintBar {
   pocPrice: number;
   pocVolume: number;
   tradesCount: number;
+  whaleBuyVolume: number;
+  whaleSellVolume: number;
+  whaleBuyCount: number;
+  whaleSellCount: number;
+  bidIcebergPrice: number | null;
+  askIcebergPrice: number | null;
   priceLevels: SerializedPriceLevelVolume[];
   isClosed: boolean;
 }
@@ -214,6 +226,12 @@ export class OrderFlowAggregator {
       pocPrice: bar.pocPrice,
       pocVolume: bar.pocVolume,
       tradesCount: bar.tradesCount,
+      whaleBuyVolume: bar.whaleBuyVolume,
+      whaleSellVolume: bar.whaleSellVolume,
+      whaleBuyCount: bar.whaleBuyCount,
+      whaleSellCount: bar.whaleSellCount,
+      bidIcebergPrice: bar.bidIcebergPrice,
+      askIcebergPrice: bar.askIcebergPrice,
       priceLevels: sortedLevels,
       isClosed: bar.isClosed
     };
@@ -246,6 +264,12 @@ export class OrderFlowAggregator {
       pocPrice: quantizedPrice,
       pocVolume: 0,
       tradesCount: 0,
+      whaleBuyVolume: 0,
+      whaleSellVolume: 0,
+      whaleBuyCount: 0,
+      whaleSellCount: 0,
+      bidIcebergPrice: null,
+      askIcebergPrice: null,
       priceLevels: new Map(),
       isClosed: false
     };
@@ -306,7 +330,28 @@ export class OrderFlowAggregator {
     level.delta = Number((level.askVolume - level.bidVolume).toFixed(6));
     level.tradesCount += 1;
 
-    // 4. Point of Control (POC) Evaluation
+    // 4. Whale Tape Print Detection (Individual trade >= 8x running average trade size after warmup)
+    const avgPrintSize = bar.tradesCount > 5 ? (bar.totalVolume - size) / (bar.tradesCount - 1) : 0;
+    if (avgPrintSize > 0 && size >= avgPrintSize * 8) {
+      if (isBuy) {
+        bar.whaleBuyVolume = Number((bar.whaleBuyVolume + size).toFixed(6));
+        bar.whaleBuyCount += 1;
+      } else {
+        bar.whaleSellVolume = Number((bar.whaleSellVolume + size).toFixed(6));
+        bar.whaleSellCount += 1;
+      }
+    }
+
+    // 5. True Iceberg Refill Detection (25+ prints soaked at exact price level without breaking through)
+    if (level.tradesCount >= 25) {
+      if (level.bidVolume >= level.askVolume * 2.2 && bar.close >= level.price) {
+        bar.bidIcebergPrice = level.price;
+      } else if (level.askVolume >= level.bidVolume * 2.2 && bar.close <= level.price) {
+        bar.askIcebergPrice = level.price;
+      }
+    }
+
+    // 6. Point of Control (POC) Evaluation
     if (level.totalVolume > bar.pocVolume) {
       bar.pocPrice = level.price;
       bar.pocVolume = level.totalVolume;

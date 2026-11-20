@@ -60,9 +60,9 @@ function finalize(input: FinalizeInput): SpecialistReport {
 
   const hasSweepOrAbsorptionEvidence = dir
     ? evidence[dir].some((e) =>
-        ['SMC05', 'SMC06', 'SMC07', 'SMC08', 'ICT05', 'ICT06', 'ICT13', 'ICT14', 'ICT15', 'ICT16', 'OF01', 'OF02', 'OF21', 'OF23'].includes(e.strategy ?? '') ||
+        ['SMC05', 'SMC06', 'SMC07', 'SMC08', 'ICT05', 'ICT06', 'ICT13', 'ICT14', 'ICT15', 'ICT16', 'OF01', 'OF02', 'OF21', 'OF23', 'OF24', 'OF25'].includes(e.strategy ?? '') ||
         e.category === 'LIQUIDITY' ||
-        /swept|absorption|raid|turtle soup/i.test(e.text)
+        /swept|absorption|iceberg|raid|turtle soup/i.test(e.text)
       )
     : false;
 
@@ -753,6 +753,50 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
         category: 'LIQUIDITY',
         strategy: 'OF21',
         text: `Institutional Ask Defense: Heavy buying delta (+${f(micro.latestBarDelta)}) absorbed by passive seller; closed bearish below mid (${f(latest.close)}).`
+      });
+    }
+  }
+
+  // 2.2) True Iceberg Order Refill Detection (25+ repeated limit fills at exact price tick)
+  const bidIceberg = (latest as { bidIcebergPrice?: number | null }).bidIcebergPrice ?? null;
+  const askIceberg = (latest as { askIcebergPrice?: number | null }).askIcebergPrice ?? null;
+  if (bidIceberg !== null && latest.close > open(latest)) {
+    evidence.LONG.push({
+      pts: 2,
+      category: 'LIQUIDITY',
+      strategy: 'OF24',
+      text: `True Bid Iceberg Refill: repeated passive limit refills soaked sell sweeps at ${f(bidIceberg)}; closed bullish at ${f(latest.close)}.`
+    });
+  }
+  if (askIceberg !== null && latest.close < open(latest)) {
+    evidence.SHORT.push({
+      pts: 2,
+      category: 'LIQUIDITY',
+      strategy: 'OF25',
+      text: `True Ask Iceberg Refill: repeated passive limit refills soaked buy sweeps at ${f(askIceberg)}; closed bearish at ${f(latest.close)}.`
+    });
+  }
+
+  // 2.3) Big Orders / Whale Tape Sweeps (Individual prints >= 8x avg size dominating bar flow)
+  const whaleBuyVol = (latest as { whaleBuyVolume?: number }).whaleBuyVolume ?? 0;
+  const whaleSellVol = (latest as { whaleSellVolume?: number }).whaleSellVolume ?? 0;
+  const whaleBuyCount = (latest as { whaleBuyCount?: number }).whaleBuyCount ?? 0;
+  const whaleSellCount = (latest as { whaleSellCount?: number }).whaleSellCount ?? 0;
+  if (latest.totalVolume > 0) {
+    if (whaleBuyVol >= latest.totalVolume * 0.18 && whaleBuyVol > whaleSellVol * 1.5 && latest.close > open(latest)) {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'FLOW',
+        strategy: 'OF26',
+        text: `Whale Tape Sweep (Buy): ${whaleBuyCount} big institutional prints (${f(whaleBuyVol)} vol) swept asks with bullish close.`
+      });
+    }
+    if (whaleSellVol >= latest.totalVolume * 0.18 && whaleSellVol > whaleBuyVol * 1.5 && latest.close < open(latest)) {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'FLOW',
+        strategy: 'OF27',
+        text: `Whale Tape Sweep (Sell): ${whaleSellCount} big institutional prints (${f(whaleSellVol)} vol) hit bids with bearish close.`
       });
     }
   }
