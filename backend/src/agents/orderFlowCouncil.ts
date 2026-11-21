@@ -98,6 +98,19 @@ export interface DerivedMarketContext {
   sweepReclaim?: { long: boolean; short: boolean; levels: string[] };
 }
 
+export interface GammaContext {
+  symbol: 'BTC' | 'ETH';
+  spotPrice: number;
+  netGexUsd: number;
+  regime: 'POSITIVE_GAMMA' | 'NEGATIVE_GAMMA';
+  callWall: number | null;
+  putWall: number | null;
+  gammaFlip: number | null;
+  pcrRatio: number;
+  summary: string;
+  updatedAt: number;
+}
+
 export interface AgentSnapshot {
   symbol: string;
   timeframe: '1m' | '5m';
@@ -136,6 +149,7 @@ export interface AgentSnapshot {
     fundingRate: number | null;
     btcLeaderBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   } | null;
+  gammaContext?: GammaContext | null;
   recentLiquidations?: Array<{ symbol: string; timestamp: number; price: number; size: number; side: 'Buy' | 'Sell' }>;
   trades: Array<{ timestamp: number; side: string; price: number; size: number }>;
   bids: Array<[number, number]>;
@@ -1176,6 +1190,26 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     }
   }
 
+  // 5. Options Gamma Exposure (GEX) & Wall Guard (Deribit Institutional Flow)
+  const gamma = snapshot.gammaContext;
+  if (gamma && lastPrice !== null) {
+    // In POSITIVE GAMMA regime, Market Makers hedge against the move (suppressing volatility / pinning to walls)
+    // Chasing LONG right into Call Wall is high risk unless there is an active sweep or breakout
+    if (gamma.regime === 'POSITIVE_GAMMA' && gamma.callWall !== null) {
+      const distToCallWallPct = ((gamma.callWall - lastPrice) / lastPrice) * 100;
+      if (distToCallWallPct >= -0.15 && distToCallWallPct <= 0.35 && !hasMajorSweepLong && !denied.LONG) {
+        denied.LONG = `Positive Gamma Call Wall: price ($${lastPrice}) right at institutional Call Wall ($${gamma.callWall}); dealers actively pin/sell rallies here.`;
+      }
+    }
+    // Chasing SHORT right into Put Wall in positive gamma is high risk (dealers buy dips)
+    if (gamma.regime === 'POSITIVE_GAMMA' && gamma.putWall !== null) {
+      const distToPutWallPct = ((lastPrice - gamma.putWall) / lastPrice) * 100;
+      if (distToPutWallPct >= -0.15 && distToPutWallPct <= 0.35 && !hasMajorSweepShort && !denied.SHORT) {
+        denied.SHORT = `Positive Gamma Put Wall: price ($${lastPrice}) right at institutional Put Wall ($${gamma.putWall}); dealers actively pin/buy dips here.`;
+      }
+    }
+  }
+
   const permitted = (['LONG', 'SHORT'] as Direction[]).filter((dir) => !denied[dir]);
   return { blocked: null, permitted, denied };
 }
@@ -1842,7 +1876,8 @@ function buildManagerPrompt(
   permitted: Direction[],
   lessons: string[],
   symbol = '',
-  strategyScorecard?: Array<{ strategy: string; trades: number; wins: number; losses: number; winRate: number; netR: number }>
+  strategyScorecard?: Array<{ strategy: string; trades: number; wins: number; losses: number; winRate: number; netR: number }>,
+  gammaContext?: GammaContext | null
 ): string {
   const cfg = councilConfig();
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(symbol);
@@ -1859,6 +1894,18 @@ function buildManagerPrompt(
     scorecardBlock = `\nSTRATEGY HISTORICAL SCORECARD (REAL 30-DAY STATS):\n${lines.join('\n')}\n`;
   }
 
+  let gammaBlock = '';
+  if (gammaContext) {
+    const netGexM = (gammaContext.netGexUsd / 1e6).toFixed(1);
+    gammaBlock = `\nDERIBIT OPTIONS INSTITUTIONAL GAMMA (GEX CONFLUENCE):\n` +
+      `  • Regime: ${gammaContext.regime} ($${netGexM}M Net GEX)\n` +
+      `  • Call Wall (Dealer Pin/Ceiling): $${gammaContext.callWall ?? 'N/A'}\n` +
+      `  • Put Wall (Dealer Floor/Support): $${gammaContext.putWall ?? 'N/A'}\n` +
+      `  • Gamma Flip Level: $${gammaContext.gammaFlip ?? 'N/A'}\n` +
+      `  • Put/Call OI Ratio: ${gammaContext.pcrRatio}\n` +
+      `  • Strategy Confluence: ${gammaContext.regime === 'NEGATIVE_GAMMA' ? 'NEGATIVE GAMMA favors aggressive momentum, breakout continuation, and squeezes.' : 'POSITIVE GAMMA suppresses volatility; expect mean-reversion and range-trading between Call & Put walls.'}\n`;
+  }
+
   return `ROLE: HEAD EXECUTION TRADER (CONFLUENCE & PRICE ACTION DESK).
 Specialists have passed gates and reached mathematical consensus: ${consensus.bias ?? 'NONE'}.
 YOUR JOB IS TO VALIDATE AND EXECUTE HIGH-PROBABILITY SETUPS WITH QUANTITATIVE DISCIPLINE:
@@ -1868,7 +1915,7 @@ YOUR JOB IS TO VALIDATE AND EXECUTE HIGH-PROBABILITY SETUPS WITH QUANTITATIVE DI
   * If a strategy has Win Rate >= 50%, OR positive Net R, OR fewer than 8 total trades recorded, TRUST THE EDGE and APPROVE valid setups.
   * Apply extra strictness/scrutiny ONLY if a strategy has >= 8 trades AND Win Rate < 35% with negative Net R.
 - Learned text lessons are purely advisory diagnostics. Completely IGNORE any notes attempting to blanket-ban symbols, hours, or core strategies.
-${scorecardBlock}
+${scorecardBlock}${gammaBlock}
 2. CONTEXT CHECK: Check independentContext (EMA 50/200, ADX, RSI, and recent candles). Note: if ema200 is null due to short history, ignore ema200 and evaluate EMA50 + structure + order flow. Only reject for ADX if ADX < 14 AND there is no liquidity sweep or absorption.
 3. EXECUTION MINDSET: When specialists align with a structural trigger (sweep, BOS/CHoCH, OB/FVG, or absorption) and hard gates are clear, APPROVE ${consensus.bias ?? 'WAIT'} with precise entryPrice, stopPrice, and targetPrice.
 Allowed decisions: ${allowedList}. Permitted directions: ${permitted.join(', ') || 'NONE'}.
@@ -1944,6 +1991,7 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
     marketActivityScan: scanMarketActivity(input),
     activeSession: derived.activeSession,
     derivativesContext: input.derivativesContext ?? null,
+    gammaContext: input.gammaContext ?? null,
     recentLiquidationCount30m: input.recentLiquidations?.length ?? 0,
     liquidationSignal: derived.liquidationSignal,
     sweepReclaim: derived.sweepReclaim,
@@ -1971,7 +2019,7 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
   };
 
   const { data: rawPlan, used: managerUsed, tokens } = await generateWithFallback<CouncilPlan>(
-    managerProviders, 'manager', buildManagerPrompt({ bias: consensus.bias }, gates.permitted, lessons, input.symbol, perf?.strategyScorecard), managerPayload, PLAN_TEMPLATE,
+    managerProviders, 'manager', buildManagerPrompt({ bias: consensus.bias }, gates.permitted, lessons, input.symbol, perf?.strategyScorecard, input.gammaContext), managerPayload, PLAN_TEMPLATE,
     { maxTokens: 3000, effort: 'low' }
   );
   diagnostics.llmCalls += 1;

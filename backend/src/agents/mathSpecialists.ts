@@ -760,6 +760,48 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     }
   }
 
+  // 1.2) Deribit Options Gamma (GEX) Institutional Confluence
+  const gamma = snapshot.gammaContext;
+  if (gamma && latest.close > 0) {
+    if (gamma.putWall !== null && Math.abs(latest.close - gamma.putWall) / latest.close <= 0.005) {
+      if (latest.close > open(latest) || (micro.latestBarDelta > 0 && micro.cvdTrend === 'RISING')) {
+        evidence.LONG.push({
+          pts: 2,
+          category: 'POI',
+          strategy: 'OF10',
+          text: `Deribit Put Wall Support bounce ($${gamma.putWall}): institutional options floor defended with buying response.`
+        });
+      }
+    }
+    if (gamma.callWall !== null && Math.abs(latest.close - gamma.callWall) / latest.close <= 0.005) {
+      if (latest.close < open(latest) || (micro.latestBarDelta < 0 && micro.cvdTrend === 'FALLING')) {
+        evidence.SHORT.push({
+          pts: 2,
+          category: 'POI',
+          strategy: 'OF11',
+          text: `Deribit Call Wall Resistance rejection ($${gamma.callWall}): institutional options ceiling pinned/rejected with selling response.`
+        });
+      }
+    }
+    if (gamma.regime === 'NEGATIVE_GAMMA' && gamma.gammaFlip !== null) {
+      if (latest.close < gamma.gammaFlip && micro.cvdTrend === 'FALLING' && micro.latestBarDelta < 0) {
+        evidence.SHORT.push({
+          pts: 1,
+          category: 'MOMENTUM',
+          strategy: 'OF12',
+          text: `Negative Gamma Acceleration: price below Gamma Flip ($${gamma.gammaFlip}) with negative delta expansion.`
+        });
+      } else if (latest.close > gamma.gammaFlip && micro.cvdTrend === 'RISING' && micro.latestBarDelta > 0) {
+        evidence.LONG.push({
+          pts: 1,
+          category: 'MOMENTUM',
+          strategy: 'OF13',
+          text: `Gamma Flip Reclaim: price trading above Gamma Flip ($${gamma.gammaFlip}) with positive delta momentum.`
+        });
+      }
+    }
+  }
+
   // 2) Stacked Imbalances (3+ adjacent levels per catalogue OF07/OF08)
   if (micro.stackedBuyImbalances.length >= 3 && latest.close >= latest.open) {
     evidence.LONG.push({

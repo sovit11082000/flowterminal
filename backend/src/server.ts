@@ -32,6 +32,7 @@ import { OrderFlowAggregator } from './engine/orderFlowAggregator.js';
 import { BybitRestService, BybitRestServiceError } from './services/bybitRestService.js';
 import { BybitOptionsService, type OptionBase } from './services/bybitOptionsService.js';
 import { BinanceOptionsService } from './services/binanceOptionsService.js';
+import { DeribitOptionsService } from './services/deribitOptionsService.js';
 import { FootprintHistoryStore } from './services/footprintHistoryStore.js';
 import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
@@ -149,6 +150,8 @@ async function fetchBybitRest(endpoint: string, init?: RequestInit): Promise<Res
 const restService = new BybitRestService({ baseUrl: BYBIT_REST_BASE });
 const optionsService = new BybitOptionsService(BYBIT_REST_BASE);
 const binanceOptionsService = new BinanceOptionsService();
+const deribitOptionsService = new DeribitOptionsService();
+deribitOptionsService.startAutoRefresh(300_000);
 const orderBookHistory = new OrderBookHistoryStore();
 const tradeHistory = new TradeHistoryStore();
 const liquidationHistory = new LiquidationHistoryStore();
@@ -772,21 +775,23 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && parsed.pathname === '/api/options-gamma') {
     const baseCoin = parsed.query.baseCoin;
-    const source = typeof parsed.query.source === 'string' ? parsed.query.source.toLowerCase() : 'binance';
+    const source = typeof parsed.query.source === 'string' ? parsed.query.source.toLowerCase() : 'deribit';
     if (baseCoin !== 'BTC' && baseCoin !== 'ETH') {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'baseCoin must be BTC or ETH.' }));
       return;
     }
-    if (source !== 'binance' && source !== 'bybit') {
+    if (source !== 'binance' && source !== 'bybit' && source !== 'deribit') {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'source must be binance or bybit.' }));
+      res.end(JSON.stringify({ error: 'source must be deribit, binance or bybit.' }));
       return;
     }
     try {
-      const snapshot = source === 'binance'
-        ? await binanceOptionsService.fetchSnapshot(baseCoin as OptionBase)
-        : await optionsService.fetchSnapshot(baseCoin as OptionBase);
+      const snapshot = source === 'deribit'
+        ? await deribitOptionsService.fetchSnapshot(baseCoin as OptionBase)
+        : source === 'binance'
+          ? await binanceOptionsService.fetchSnapshot(baseCoin as OptionBase)
+          : await optionsService.fetchSnapshot(baseCoin as OptionBase);
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(snapshot));
     } catch (err: unknown) {
@@ -1468,6 +1473,25 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
 
       const recentLiqs = liquidationHistory.getHistory(symbol, Date.now() - 30 * 60_000, Date.now(), 50);
 
+      const optionBaseCoin: OptionBase | null =
+        symbol === 'BTCUSDT' ? 'BTC' :
+        symbol === 'ETHUSDT' ? 'ETH' : null;
+      const gammaSnap = optionBaseCoin
+        ? deribitOptionsService.getLatestSnapshot(optionBaseCoin)
+        : (symbol === 'SOLUSDT' ? deribitOptionsService.getLatestSnapshot('BTC') : null);
+      const gammaContext = gammaSnap ? {
+        symbol: gammaSnap.baseCoin,
+        spotPrice: gammaSnap.spotPrice,
+        netGexUsd: gammaSnap.netGexUsd,
+        regime: gammaSnap.regime,
+        callWall: gammaSnap.callWall,
+        putWall: gammaSnap.putWall,
+        gammaFlip: gammaSnap.gammaFlip,
+        pcrRatio: gammaSnap.pcrRatio,
+        summary: gammaSnap.summary,
+        updatedAt: gammaSnap.updatedAt
+      } : null;
+
       const snapshot: AgentSnapshot = {
         symbol,
         timeframe: '1m',
@@ -1477,6 +1501,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           fundingRate: symTicker?.fundingRate ?? null,
           btcLeaderBias
         },
+        gammaContext,
         recentLiquidations: recentLiqs,
         feedStatus: isOrderBookSafe ? symbolStatus : 'DESYNCHRONIZED',
         lastTradeAt: symbolLastTradeAt,
