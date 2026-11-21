@@ -1003,14 +1003,14 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     return { blocked: `Data quality gate: market feed stale (${staleSec}s since last trade).`, permitted: none, denied: {} };
   }
 
-  // 2. Account-Level Risk Circuit Breaker (45-min cooldown after 3 consecutive losses, not permanent day lock)
+  // 2. Account-Level Risk Circuit Breaker (20-min cooldown after 3 consecutive losses, not permanent day lock)
   const recentTrades = snapshot.paperPerformance?.recent ?? [];
   const lastThree = recentTrades.slice(-3);
   if (lastThree.length === 3 && lastThree.every((t) => t.outcome === 'LOSS')) {
     const lastLossAt = (lastThree[2] as { resolvedAt?: number }).resolvedAt ?? 0;
     const elapsedMin = lastLossAt > 0 ? (Date.now() - lastLossAt) / 60_000 : 999;
-    if (elapsedMin < 45) {
-      const waitMin = Math.ceil(45 - elapsedMin);
+    if (elapsedMin < 20) {
+      const waitMin = Math.ceil(20 - elapsedMin);
       return { blocked: `Risk circuit breaker: 3 consecutive losses; cooling down for ${waitMin}m more.`, permitted: none, denied: {} };
     }
   }
@@ -1030,13 +1030,16 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const absorption = derived.orderFlowSummary?.absorptionSignal ?? 'NONE';
   const isChopRegime = derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop;
 
-  if (isChopRegime) {
-    return { blocked: 'CHOP_COMPRESSION: sideways/low-volume market detected; standing aside completely.', permitted: none, denied: {} };
-  }
-
   const sweptLevels = sweep.levels ?? [];
   const hasMajorSweepLong = sweep.long && sweptLevels.some((l) => l === 'PDL' || l === 'PWL');
   const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH');
+  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION';
+  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION';
+
+  // Do not block CHOP if there is an active institutional absorption or sweep-reclaim
+  if (isChopRegime && !hasReversalTriggerLong && !hasReversalTriggerShort) {
+    return { blocked: 'CHOP_COMPRESSION: sideways/low-volume market detected; standing aside completely.', permitted: none, denied: {} };
+  }
 
   const denied: Partial<Record<Direction, string>> = {};
 
@@ -1070,10 +1073,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   }
 
 
- const fpNetDelta = snapshot.footprints.slice(-60).reduce((s, b) => s + b.delta, 0);
+  const fpNetDelta = snapshot.footprints.slice(-60).reduce((s, b) => s + b.delta, 0);
   const recent15Delta = snapshot.footprints.slice(-15).reduce((s, b) => s + b.delta, 0);
-  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION';
-  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION';
 
   if (macroBearish && !hasReversalTriggerLong) {
     denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
@@ -1130,11 +1131,11 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const priorHigh = Math.max(...prev30to15.map((c) => c.high));
     const recentHigh = Math.max(...last15.map((c) => c.high));
 
-    if (recentLow > priorLow && lastPrice > recentLow && !hasMajorSweepShort && !denied.SHORT) {
-      denied.SHORT = `Higher-Low Guard: recent 15m low (${recentLow}) is above prior low (${priorLow}); SHORT blocked without PDH/PWH sweep.`;
+    if (recentLow > priorLow && lastPrice > recentLow && recent15Delta > 0 && macroBullish && !hasMajorSweepShort && !denied.SHORT) {
+      denied.SHORT = `Higher-Low Guard: higher low formed with positive delta in bullish structure; SHORT blocked.`;
     }
-    if (recentHigh < priorHigh && lastPrice < recentHigh && !hasMajorSweepLong && !denied.LONG) {
-      denied.LONG = `Lower-High Guard: recent 15m high (${recentHigh}) is below prior high (${priorHigh}); LONG blocked without PDL/PWL sweep.`;
+    if (recentHigh < priorHigh && lastPrice < recentHigh && recent15Delta < 0 && macroBearish && !hasMajorSweepLong && !denied.LONG) {
+      denied.LONG = `Lower-High Guard: lower high formed with negative delta in bearish structure; LONG blocked.`;
     }
   }
 
@@ -1184,25 +1185,26 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
 // ===========================================================================
 export function computeConsensus(reports: SpecialistReport[]): { bias: Direction | null; reason: string } {
   const cfg = councilConfig();
-  // Count agrees: a specialist must have strength >= 2 to be a "real" vote.
-  // Strength-1 reporters are weak/uncertain and should not drive trade decisions on their own.
-  const tally = (dir: Direction) => reports.filter((r) => r.bias === dir && r.strength >= 2);
   // Any specialist opposing at strength >= opposeVetoStrength kills the consensus.
   const vetoed = (dir: Direction) => reports.some((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= cfg.opposeVetoStrength);
 
   for (const dir of ['LONG', 'SHORT'] as Direction[]) {
-    const supporters = tally(dir);
-    // Allow a strength-1 specialist to still count as "tie-breaker" when all 3 agree (unanimous)
-    const allThreeAgree = reports.filter((r) => r.bias === dir && r.strength >= 1).length >= 3;
+    const supporters = reports.filter((r) => r.bias === dir && r.strength >= 2);
+    const allAgreeing = reports.filter((r) => r.bias === dir && r.strength >= 1);
     const opposing = reports.filter((r) => r.bias !== dir && r.bias !== 'NEUTRAL' && r.strength >= 1);
-    const hasLeadOrUnanimous = supporters.some((r) => r.strength >= cfg.minLeadStrength) || allThreeAgree;
-    const unopposedPair = supporters.length >= 2 && opposing.length === 0;
-    if (supporters.length >= cfg.minAgreeing && (hasLeadOrUnanimous || unopposedPair) && !vetoed(dir)) {
-      return { bias: dir, reason: `${supporters.map((r) => r.name).join(' + ')} agree on ${dir}.` };
+
+    const standardConsensus = supporters.length >= cfg.minAgreeing && (supporters.some((r) => r.strength >= cfg.minLeadStrength) || (supporters.length >= 2 && opposing.length === 0));
+    // Max conviction lead (Strength 3) + at least 1 agreeing specialist (strength >= 1) with 0 opposition
+    const maxLeadConsensus = reports.some((r) => r.bias === dir && r.strength >= 3) && allAgreeing.length >= 2 && opposing.length === 0;
+    const unanimousConsensus = allAgreeing.length >= 3 && opposing.length === 0;
+
+    if ((standardConsensus || maxLeadConsensus || unanimousConsensus) && !vetoed(dir)) {
+      const names = allAgreeing.map((r) => `${r.name} (${r.strength}/3)`).join(' + ');
+      return { bias: dir, reason: `${names} agree on ${dir}.` };
     }
   }
   const summary = reports.map((r) => `${r.agentId}:${r.bias}/${r.strength}`).join(', ');
-  return { bias: null, reason: `No qualifying consensus (${summary}). Need ${cfg.minAgreeing}+ specialists at strength >= 2, one with strength >= ${cfg.minLeadStrength}, and no opposing specialist at strength >= ${cfg.opposeVetoStrength}.` };
+  return { bias: null, reason: `No qualifying consensus (${summary}). Need ${cfg.minAgreeing}+ specialists at strength >= 2, or Strength 3 lead with agreeing confirmation, and no opposing specialist at strength >= ${cfg.opposeVetoStrength}.` };
 }
 
 // ===========================================================================
@@ -1270,8 +1272,17 @@ export function resolveTradeLevels(
   let risk = Math.abs(entry - stopPrice);
 
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(snapshot.symbol);
-  const effectiveMinRiskPct = isForex ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
-  const effectiveMaxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
+  const isAltCrypto = /^(SOLUSDT)$/i.test(snapshot.symbol);
+  const effectiveMinRiskPct = isForex
+    ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08)
+    : isAltCrypto
+      ? 0.40
+      : cfg.minRiskPct;
+  const effectiveMaxRiskPct = isForex
+    ? 0.50
+    : isAltCrypto
+      ? 1.80
+      : 0.90;
 
   // Structural Stop Floor: Stop must be BEYOND the recent swing high/low that caused the setup
   // This prevents "noise stops" that get hit instantly by normal market breathing
@@ -1835,8 +1846,9 @@ function buildManagerPrompt(
 ): string {
   const cfg = councilConfig();
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(symbol);
-  const minRiskPct = isForex ? (symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
-  const maxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
+  const isAltCrypto = /^(SOLUSDT)$/i.test(symbol);
+  const minRiskPct = isForex ? (symbol === 'XAUUSD' ? 0.14 : 0.08) : isAltCrypto ? 0.40 : cfg.minRiskPct;
+  const maxRiskPct = isForex ? 0.50 : isAltCrypto ? 1.80 : 0.90;
   const allowedList = consensus.bias ? `${consensus.bias} or WAIT` : 'WAIT';
 
   let scorecardBlock = '';
