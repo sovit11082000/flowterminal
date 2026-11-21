@@ -1047,8 +1047,48 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const sweptLevels = sweep.levels ?? [];
   const hasMajorSweepLong = sweep.long && sweptLevels.some((l) => l === 'PDL' || l === 'PWL');
   const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH');
-  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION';
-  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION';
+
+  // Compute dealing range position percentage early so reversal triggers and filters can use it
+  const rangeBars = (snapshot.candles5m && snapshot.candles5m.length >= 20)
+    ? snapshot.candles5m.slice(-54)
+    : snapshot.candles.slice(-270);
+  const lastPrice = snapshot.latestPrice ?? snapshot.candles[snapshot.candles.length - 1]?.close ?? null;
+  let rangePosPct: number | null = null;
+  if (rangeBars.length >= 10 && lastPrice !== null) {
+    const rHigh = Math.max(...rangeBars.map((c) => c.high));
+    const rLow = Math.min(...rangeBars.map((c) => c.low));
+    const rSpan = rHigh - rLow;
+    if (rSpan > 0) rangePosPct = ((lastPrice - rLow) / rSpan) * 100;
+  }
+  if (rangePosPct === null && derived.dealingRange && lastPrice !== null) {
+    const dr = derived.dealingRange;
+    const span = dr.swingHigh - dr.swingLow;
+    if (span > 0) rangePosPct = ((lastPrice - dr.swingLow) / span) * 100;
+  }
+
+  const fpNetDelta = snapshot.footprints.slice(-60).reduce((s, b) => s + b.delta, 0);
+  const recent15Delta = snapshot.footprints.slice(-15).reduce((s, b) => s + b.delta, 0);
+
+  // RULE 2: Institutional Top Rejection & Bottom Absorption Triggers
+  // Unblock counter-trend reversals when price is at range extremes with confirmed order flow absorption
+  const ofSummary = derived.orderFlowSummary;
+  const isCeilingAbsorption = ofSummary?.absorptionSignal === 'BEARISH_ABSORPTION' ||
+    ofSummary?.deltaBreakoutSignal === 'BEARISH_DELTA_BREAKDOWN' ||
+    (ofSummary?.stackedSellImbalances && ofSummary.stackedSellImbalances.length >= 3);
+  const isFloorAbsorption = ofSummary?.absorptionSignal === 'BULLISH_ABSORPTION' ||
+    ofSummary?.deltaBreakoutSignal === 'BULLISH_DELTA_IMPULSE' ||
+    (ofSummary?.stackedBuyImbalances && ofSummary.stackedBuyImbalances.length >= 3);
+
+  // If price is at or above 78% of range (Deep Premium) and shows selling delta or ceiling rejection
+  const isPremiumTopRejection = (rangePosPct !== null && rangePosPct >= 78) &&
+    (recent15Delta < 0 || isCeilingAbsorption || (ofSummary?.cvdTrend === 'FALLING' && (ofSummary?.latestBarDelta ?? 0) < 0));
+
+  // If price is at or below 22% of range (Deep Discount) and shows buying delta or floor absorption
+  const isDiscountBottomAbsorption = (rangePosPct !== null && rangePosPct <= 22) &&
+    (recent15Delta > 0 || isFloorAbsorption || (ofSummary?.cvdTrend === 'RISING' && (ofSummary?.latestBarDelta ?? 0) > 0));
+
+  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION' || isFloorAbsorption || isDiscountBottomAbsorption;
+  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION' || isCeilingAbsorption || isPremiumTopRejection;
 
   // Do not block CHOP if there is an active institutional absorption or sweep-reclaim
   if (isChopRegime && !hasReversalTriggerLong && !hasReversalTriggerShort) {
@@ -1074,30 +1114,30 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     }
   }
 
-  const rangeBars = (snapshot.candles5m && snapshot.candles5m.length >= 20)
-    ? snapshot.candles5m.slice(-54)
-    : snapshot.candles.slice(-270);
-  const lastPrice = snapshot.latestPrice ?? snapshot.candles[snapshot.candles.length - 1]?.close ?? null;
-  let rangePosPct: number | null = null;
-  if (rangeBars.length >= 10 && lastPrice !== null) {
-    const rHigh = Math.max(...rangeBars.map((c) => c.high));
-    const rLow = Math.min(...rangeBars.map((c) => c.low));
-    const rSpan = rHigh - rLow;
-    if (rSpan > 0) rangePosPct = ((lastPrice - rLow) / rSpan) * 100;
+  // RULE 1: Strict Premium / Discount Range & EMA Overextension Guard
+  const ema50 = derived.independentContext?.ema50 ?? null;
+  const isCrypto = /USDT|USDC|BUSD/i.test(snapshot.symbol);
+  const maxEmaOverextensionPct = isCrypto ? 1.5 : 0.6; // 1.5% for crypto, 0.6% for forex
+  const distEmaPct = (lastPrice !== null && ema50 !== null && ema50 > 0)
+    ? ((lastPrice - ema50) / ema50) * 100
+    : null;
+
+  // Long Filter in Premium:
+  if (rangePosPct !== null && rangePosPct >= 80 && !hasMajorSweepLong) {
+    if (rangePosPct >= 88) {
+      denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range (Deep Premium); wait for pullback to Discount/EMA before buying.`;
+    } else if (distEmaPct !== null && distEmaPct > maxEmaOverextensionPct) {
+      denied.LONG = `Top chasing blocked: price at ${rangePosPct.toFixed(0)}% of range and +${distEmaPct.toFixed(2)}% stretched above 50 EMA; wait for mean-reversion retest.`;
+    }
   }
 
-
-  const fpNetDelta = snapshot.footprints.slice(-60).reduce((s, b) => s + b.delta, 0);
-  const recent15Delta = snapshot.footprints.slice(-15).reduce((s, b) => s + b.delta, 0);
-
-  if (macroBearish && !hasReversalTriggerLong) {
-    denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
-  } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0) {
-    denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
-  } else if (rangePosPct !== null && rangePosPct > 88 && !hasMajorSweepLong) {
-    // Top-chasing: only block LONG when price is at extreme top of range AND trend is NOT already bullish
-    // (In a real uptrend, being at 88%+ is fine — we only block if no sweep exists)
-    denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range; wait for pullback to FVG/OB.`;
+  // Short Filter in Discount:
+  if (rangePosPct !== null && rangePosPct <= 20 && !hasMajorSweepShort) {
+    if (rangePosPct <= 12) {
+      denied.SHORT = `Bottom chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range (Deep Discount); wait for bounce before shorting.`;
+    } else if (distEmaPct !== null && distEmaPct < -maxEmaOverextensionPct) {
+      denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of range and ${distEmaPct.toFixed(2)}% stretched below 50 EMA; wait for mean-reversion bounce.`;
+    }
   }
 
   // Short-term 30-bar extension check: never buy the top of a vertical rally or sell the bottom of a dump
@@ -1108,20 +1148,62 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      if (shortPosPct > 88 && !denied.LONG) {
+      if (shortPosPct > 88 && !denied.LONG && !hasMajorSweepLong) {
         denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
       }
-      // Bottom of 30m dump: only block SHORT if trend is NOT bearish (i.e., counter-trend short into exhaustion)
-      // If trend IS bearish (macroBearish=true), selling into a dump is TREND-FOLLOWING — ALLOW IT
-      if (shortPosPct < 12 && !denied.SHORT && !macroBearish) {
-        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce (counter-trend short into exhaustion).`;
+      if (shortPosPct < 12 && !denied.SHORT && !hasMajorSweepShort && !macroBearish) {
+        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
       }
     }
   }
 
+  // RULE 3: Falling Knife & Rising Rocket Guard (Multi-candle momentum direction)
+  const recentBars5m = (snapshot.candles5m && snapshot.candles5m.length >= 4)
+    ? snapshot.candles5m.slice(-4)
+    : snapshot.candles.slice(-12);
+  if (recentBars5m.length >= 2) {
+    const bPrev = recentBars5m[recentBars5m.length - 2];
+    const bCurr = recentBars5m[recentBars5m.length - 1];
+    const bPrevOpen = bPrev.open ?? bPrev.close;
+    const bCurrOpen = bCurr.open ?? bCurr.close;
+    const currRange = bCurr.high - bCurr.low;
+
+    // Falling Knife: 2+ consecutive red bars with lower lows dropping from highs
+    const isConsecutiveRed = bPrev.close < bPrevOpen && bCurr.close < bCurrOpen && bCurr.low <= bPrev.low;
+    const dropPct = bPrev.high > 0 ? ((bPrev.high - bCurr.low) / bPrev.high) * 100 : 0;
+    const minImpulsiveDrop = isCrypto ? 0.3 : 0.1; // 0.3% drop on crypto
+    if (isConsecutiveRed && dropPct >= minImpulsiveDrop && !denied.LONG && !hasMajorSweepLong) {
+      const lowerWick = Math.min(bCurr.close, bCurrOpen) - bCurr.low;
+      const hasBullishAbsorptionWick = currRange > 0 && (lowerWick / currRange >= 0.38) && (bCurr.close > bCurr.low + currRange * 0.35);
+      const hasGreenReclaim = bCurr.close > bCurrOpen;
+      if (!hasBullishAbsorptionWick && !hasGreenReclaim) {
+        denied.LONG = `Falling Knife Guard: 2+ consecutive impulsive red candles dropping (-${dropPct.toFixed(2)}%); LONG blocked until bullish wick rejection or green candle confirmation.`;
+      }
+    }
+
+    // Rising Rocket: 2+ consecutive green bars with higher highs rallying into resistance
+    const isConsecutiveGreen = bPrev.close > bPrevOpen && bCurr.close > bCurrOpen && bCurr.high >= bPrev.high;
+    const pumpPct = bPrev.low > 0 ? ((bCurr.high - bPrev.low) / bPrev.low) * 100 : 0;
+    const minImpulsivePump = isCrypto ? 0.3 : 0.1;
+    if (isConsecutiveGreen && pumpPct >= minImpulsivePump && !denied.SHORT && !hasMajorSweepShort) {
+      const upperWick = bCurr.high - Math.max(bCurr.close, bCurrOpen);
+      const hasBearishRejectionWick = currRange > 0 && (upperWick / currRange >= 0.38) && (bCurr.close < bCurr.high - currRange * 0.35);
+      const hasRedReversal = bCurr.close < bCurrOpen;
+      if (!hasBearishRejectionWick && !hasRedReversal) {
+        denied.SHORT = `Rising Rocket Guard: 2+ consecutive impulsive green candles rallying (+${pumpPct.toFixed(2)}%); SHORT blocked until bearish wick rejection or red candle confirmation.`;
+      }
+    }
+  }
+
+  if (macroBearish && !hasReversalTriggerLong) {
+    denied.LONG = `Intraday 15m/5m trend is BEARISH (${activityScan.structure15m}); LONGs blocked unless sweep-reclaim or absorption occurs.`;
+  } else if (macroBearish && fpNetDelta < 0 && recent15Delta <= 0 && !isDiscountBottomAbsorption) {
+    denied.LONG = `Counter-trend LONG blocked: 15m/5m BEARISH and both 60m (${fpNetDelta.toFixed(1)}) and 15m (${recent15Delta.toFixed(1)}) delta remain negative.`;
+  }
+
   if (macroBullish && !hasReversalTriggerShort) {
     denied.SHORT = `Intraday 15m/5m trend is BULLISH (${activityScan.structure15m}); SHORTs blocked unless sweep-rejection or absorption occurs.`;
-  } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0) {
+  } else if (macroBullish && fpNetDelta > 0 && recent15Delta >= 0 && !isPremiumTopRejection) {
     denied.SHORT = `Counter-trend SHORT blocked: 15m/5m BULLISH and both 60m (+${fpNetDelta.toFixed(1)}) and 15m (+${recent15Delta.toFixed(1)}) delta remain positive.`;
   } else if (rangePosPct !== null && rangePosPct < 12 && !hasMajorSweepShort && !macroBearish) {
     // Bottom-chasing: only block SHORT when trend is NOT already bearish
@@ -1145,10 +1227,10 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const priorHigh = Math.max(...prev30to15.map((c) => c.high));
     const recentHigh = Math.max(...last15.map((c) => c.high));
 
-    if (recentLow > priorLow && lastPrice > recentLow && recent15Delta > 0 && macroBullish && !hasMajorSweepShort && !denied.SHORT) {
+    if (recentLow > priorLow && lastPrice > recentLow && recent15Delta > 0 && macroBullish && !hasMajorSweepShort && !isPremiumTopRejection && !denied.SHORT) {
       denied.SHORT = `Higher-Low Guard: higher low formed with positive delta in bullish structure; SHORT blocked.`;
     }
-    if (recentHigh < priorHigh && lastPrice < recentHigh && recent15Delta < 0 && macroBearish && !hasMajorSweepLong && !denied.LONG) {
+    if (recentHigh < priorHigh && lastPrice < recentHigh && recent15Delta < 0 && macroBearish && !hasMajorSweepLong && !isDiscountBottomAbsorption && !denied.LONG) {
       denied.LONG = `Lower-High Guard: lower high formed with negative delta in bearish structure; LONG blocked.`;
     }
   }
@@ -1158,18 +1240,18 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const earlyBullFlip = emaAlign === 'BULLISH_ABOVE_50_200' && recent15Delta > 0 && (sweep.long || absorption === 'BULLISH_ABSORPTION');
   const earlyBearFlip = emaAlign === 'BEARISH_BELOW_50_200' && recent15Delta < 0 && (sweep.short || absorption === 'BEARISH_ABSORPTION');
 
-  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !(hasMajorSweepLong && recent15Delta > 0)) {
+  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !(hasMajorSweepLong && recent15Delta > 0) && !isDiscountBottomAbsorption) {
     denied.LONG = 'Macro 1H trend is BEARISH; LONG blocked without EMA50 reclaim + sweep/delta flip.';
   }
-  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !(hasMajorSweepShort && recent15Delta < 0)) {
+  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !(hasMajorSweepShort && recent15Delta < 0) && !isPremiumTopRejection) {
     denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without EMA50 breakdown + sweep/delta flip.';
   }
 
   // 4H Directional Gate: never counter-trade 4H macro bias without confirmed HTF liquidity raid
-  if (derived.macro4hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !hasMajorSweepLong) {
+  if (derived.macro4hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !hasMajorSweepLong && !isDiscountBottomAbsorption) {
     denied.LONG = 'Macro 4H trend is BEARISH; counter-trend LONG blocked without confirmed HTF liquidity sweep.';
   }
-  if (derived.macro4hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !hasMajorSweepShort) {
+  if (derived.macro4hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !hasMajorSweepShort && !isPremiumTopRejection) {
     denied.SHORT = 'Macro 4H trend is BULLISH; counter-trend SHORT blocked without confirmed HTF liquidity raid.';
   }
 
