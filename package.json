@@ -7,6 +7,7 @@
     "frontend"
   ],
   "scripts": {
+    "build": "npm run build --workspace=backend",
     "dev": "concurrently \"npm run dev --workspace=backend\" \"npm run dev --workspace=frontend\"",
     "start": "node --max-old-space-size=440 --optimize-for-size backend/dist/src/server.js",
     "test": "npm run test --workspace=backend"

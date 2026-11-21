@@ -65,6 +65,16 @@ export interface LiveTradeJournalRecord {
   audited: boolean;
 }
 
+export interface StrategyScorecardItem {
+  strategy: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  netR: number;
+  avgR?: number;
+}
+
 export interface SystemAuditLogRecord {
   auditDateIst: string;
   tradeId: string;
@@ -259,6 +269,59 @@ export class MongoHistoryStore {
       .limit(100)
       .toArray();
     return docs.map((doc) => this.clean<LiveTradeJournalRecord>(doc));
+  }
+
+  async getStrategyScorecard(days = 30): Promise<StrategyScorecardItem[]> {
+    if (!this.db) return [];
+    try {
+      const cutoffMs = Date.now() - days * 24 * 60 * 60_000;
+      const trades = await this.collection('tradeJournal')
+        .find({ resolvedAt: { $gte: cutoffMs } })
+        .toArray();
+
+      const stratMap = new Map<string, { trades: number; wins: number; losses: number; netR: number }>();
+
+      for (const doc of trades) {
+        const rawStrats = Array.isArray(doc.strategies) && doc.strategies.length ? doc.strategies : ['PURE_ORDERFLOW'];
+        const outcome = doc.outcome === 'WIN' ? 'WIN' : 'LOSS';
+        const pnlR = typeof doc.pnlR === 'number' ? doc.pnlR : (outcome === 'WIN' ? 1.5 : -1);
+
+        for (const s of rawStrats) {
+          const stratName = String(s).trim();
+          if (!stratName) continue;
+          const curr = stratMap.get(stratName) ?? { trades: 0, wins: 0, losses: 0, netR: 0 };
+          curr.trades += 1;
+          if (outcome === 'WIN' || pnlR > 0) {
+            curr.wins += 1;
+          } else {
+            curr.losses += 1;
+          }
+          curr.netR += pnlR;
+          stratMap.set(stratName, curr);
+        }
+      }
+
+      const results: StrategyScorecardItem[] = [];
+      for (const [strategy, stats] of stratMap.entries()) {
+        const winRate = stats.trades > 0 ? Number(((stats.wins / stats.trades) * 100).toFixed(1)) : 0;
+        const netR = Number(stats.netR.toFixed(2));
+        const avgR = stats.trades > 0 ? Number((stats.netR / stats.trades).toFixed(2)) : 0;
+        results.push({
+          strategy,
+          trades: stats.trades,
+          wins: stats.wins,
+          losses: stats.losses,
+          winRate,
+          netR,
+          avgR
+        });
+      }
+
+      return results.sort((a, b) => b.netR - a.netR);
+    } catch (err) {
+      console.warn('[MongoDB Strategy Scorecard Error]:', err);
+      return [];
+    }
   }
 
   async markTradesAudited(tradeIds: string[]): Promise<void> {

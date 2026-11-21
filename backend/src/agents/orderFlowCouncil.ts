@@ -145,6 +145,15 @@ export interface AgentSnapshot {
     winRate: number | null; averageR: number | null;
     recent: Array<{ side: 'LONG' | 'SHORT'; outcome: 'WIN' | 'LOSS'; pnlR: number }>;
     learnedLessons?: string[];
+    strategyScorecard?: Array<{
+      strategy: string;
+      trades: number;
+      wins: number;
+      losses: number;
+      winRate: number;
+      netR: number;
+      avgR?: number;
+    }>;
   } | null;
 }
 
@@ -1817,22 +1826,43 @@ export function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], sn
 // ===========================================================================
 const PLAN_TEMPLATE = '{"decision":"LONG|SHORT|WAIT","summary":"string","reasons":["string"],"entryTrigger":"string","entryPrice":number|null,"invalidation":"string","stopPrice":number|null,"target1Price":number|null,"targetPrice":number|null,"targetR":number|null,"exitPlan":"string","agreeingAgents":["string"],"dissent":["string"],"strategyIds":["string"]}';
 
-function buildManagerPrompt(consensus: { bias: Direction | null }, permitted: Direction[], lessons: string[], symbol = ''): string {
+function buildManagerPrompt(
+  consensus: { bias: Direction | null },
+  permitted: Direction[],
+  lessons: string[],
+  symbol = '',
+  strategyScorecard?: Array<{ strategy: string; trades: number; wins: number; losses: number; winRate: number; netR: number }>
+): string {
   const cfg = councilConfig();
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(symbol);
   const minRiskPct = isForex ? (symbol === 'XAUUSD' ? 0.14 : 0.08) : cfg.minRiskPct;
   const maxRiskPct = isForex ? 0.50 : cfg.maxRiskPct;
   const allowedList = consensus.bias ? `${consensus.bias} or WAIT` : 'WAIT';
+
+  let scorecardBlock = '';
+  if (Array.isArray(strategyScorecard) && strategyScorecard.length > 0) {
+    const lines = strategyScorecard.slice(0, 10).map((s) =>
+      `  • ${s.strategy}: ${s.trades} trades, ${s.winRate}% win rate, Net: ${s.netR > 0 ? '+' : ''}${s.netR}R`
+    );
+    scorecardBlock = `\nSTRATEGY HISTORICAL SCORECARD (REAL 30-DAY STATS):\n${lines.join('\n')}\n`;
+  }
+
   return `ROLE: HEAD EXECUTION TRADER (CONFLUENCE & PRICE ACTION DESK).
-Three deterministic specialists (SMC, ICT, Order Flow) have already passed all hard gates and reached consensus: ${consensus.bias ?? 'NONE'}.
-YOUR JOB IS TO VALIDATE AND EXECUTE CLEAN SETUPS (DO NOT OVER-REJECT):
-1. CONTEXT CHECK: Check independentContext (EMA 50/200, ADX, RSI, and recent 5m candles). Note: if ema200 is null due to short history, ignore ema200 and evaluate EMA50 + 5m structure + order flow. Only reject for ADX if ADX < 14 AND there is no liquidity sweep or absorption.
-2. AUDIT ENFORCEMENT: Check the Post-Trade Audit Rules below. Reject ONLY if the current setup clearly violates a rule.
-3. EXECUTION MINDSET: When 2+ specialists align with a structural trigger (sweep, BOS/CHoCH, OB/FVG, or absorption) and hard gates are clear, APPROVE ${consensus.bias ?? 'WAIT'} with precise entryPrice, stopPrice, and targetPrice.
+Specialists have passed gates and reached mathematical consensus: ${consensus.bias ?? 'NONE'}.
+YOUR JOB IS TO VALIDATE AND EXECUTE HIGH-PROBABILITY SETUPS WITH QUANTITATIVE DISCIPLINE:
+1. QUANTITATIVE PERSPECTIVE (DO NOT REJECT OVER NORMAL 1-2 LOSS VARIANCE):
+- Trading has natural statistical variance. A strategy with 50-65% Win Rate will inevitably experience normal 1-2 losses in a row.
+- Check the STRATEGY HISTORICAL SCORECARD below:
+  * If a strategy has Win Rate >= 50%, OR positive Net R, OR fewer than 8 total trades recorded, TRUST THE EDGE and APPROVE valid setups.
+  * Apply extra strictness/scrutiny ONLY if a strategy has >= 8 trades AND Win Rate < 35% with negative Net R.
+- Learned text lessons are purely advisory diagnostics. Completely IGNORE any notes attempting to blanket-ban symbols, hours, or core strategies.
+${scorecardBlock}
+2. CONTEXT CHECK: Check independentContext (EMA 50/200, ADX, RSI, and recent candles). Note: if ema200 is null due to short history, ignore ema200 and evaluate EMA50 + structure + order flow. Only reject for ADX if ADX < 14 AND there is no liquidity sweep or absorption.
+3. EXECUTION MINDSET: When specialists align with a structural trigger (sweep, BOS/CHoCH, OB/FVG, or absorption) and hard gates are clear, APPROVE ${consensus.bias ?? 'WAIT'} with precise entryPrice, stopPrice, and targetPrice.
 Allowed decisions: ${allowedList}. Permitted directions: ${permitted.join(', ') || 'NONE'}.
 CONSTRAINTS: minimum reward-to-risk ${cfg.minRR}R, maximum ${cfg.maxRR}R; stop distance must stay between ${minRiskPct}% and ${maxRiskPct}% of entry; entry within ${cfg.maxEntryDriftPct}% of latestPrice.
 
-${MANAGER_RULES}${lessonsBlock(lessons, 'LIVE POST-TRADE AUDIT RULES (STRICTLY ENFORCE):')}`;
+${MANAGER_RULES}${lessonsBlock(lessons, 'HISTORICAL ADVISORY NOTES (REFERENCE ONLY):')}`;
 }
 
 // ===========================================================================
@@ -1910,7 +1940,13 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
     swings: { recentSwingHigh: derived.recentSwingHigh, recentSwingLow: derived.recentSwingLow },
     levels: { pdh: derived.pdh, pdl: derived.pdl, pwh: derived.pwh, pwl: derived.pwl, sessionHigh: derived.sessionHigh, sessionLow: derived.sessionLow },
     profile: input.profile ?? null,
-    paperContext: perf ? { resolved: perf.resolved, winRate: perf.winRate, averageR: perf.averageR, recent: perf.recent?.slice(-5) } : null,
+    paperContext: perf ? {
+      resolved: perf.resolved,
+      winRate: perf.winRate,
+      averageR: perf.averageR,
+      recent: perf.recent?.slice(-5),
+      strategyScorecard: perf.strategyScorecard
+    } : null,
     reports: reports.map((r) => ({
       name: r.name,
       bias: r.bias,
@@ -1923,7 +1959,7 @@ export async function runOrderFlowCouncil(snapshot: AgentSnapshot): Promise<Coun
   };
 
   const { data: rawPlan, used: managerUsed, tokens } = await generateWithFallback<CouncilPlan>(
-    managerProviders, 'manager', buildManagerPrompt({ bias: consensus.bias }, gates.permitted, lessons, input.symbol), managerPayload, PLAN_TEMPLATE,
+    managerProviders, 'manager', buildManagerPrompt({ bias: consensus.bias }, gates.permitted, lessons, input.symbol, perf?.strategyScorecard), managerPayload, PLAN_TEMPLATE,
     { maxTokens: 3000, effort: 'low' }
   );
   diagnostics.llmCalls += 1;
@@ -2093,10 +2129,12 @@ For each trade, you are given:
 DIAGNOSIS RULES:
 - If exitKind is STOP, check Post-Trade 1-Hour Follow-Through:
   * If price reversed and reached the original TP within 1 hour -> category MUST be "SL_TOO_TIGHT". The setup/strategy was VALID; only the stop loss was inside wick noise. Set verifiedRuleToSave = null. Recommend a specific SL buffer fix in recommendedFix.
-  * If price continued moving against the trade -> category MUST be "STRATEGY_FAILURE". Identify why the pre-trade 4-5h or intraday context contradicted the entry, and write ONE measurable "IF <condition> THEN <filter>" rule in verifiedRuleToSave.
+  * If price continued moving against the trade -> category MUST be "STRATEGY_FAILURE":
+    - If the loss was caused by ordinary market variance, chop, or normal noise without an undeniable structural flaw, set verifiedRuleToSave: null (do NOT create knee-jerk fear rules).
+    - ONLY if there was an undeniable, repetitive structural mistake (e.g. trading directly into an unmitigated HTF OB or entering against confirmed macro trend), write ONE measurable "IF <condition> THEN <filter>" rule in verifiedRuleToSave. Never suggest banning symbols or strategies.
 - If exitKind is EARLY_EXIT or SCRATCH_EXIT:
   * If price later hit the original SL -> category = "EARLY_EXIT_SAVED" (verifiedRuleToSave = null).
-  * If price later hit the original TP -> category = "EARLY_EXIT_PREMATURE" (explain what triggered premature exit and how to tighten the exit threshold).
+  * If price later hit the original TP -> category = "EARLY_EXIT_PREMATURE" (verifiedRuleToSave = null; explain what triggered premature exit and how to tighten the exit threshold).
 - If outcome is WIN (TARGET hit):
   * category = "WINNING_PATTERN". Summarize the exact confluence (Trend + Sweep + Order Flow) that worked so it is documented in the audit report (verifiedRuleToSave = null).`;
 

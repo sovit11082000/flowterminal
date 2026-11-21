@@ -36,7 +36,7 @@ import { FootprintHistoryStore } from './services/footprintHistoryStore.js';
 import { OrderBookHistoryStore } from './services/orderBookHistoryStore.js';
 import { TradeHistoryStore } from './services/tradeHistoryStore.js';
 import { LiquidationHistoryStore } from './services/liquidationHistoryStore.js';
-import { MongoHistoryStore, type AgentPaperPerformance } from './services/mongoHistoryStore.js';
+import { MongoHistoryStore, type AgentPaperPerformance, type StrategyScorecardItem } from './services/mongoHistoryStore.js';
 import { runOrderFlowCouncil, type AgentSnapshot, type RiskAllocation } from './agents/orderFlowCouncil.js';
 import { sendTradeEntryAlert, sendTradeOutcomeAlert, sendTelegramMessage, sendOrEditLiveStatusMessage } from './services/telegramService.js';
 import { runNightlyAuditCycle, renderAuditDashboardHtml } from './services/nightlyAuditService.js';
@@ -526,6 +526,19 @@ const sessionPerformance = {
   netR: 0
 };
 
+let cachedStrategyScorecard: StrategyScorecardItem[] = [];
+let lastScorecardFetchMs = 0;
+
+async function getOrUpdateScorecard(): Promise<StrategyScorecardItem[]> {
+  if (Date.now() - lastScorecardFetchMs > 5 * 60_000 || !cachedStrategyScorecard.length) {
+    if (mongoHistory.connected) {
+      cachedStrategyScorecard = await mongoHistory.getStrategyScorecard(30);
+      lastScorecardFetchMs = Date.now();
+    }
+  }
+  return cachedStrategyScorecard;
+}
+
 async function handleQuotaExhaustedAlert(errorMsg: string): Promise<void> {
   const now = Date.now();
   if (now - lastQuotaAlertTime < 5 * 60_000) return;
@@ -691,7 +704,8 @@ const server = http.createServer(async (req, res) => {
           snapshot.paperPerformance = {
             ...paperPerformance,
             recent: getTodayIstResults(),
-            learnedLessons: [...persistentLessons, ...liveLearnedLessons]
+            learnedLessons: [...persistentLessons, ...liveLearnedLessons],
+            strategyScorecard: await getOrUpdateScorecard()
           };
         } catch (error) {
           console.warn('[MongoDB] Could not load prior agent outcomes:', error instanceof Error ? error.message : error);
@@ -1127,6 +1141,137 @@ export function updateMarketStatus(status: ConnectionStatus, message?: string, a
   broadcast(statusMsg);
 }
 
+// --- MULTI-COIN LIVE TRADE RESOLUTION & TICK MONITORING ---
+function resolveAndCloseLiveTrade(
+  currentTrade: LiveActiveTrade,
+  exitPrice: number,
+  outcome: 'WIN' | 'LOSS' | 'OPEN',
+  exitKind: 'TARGET' | 'STOP' | 'EARLY_EXIT' | 'SCRATCH_EXIT' | 'TIMEOUT'
+): void {
+  const symbol = currentTrade.symbol;
+  const isLong = currentTrade.decision === 'LONG';
+  const initialRisk = currentTrade.initialRisk;
+  const diff = isLong ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
+  const rawR = diff / initialRisk;
+  const feeSlippageR = 0.05; // Realistic round-trip maker/taker fee + spread slippage deduction
+  const pnlR = Number((rawR - feeSlippageR).toFixed(2));
+  const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN' ? outcome : (pnlR > 0.15 ? 'WIN' : 'LOSS');
+  const finalExitKind = exitKind ?? 'TIMEOUT';
+
+  const finishedTrade = { ...currentTrade };
+  liveActiveTrades.delete(symbol);
+
+  // Invalidate scorecard cache immediately
+  lastScorecardFetchMs = 0;
+
+  const resolvedIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
+  if (resolvedOutcome === 'LOSS' && finalExitKind === 'STOP') {
+    lastSlDirectionBySymbol.set(symbol, { side: finishedTrade.decision, at: Date.now() });
+    macroTrendCache.delete(symbol);
+  } else if (resolvedOutcome === 'WIN') {
+    lastSlDirectionBySymbol.delete(symbol);
+  }
+
+  sessionPerformance.totalTrades += 1;
+  if (resolvedOutcome === 'WIN') sessionPerformance.wins += 1;
+  else sessionPerformance.losses += 1;
+  sessionPerformance.netR += pnlR;
+
+  const winRate = sessionPerformance.totalTrades > 0
+    ? (sessionPerformance.wins / sessionPerformance.totalTrades) * 100
+    : 0;
+
+  console.log(`[${resolvedIst}] [Trade Resolved] [${finishedTrade.tradeId}] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} [${finalExitKind}] (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
+
+  const resolvedAtMs = Date.now();
+  todayIstResolvedResults.push({
+    istDay: istDayString(resolvedAtMs),
+    side: finishedTrade.decision,
+    outcome: resolvedOutcome,
+    pnlR,
+    resolvedAt: resolvedAtMs
+  });
+
+  if (mongoHistory.connected) {
+    void mongoHistory.saveLiveTradeJournal({
+      tradeId: finishedTrade.tradeId,
+      symbol,
+      side: finishedTrade.decision,
+      entryPrice: finishedTrade.entryPrice,
+      stopPrice: finishedTrade.initialStopPrice ?? finishedTrade.stopPrice,
+      initialRisk: finishedTrade.initialRisk,
+      targetPrice: finishedTrade.targetPrice,
+      targetR: finishedTrade.targetR,
+      exitPrice,
+      outcome: resolvedOutcome,
+      exitKind: finalExitKind,
+      pnlR,
+      barsHeld: finishedTrade.barsHeld,
+      enteredAt: finishedTrade.enteredAt,
+      resolvedAt: resolvedAtMs,
+      macro1hTrend: finishedTrade.macro1hTrend,
+      macro4hTrend: finishedTrade.macro4hTrend,
+      strategies: finishedTrade.strategies,
+      reasons: finishedTrade.reasons,
+      summary: finishedTrade.summary,
+      audited: false
+    });
+  }
+
+  const statusNote = finalExitKind === 'TARGET'
+    ? 'Target hit! Setup logged for Nightly Audit reinforcement.'
+    : finalExitKind === 'EARLY_EXIT'
+      ? 'Trailing SL locked profit (+1.0R / +1.5R) hit. Queued for 1:30 AM IST Nightly Audit.'
+      : 'Queued for 1:30 AM IST Nightly Audit (checking 1H/4H + 4.5h pre-trade & 1h post-trade context).';
+
+  void sendTradeOutcomeAlert({
+    tradeId: finishedTrade.tradeId,
+    symbol,
+    decision: finishedTrade.decision,
+    outcome: resolvedOutcome,
+    entryPrice: finishedTrade.entryPrice,
+    exitPrice,
+    pnlR,
+    barsHeld: finishedTrade.barsHeld,
+    lessonLearned: statusNote,
+    sessionStats: {
+      totalTrades: sessionPerformance.totalTrades,
+      wins: sessionPerformance.wins,
+      losses: sessionPerformance.losses,
+      winRate,
+      netR: sessionPerformance.netR
+    }
+  }).catch(() => {});
+}
+
+function checkLiveTradeTick(symbol: string, currentPrice: number): void {
+  const currentTrade = liveActiveTrades.get(symbol);
+  if (!currentTrade || !(currentPrice > 0)) return;
+
+  const isLong = currentTrade.decision === 'LONG';
+  const initialRisk = currentTrade.initialRisk;
+
+  if (isLong) {
+    if (currentPrice >= currentTrade.targetPrice) {
+      resolveAndCloseLiveTrade(currentTrade, currentTrade.targetPrice, 'WIN', 'TARGET');
+    } else if (currentPrice <= currentTrade.stopPrice) {
+      const lockedR = (currentTrade.stopPrice - currentTrade.entryPrice) / initialRisk;
+      const outcome = lockedR > 0.05 ? 'WIN' : 'LOSS';
+      const exitKind = lockedR > 0.05 ? 'EARLY_EXIT' : 'STOP';
+      resolveAndCloseLiveTrade(currentTrade, currentTrade.stopPrice, outcome, exitKind);
+    }
+  } else {
+    if (currentPrice <= currentTrade.targetPrice) {
+      resolveAndCloseLiveTrade(currentTrade, currentTrade.targetPrice, 'WIN', 'TARGET');
+    } else if (currentPrice >= currentTrade.stopPrice) {
+      const lockedR = (currentTrade.entryPrice - currentTrade.stopPrice) / initialRisk;
+      const outcome = lockedR > 0.05 ? 'WIN' : 'LOSS';
+      const exitKind = lockedR > 0.05 ? 'EARLY_EXIT' : 'STOP';
+      resolveAndCloseLiveTrade(currentTrade, currentTrade.stopPrice, outcome, exitKind);
+    }
+  }
+}
+
 // --- MULTI-COIN LIVE BAR PROCESSING & LEARNING (STRICTLY PAPER + TELEGRAM) ---
 async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFootprintBar, allowNewEntry = false): Promise<void> {
   if (!isAutoTradingEnabled) {
@@ -1240,97 +1385,13 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
     const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars;
 
     if (outcome !== 'OPEN' || isStagnantTimeout) {
-      const diff = isLong ? exitPrice - currentTrade.entryPrice : currentTrade.entryPrice - exitPrice;
-      const rawR = diff / initialRisk;
-      const feeSlippageR = 0.05; // Realistic round-trip maker/taker fee + spread slippage deduction
-      const pnlR = Number((rawR - feeSlippageR).toFixed(2));
-      const resolvedOutcome: 'WIN' | 'LOSS' = outcome !== 'OPEN' ? outcome : (pnlR > 0.15 ? 'WIN' : 'LOSS');
       const finalExitKind = exitKind ?? 'TIMEOUT';
-
-      const finishedTrade = { ...currentTrade };
-      liveActiveTrades.delete(symbol);
-
-      const resolvedIst = new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
-      if (resolvedOutcome === 'LOSS' && finalExitKind === 'STOP') {
-        lastSlDirectionBySymbol.set(symbol, { side: finishedTrade.decision, at: Date.now() });
-        macroTrendCache.delete(symbol);
-      } else if (resolvedOutcome === 'WIN') {
-        lastSlDirectionBySymbol.delete(symbol);
-      }
-
-      sessionPerformance.totalTrades += 1;
-      if (resolvedOutcome === 'WIN') sessionPerformance.wins += 1;
-      else sessionPerformance.losses += 1;
-      sessionPerformance.netR += pnlR;
-
-      const winRate = sessionPerformance.totalTrades > 0
-        ? (sessionPerformance.wins / sessionPerformance.totalTrades) * 100
-        : 0;
-
-      console.log(`[${resolvedIst}] [Trade Resolved] [${finishedTrade.tradeId}] ${finishedTrade.decision} on ${symbol} -> ${resolvedOutcome} [${finalExitKind}] (${pnlR > 0 ? '+' : ''}${pnlR}R) @ $${exitPrice}`);
-
-      const resolvedAtMs = Date.now();
-      todayIstResolvedResults.push({
-        istDay: istDayString(resolvedAtMs),
-        side: finishedTrade.decision,
-        outcome: resolvedOutcome,
-        pnlR,
-        resolvedAt: resolvedAtMs
-      });
-
-      if (mongoHistory.connected) {
-        void mongoHistory.saveLiveTradeJournal({
-          tradeId: finishedTrade.tradeId,
-          symbol,
-          side: finishedTrade.decision,
-          entryPrice: finishedTrade.entryPrice,
-          stopPrice: finishedTrade.initialStopPrice ?? finishedTrade.stopPrice,
-          initialRisk: finishedTrade.initialRisk,
-          targetPrice: finishedTrade.targetPrice,
-          targetR: finishedTrade.targetR,
-          exitPrice,
-          outcome: resolvedOutcome,
-          exitKind: finalExitKind,
-          pnlR,
-          barsHeld: finishedTrade.barsHeld,
-          enteredAt: finishedTrade.enteredAt,
-          resolvedAt: resolvedAtMs,
-          macro1hTrend: finishedTrade.macro1hTrend,
-          macro4hTrend: finishedTrade.macro4hTrend,
-          strategies: finishedTrade.strategies,
-          reasons: finishedTrade.reasons,
-          summary: finishedTrade.summary,
-          audited: false
-        });
-      }
-
-      const statusNote = finalExitKind === 'TARGET'
-        ? 'Target hit! Setup logged for Nightly Audit reinforcement.'
-        : finalExitKind === 'EARLY_EXIT'
-          ? 'Trailing SL locked profit (+1.0R / +1.5R) hit. Queued for 1:30 AM IST Nightly Audit.'
-          : 'Queued for 1:30 AM IST Nightly Audit (checking 1H/4H + 4.5h pre-trade & 1h post-trade context).';
-
-      void sendTradeOutcomeAlert({
-        tradeId: finishedTrade.tradeId,
-        symbol,
-        decision: finishedTrade.decision,
-        outcome: resolvedOutcome,
-        entryPrice: finishedTrade.entryPrice,
-        exitPrice,
-        pnlR,
-        barsHeld: finishedTrade.barsHeld,
-        lessonLearned: statusNote,
-        sessionStats: {
-          totalTrades: sessionPerformance.totalTrades,
-          wins: sessionPerformance.wins,
-          losses: sessionPerformance.losses,
-          winRate,
-          netR: sessionPerformance.netR
-        }
-      }).catch(() => {});
-
+      resolveAndCloseLiveTrade(currentTrade, exitPrice, outcome, finalExitKind);
       return;
     }
+
+    // Trade is still open and running -> do not evaluate new entries on this symbol
+    return;
   }
 
   // 2. Evaluate new setup across coins (ONLY on 5m bar close to eliminate 1m noise)
@@ -1452,7 +1513,8 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           winRate: sessionPerformance.totalTrades > 0 ? Number(((sessionPerformance.wins / sessionPerformance.totalTrades) * 100).toFixed(1)) : null,
           averageR: sessionPerformance.totalTrades > 0 ? Number((sessionPerformance.netR / sessionPerformance.totalTrades).toFixed(2)) : null,
           recent: todayResults,
-          learnedLessons: [...persistentLessons, ...liveLearnedLessons]
+          learnedLessons: [...persistentLessons, ...liveLearnedLessons],
+          strategyScorecard: await getOrUpdateScorecard()
         }
       };
 
@@ -1615,6 +1677,9 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
       };
       liveTickerBySymbol.set(symbol, ticker);
       broadcast({ type: 'TICKER', data: { symbol, ...ticker }, timestamp: Date.now() });
+      if (lastPrice !== null && lastPrice > 0) {
+        checkLiveTradeTick(symbol, lastPrice);
+      }
     } else if (topic.startsWith('publicTrade.')) {
       const trades = parsePublicTradePayload(payload);
       if (trades.length > 0) {
@@ -1622,6 +1687,7 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
         lastTradeReceivedAt = nowMs;
         for (const t of trades) {
           lastTradeAtBySymbol.set(t.symbol, nowMs);
+          checkLiveTradeTick(t.symbol, t.price);
         }
         tradeHistory.save(trades);
         queueMongoTrades(trades);
@@ -1657,8 +1723,8 @@ const bybitClient = new BybitWebSocketClient([...CRYPTO_SYMBOLS], {
                   timestamp: Date.now()
                 });
 
-                // Analyze setups on every 1-minute closed footprint bar (was 5m only)
-                void handleLiveBarAutonomousTrading(trade.symbol, serialized, true);
+                // Active trade management on every 1-minute closed footprint bar (trailing SL, reversal guard, timeout)
+                void handleLiveBarAutonomousTrading(trade.symbol, serialized, false);
               }
             }
 
