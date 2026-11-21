@@ -429,13 +429,55 @@ async function getDailyRanges(symbol: string): Promise<Array<{ day: number; high
       .filter((c) => Number.isFinite(c.high) && Number.isFinite(c.low))
       .map((c) => ({ day: c.time, high: c.high, low: c.low }))
       .sort((a, b) => a.day - b.day);
-    dailyRangeCache.set(symbol, { fetchedAt: ranges.length ? now : now - DAILY_RANGE_TTL_MS + 60_000, ranges });
-    return ranges;
-  } catch (error) {
-    console.warn(`[Daily Ranges] Could not load 1d candles for ${symbol}:`, error instanceof Error ? error.message : error);
-    dailyRangeCache.set(symbol, { fetchedAt: Date.now() - DAILY_RANGE_TTL_MS + 60_000, ranges: cached?.ranges ?? [] });
-    return cached?.ranges ?? [];
-  }
+    if (ranges.length > 0) {
+      dailyRangeCache.set(symbol, { fetchedAt: now, ranges });
+      return ranges;
+    }
+  } catch {}
+
+  // Direct Fallback 1: Coinbase Public API (Zero auth, 100% reliable on Render/AWS)
+  try {
+    const fsym = symbol.replace(/USDT$/i, '');
+    const cbRes = await fetch(`https://api.exchange.coinbase.com/products/${fsym}-USD/candles?granularity=86400`, {
+      headers: { 'User-Agent': 'FlowTerminal/1.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(6_000)
+    });
+    if (cbRes.ok) {
+      const cbRows = (await cbRes.json()) as Array<[number, number, number, number, number, number]>;
+      if (Array.isArray(cbRows) && cbRows.length > 0) {
+        const ranges = cbRows.slice(0, 10).map((r) => ({
+          day: Number(r[0]),
+          low: Number(r[1]),
+          high: Number(r[2])
+        })).sort((a, b) => a.day - b.day);
+        dailyRangeCache.set(symbol, { fetchedAt: Date.now(), ranges });
+        return ranges;
+      }
+    }
+  } catch {}
+
+  // Direct Fallback 2: Binance.US Public API
+  try {
+    const fsym = symbol.replace(/USDT$/i, '');
+    const bRes = await fetch(`https://api.binance.us/api/v3/klines?symbol=${fsym}USDT&interval=1d&limit=10`, {
+      signal: AbortSignal.timeout(6_000)
+    });
+    if (bRes.ok) {
+      const bRows = (await bRes.json()) as Array<[number, string, string, string, string, string, number, string]>;
+      if (Array.isArray(bRows) && bRows.length > 0) {
+        const ranges = bRows.map((r) => ({
+          day: Math.floor(Number(r[0]) / 1000),
+          low: Number(r[3]),
+          high: Number(r[2])
+        })).sort((a, b) => a.day - b.day);
+        dailyRangeCache.set(symbol, { fetchedAt: Date.now(), ranges });
+        return ranges;
+      }
+    }
+  } catch {}
+
+  dailyRangeCache.set(symbol, { fetchedAt: Date.now() - DAILY_RANGE_TTL_MS + 60_000, ranges: cached?.ranges ?? [] });
+  return cached?.ranges ?? [];
 }
 
 const MACRO_TREND_TTL_MS = 5 * 60_000;

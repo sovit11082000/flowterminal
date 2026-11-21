@@ -375,27 +375,66 @@ export class BybitRestService {
       }
     } catch {}
 
-    // Fallback 2: Binance Public Klines (Free, zero API key required, reliable on cloud/Render)
+    // Fallback 2: Binance US / Global Klines (Free, zero API key required, reliable on cloud/Render)
+    if (!candles.length) {
+      const bTimeframe = timeframe === '1d' ? '1d' : timeframe === '4h' ? '4h' : timeframe === '1h' ? '1h' : '15m';
+      const endpoints = [
+        `https://api.binance.us/api/v3/klines?symbol=${fsym}USDT&interval=${bTimeframe}&limit=${Math.min(limit, 100)}`,
+        `https://api.binance.com/api/v3/klines?symbol=${fsym}USDT&interval=${bTimeframe}&limit=${Math.min(limit, 100)}`
+      ];
+      for (const endpoint of endpoints) {
+        if (candles.length) break;
+        try {
+          const bRes = await this.fetchFn(endpoint, {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+            signal: AbortSignal.timeout(6_000)
+          });
+          if (bRes.ok) {
+            const bRows = (await bRes.json()) as Array<[number, string, string, string, string, string, number, string]>;
+            if (Array.isArray(bRows)) {
+              for (const r of bRows) {
+                const tSec = Math.floor(Number(r[0]) / 1000);
+                const open = Number(r[1]);
+                const high = Number(r[2]);
+                const low = Number(r[3]);
+                const close = Number(r[4]);
+                const volume = Number(r[5]);
+                const turnover = Number(r[7]);
+                if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
+                  candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // Fallback 3: Coinbase Public Candles (Zero API key, US-hosted, bulletproof for BTC, ETH, SOL on Render/AWS)
     if (!candles.length) {
       try {
-        const bTimeframe = timeframe === '1d' ? '1d' : timeframe === '4h' ? '4h' : timeframe === '1h' ? '1h' : '15m';
-        const bRes = await this.fetchFn(`https://api.binance.com/api/v3/klines?symbol=${fsym}USDT&interval=${bTimeframe}&limit=${Math.min(limit, 100)}`, {
+        const granMap: Record<CandleTimeframe, number> = {
+          '1m': 60, '3m': 300, '5m': 300, '15m': 900, '30m': 3600, '1h': 3600, '4h': 86400, '1d': 86400
+        };
+        const gran = granMap[timeframe] ?? 86400;
+        const cbRes = await this.fetchFn(`https://api.exchange.coinbase.com/products/${fsym}-USD/candles?granularity=${gran}`, {
           method: 'GET',
-          headers: { Accept: 'application/json' }
+          headers: { 'User-Agent': 'FlowTerminal/1.0', Accept: 'application/json' },
+          signal: AbortSignal.timeout(6_000)
         });
-        if (bRes.ok) {
-          const bRows = (await bRes.json()) as Array<[number, string, string, string, string, string, number, string]>;
-          if (Array.isArray(bRows)) {
-            for (const r of bRows) {
-              const tSec = Math.floor(Number(r[0]) / 1000);
-              const open = Number(r[1]);
+        if (cbRes.ok) {
+          const cbRows = (await cbRes.json()) as Array<[number, number, number, number, number, number]>;
+          if (Array.isArray(cbRows)) {
+            for (const r of cbRows) {
+              const tSec = Number(r[0]);
+              const low = Number(r[1]);
               const high = Number(r[2]);
-              const low = Number(r[3]);
+              const open = Number(r[3]);
               const close = Number(r[4]);
               const volume = Number(r[5]);
-              const turnover = Number(r[7]);
               if ([tSec, open, high, low, close].every(Number.isFinite) && tSec > 0 && open > 0 && high > 0 && low > 0 && close > 0) {
-                candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: Math.max(0, turnover) });
+                candles.push({ symbol, timeframe, time: tSec, open, high, low, close, volume: Math.max(0, volume), turnover: 0 });
               }
             }
           }
