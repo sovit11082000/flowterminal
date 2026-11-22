@@ -484,7 +484,8 @@ export function detectSidewaysMarket(
   candles: AgentSnapshot['candles'],
   footprints: AgentSnapshot['footprints'],
   lookback = 45,
-  activeSession: DerivedMarketContext['activeSession'] = 'OFF_HOURS'
+  activeSession: DerivedMarketContext['activeSession'] = 'OFF_HOURS',
+  isForex = false
 ): { isChop: boolean; chopIndex: number; efficiencyRatio: number; reason: string } {
   if (candles.length < 14) {
     return { isChop: false, chopIndex: 0, efficiencyRatio: 1, reason: '' };
@@ -522,9 +523,11 @@ export function detectSidewaysMarket(
     }
   }
 
+  const tightThreshold = isForex ? 0.08 : 0.55;
+  const deadRangeThreshold = isForex ? 0.05 : 0.38;
   const isQuietSession = activeSession === 'ASIA' || activeSession === 'OFF_HOURS' || activeSession === 'NY_LUNCH';
-  const isTightSessionGrind = isQuietSession && rangePct < 0.22 && efficiencyRatio < 0.11;
-  const isDeadRangeAnySession = rangePct < 0.15;
+  const isTightSessionGrind = isQuietSession && rangePct < tightThreshold && efficiencyRatio < 0.11;
+  const isDeadRangeAnySession = rangePct < deadRangeThreshold;
   const isChop =
     isTightSessionGrind ||
     isDeadRangeAnySession ||
@@ -898,8 +901,9 @@ export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketConte
   let isLowVolumeChop = false;
   const recentFp = snapshot.footprints.slice(-15);
 
+  const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(snapshot.symbol);
   const chopSourceCandles = (snapshot.candles5m && snapshot.candles5m.length >= 20) ? snapshot.candles5m : candles;
-  const chopAnalysis = detectSidewaysMarket(chopSourceCandles, snapshot.footprints, 24, activeSession);
+  const chopAnalysis = detectSidewaysMarket(chopSourceCandles, snapshot.footprints, 24, activeSession, isForex);
 
   if (chopAnalysis.isChop) {
     marketRegime = 'CHOP_COMPRESSION';
@@ -1045,8 +1049,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const isChopRegime = derived.marketRegime === 'CHOP_COMPRESSION' || derived.isLowVolumeChop;
 
   const sweptLevels = sweep.levels ?? [];
-  const hasMajorSweepLong = sweep.long && sweptLevels.some((l) => l === 'PDL' || l === 'PWL');
-  const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH');
+  const hasMajorSweepLong = sweep.long && sweptLevels.some((l) => l === 'PDL' || l === 'PWL' || l === 'SESSION_LOW' || l === 'SWING_LOW');
+  const hasMajorSweepShort = sweep.short && sweptLevels.some((l) => l === 'PDH' || l === 'PWH' || l === 'SESSION_HIGH' || l === 'SWING_HIGH');
 
   // Compute dealing range position percentage early so reversal triggers and filters can use it
   const rangeBars = (snapshot.candles5m && snapshot.candles5m.length >= 20)
@@ -1087,8 +1091,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   const isDiscountBottomAbsorption = (rangePosPct !== null && rangePosPct <= 22) &&
     (recent15Delta > 0 || isFloorAbsorption || (ofSummary?.cvdTrend === 'RISING' && (ofSummary?.latestBarDelta ?? 0) > 0));
 
-  const hasReversalTriggerLong = hasMajorSweepLong || sweep.long || absorption === 'BULLISH_ABSORPTION' || isFloorAbsorption || isDiscountBottomAbsorption;
-  const hasReversalTriggerShort = hasMajorSweepShort || sweep.short || absorption === 'BEARISH_ABSORPTION' || isCeilingAbsorption || isPremiumTopRejection;
+  const hasReversalTriggerLong = hasMajorSweepLong || absorption === 'BULLISH_ABSORPTION' || isFloorAbsorption || isDiscountBottomAbsorption;
+  const hasReversalTriggerShort = hasMajorSweepShort || absorption === 'BEARISH_ABSORPTION' || isCeilingAbsorption || isPremiumTopRejection;
 
   // Do not block CHOP if there is an active institutional absorption or sweep-reclaim
   if (isChopRegime && !hasReversalTriggerLong && !hasReversalTriggerShort) {
@@ -1235,24 +1239,30 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     }
   }
 
-  // 1H Macro Trend Guard: allow early reversal if price broke EMA50 with matching 15m delta & sweep/rejection
-  const emaAlign = derived.independentContext?.emaAlignment ?? 'MIXED_CROSSOVER';
-  const earlyBullFlip = emaAlign === 'BULLISH_ABOVE_50_200' && recent15Delta > 0 && (sweep.long || absorption === 'BULLISH_ABSORPTION');
-  const earlyBearFlip = emaAlign === 'BEARISH_BELOW_50_200' && recent15Delta < 0 && (sweep.short || absorption === 'BEARISH_ABSORPTION');
+  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG) {
+    const isLegitDiscountReversal = hasMajorSweepLong && (rangePosPct !== null && rangePosPct <= 25);
+    if (!isLegitDiscountReversal) {
+      denied.LONG = 'HTF Alignment Shield: Macro 1H trend is BEARISH; counter-trend LONG blocked without major HTF sweep in extreme Discount (<=25%).';
+    }
+  }
+  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT) {
+    const isLegitPremiumReversal = hasMajorSweepShort && (rangePosPct !== null && rangePosPct >= 75);
+    if (!isLegitPremiumReversal) {
+      denied.SHORT = 'HTF Alignment Shield: Macro 1H trend is BULLISH; counter-trend SHORT blocked without major HTF sweep in extreme Premium (>=75%).';
+    }
+  }
 
-  if (derived.macro1hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !(hasMajorSweepLong && recent15Delta > 0) && !isDiscountBottomAbsorption) {
-    denied.LONG = 'Macro 1H trend is BEARISH; LONG blocked without EMA50 reclaim + sweep/delta flip.';
+  if (derived.macro4hTrend === 'BEARISH' && !denied.LONG) {
+    const isLegitDiscountReversal = hasMajorSweepLong && (rangePosPct !== null && rangePosPct <= 20);
+    if (!isLegitDiscountReversal) {
+      denied.LONG = 'Macro 4H trend is BEARISH; counter-trend LONG blocked without confirmed HTF liquidity sweep in deep discount.';
+    }
   }
-  if (derived.macro1hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !(hasMajorSweepShort && recent15Delta < 0) && !isPremiumTopRejection) {
-    denied.SHORT = 'Macro 1H trend is BULLISH; SHORT blocked without EMA50 breakdown + sweep/delta flip.';
-  }
-
-  // 4H Directional Gate: never counter-trade 4H macro bias without confirmed HTF liquidity raid
-  if (derived.macro4hTrend === 'BEARISH' && !denied.LONG && !earlyBullFlip && !hasMajorSweepLong && !isDiscountBottomAbsorption) {
-    denied.LONG = 'Macro 4H trend is BEARISH; counter-trend LONG blocked without confirmed HTF liquidity sweep.';
-  }
-  if (derived.macro4hTrend === 'BULLISH' && !denied.SHORT && !earlyBearFlip && !hasMajorSweepShort && !isPremiumTopRejection) {
-    denied.SHORT = 'Macro 4H trend is BULLISH; counter-trend SHORT blocked without confirmed HTF liquidity raid.';
+  if (derived.macro4hTrend === 'BULLISH' && !denied.SHORT) {
+    const isLegitPremiumReversal = hasMajorSweepShort && (rangePosPct !== null && rangePosPct >= 80);
+    if (!isLegitPremiumReversal) {
+      denied.SHORT = 'Macro 4H trend is BULLISH; counter-trend SHORT blocked without confirmed HTF liquidity raid in deep premium.';
+    }
   }
 
   // 4. Open Interest + Funding Rate Trap Filter & BTC Market-Leader Correlation Guard
@@ -1312,7 +1322,7 @@ export function computeConsensus(reports: SpecialistReport[]): { bias: Direction
     const standardConsensus = supporters.length >= cfg.minAgreeing && (supporters.some((r) => r.strength >= cfg.minLeadStrength) || (supporters.length >= 2 && opposing.length === 0));
     // Max conviction lead (Strength 3) + at least 1 agreeing specialist (strength >= 1) with 0 opposition
     const maxLeadConsensus = reports.some((r) => r.bias === dir && r.strength >= 3) && allAgreeing.length >= 2 && opposing.length === 0;
-    const unanimousConsensus = allAgreeing.length >= 3 && opposing.length === 0;
+    const unanimousConsensus = allAgreeing.length >= 3 && supporters.length >= 2 && opposing.length === 0;
 
     if ((standardConsensus || maxLeadConsensus || unanimousConsensus) && !vetoed(dir)) {
       const names = allAgreeing.map((r) => `${r.name} (${r.strength}/3)`).join(' + ');
@@ -1388,17 +1398,23 @@ export function resolveTradeLevels(
   let risk = Math.abs(entry - stopPrice);
 
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(snapshot.symbol);
+  const isBtc = /^BTCUSDT$/i.test(snapshot.symbol);
+  const isEth = /^ETHUSDT$/i.test(snapshot.symbol);
   const isAltCrypto = /^(SOLUSDT)$/i.test(snapshot.symbol);
   const effectiveMinRiskPct = isForex
     ? (snapshot.symbol === 'XAUUSD' ? 0.14 : 0.08)
-    : isAltCrypto
-      ? 0.40
-      : cfg.minRiskPct;
+    : isEth
+      ? Math.max(cfg.minRiskPct, 0.60)
+      : isBtc
+        ? Math.max(cfg.minRiskPct, 0.45)
+        : isAltCrypto
+          ? Math.max(cfg.minRiskPct, 0.70)
+          : Math.max(cfg.minRiskPct, 0.50);
   const effectiveMaxRiskPct = isForex
     ? 0.50
     : isAltCrypto
-      ? 1.80
-      : 0.90;
+      ? 2.20
+      : 1.50;
 
   // Structural Stop Floor: Stop must be BEYOND the recent swing high/low that caused the setup
   // This prevents "noise stops" that get hit instantly by normal market breathing
@@ -1963,9 +1979,19 @@ function buildManagerPrompt(
 ): string {
   const cfg = councilConfig();
   const isForex = /^(XAUUSD|EURUSD|GBPUSD)$/i.test(symbol);
+  const isBtc = /^BTCUSDT$/i.test(symbol);
+  const isEth = /^ETHUSDT$/i.test(symbol);
   const isAltCrypto = /^(SOLUSDT)$/i.test(symbol);
-  const minRiskPct = isForex ? (symbol === 'XAUUSD' ? 0.14 : 0.08) : isAltCrypto ? 0.40 : cfg.minRiskPct;
-  const maxRiskPct = isForex ? 0.50 : isAltCrypto ? 1.80 : 0.90;
+  const minRiskPct = isForex
+    ? (symbol === 'XAUUSD' ? 0.14 : 0.08)
+    : isEth
+      ? Math.max(cfg.minRiskPct, 0.60)
+      : isBtc
+        ? Math.max(cfg.minRiskPct, 0.45)
+        : isAltCrypto
+          ? Math.max(cfg.minRiskPct, 0.70)
+          : Math.max(cfg.minRiskPct, 0.50);
+  const maxRiskPct = isForex ? 0.50 : isAltCrypto ? 2.20 : 1.50;
   const allowedList = consensus.bias ? `${consensus.bias} or WAIT` : 'WAIT';
 
   let scorecardBlock = '';

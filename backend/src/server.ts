@@ -1426,10 +1426,11 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       }
     }
 
-    // Never cut winning runners early: let profitable trades (beLocked or currentR > 0.15R) run up to 180m; close flat/losing trades after 75m
-    const isProfitableRunner = beLocked || currentR > 0.15;
-    const maxAllowedBars = isProfitableRunner ? 180 : 75;
-    const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars;
+    // 15m/5m Council trades need breathing room: 75m is too short for overnight/low-volatility sessions.
+    // Allow at least 240 bars (4 hours). Only trigger stagnant timeout if trade has spent 240+ bars
+    // AND is drifting in deep adverse territory (currentR < -0.40). Never exit prematurely if floating near entry or positive.
+    const maxAllowedBars = 240;
+    const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars && currentR < -0.40;
 
     if (outcome !== 'OPEN' || isStagnantTimeout) {
       const finalExitKind = exitKind ?? 'TIMEOUT';
