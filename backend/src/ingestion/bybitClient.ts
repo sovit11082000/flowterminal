@@ -122,11 +122,15 @@ export class BybitWebSocketClient {
   private subscribeTopics(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
+    const enableOrderBookStream = process.env.ENABLE_ORDERBOOK_STREAM === 'true';
     const topics = this.symbols.flatMap((symbol) => [
-      TOPIC_PUBLIC_TRADE(symbol), TOPIC_ORDERBOOK_50(symbol), TOPIC_ALL_LIQUIDATION(symbol), TOPIC_TICKER(symbol),
-      TOPIC_KLINE('1', symbol), TOPIC_KLINE('3', symbol), TOPIC_KLINE('5', symbol),
-      TOPIC_KLINE('15', symbol), TOPIC_KLINE('30', symbol), TOPIC_KLINE('60', symbol),
-      TOPIC_KLINE('240', symbol), TOPIC_KLINE('D', symbol)
+      TOPIC_PUBLIC_TRADE(symbol),
+      ...(enableOrderBookStream ? [TOPIC_ORDERBOOK_50(symbol)] : []),
+      TOPIC_ALL_LIQUIDATION(symbol),
+      TOPIC_TICKER(symbol),
+      TOPIC_KLINE('1', symbol),
+      TOPIC_KLINE('5', symbol),
+      TOPIC_KLINE('15', symbol)
     ]);
     for (let index = 0; index < topics.length; index += 10) {
       this.ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(index, index + 10) }));
@@ -134,6 +138,7 @@ export class BybitWebSocketClient {
   }
 
   public resubscribeOrderBook(symbol: string): void {
+    if (process.env.ENABLE_ORDERBOOK_STREAM !== 'true') return;
     if (!this.symbols.includes(symbol)) return;
     this.resubscribeTopic(TOPIC_ORDERBOOK_50(symbol));
   }

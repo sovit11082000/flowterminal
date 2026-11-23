@@ -94,9 +94,10 @@ export class DerivForexClient {
     };
 
     void pollOnce();
+    const pollIntervalMs = Math.max(10_000, Number(process.env.FOREX_POLL_INTERVAL_MS || 10_000));
     this.pollTimer = setInterval(() => {
       void pollOnce();
-    }, 1_000);
+    }, pollIntervalMs);
   }
 
   public disconnect(): void {
