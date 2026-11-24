@@ -464,18 +464,45 @@ function buildIndependentContext(snapshot: AgentSnapshot): IndependentContextMet
  */
 export function detectSweepReclaim(
   candles: AgentSnapshot['candles'],
-  levels: { pdh: number | null; pdl: number | null; pwh: number | null; pwl: number | null },
+  levels: {
+    pdh: number | null;
+    pdl: number | null;
+    pwh: number | null;
+    pwl: number | null;
+    sessionHigh?: number | null;
+    sessionLow?: number | null;
+    swingHigh?: number | null;
+    swingLow?: number | null;
+  },
   lookback = 30
 ): { long: boolean; short: boolean; levels: string[] } {
   const out = { long: false, short: false, levels: [] as string[] };
   const recent = candles.slice(-lookback);
   const last = recent[recent.length - 1];
   if (!last) return out;
-  for (const [name, level] of [['PDL', levels.pdl], ['PWL', levels.pwl]] as const) {
-    if (level !== null && recent.some((c) => c.low < level) && last.close > level) { out.long = true; out.levels.push(name); }
+  const longLevels: Array<readonly [string, number | null | undefined]> = [
+    ['PDL', levels.pdl],
+    ['PWL', levels.pwl],
+    ['SESSION_LOW', levels.sessionLow],
+    ['SWING_LOW', levels.swingLow]
+  ];
+  for (const [name, level] of longLevels) {
+    if (level !== null && level !== undefined && recent.some((c) => c.low < level) && last.close > level) {
+      out.long = true;
+      out.levels.push(name);
+    }
   }
-  for (const [name, level] of [['PDH', levels.pdh], ['PWH', levels.pwh]] as const) {
-    if (level !== null && recent.some((c) => c.high > level) && last.close < level) { out.short = true; out.levels.push(name); }
+  const shortLevels: Array<readonly [string, number | null | undefined]> = [
+    ['PDH', levels.pdh],
+    ['PWH', levels.pwh],
+    ['SESSION_HIGH', levels.sessionHigh],
+    ['SWING_HIGH', levels.swingHigh]
+  ];
+  for (const [name, level] of shortLevels) {
+    if (level !== null && level !== undefined && recent.some((c) => c.high > level) && last.close < level) {
+      out.short = true;
+      out.levels.push(name);
+    }
   }
   return out;
 }
@@ -959,7 +986,16 @@ export function buildDerivedContext(snapshot: AgentSnapshot): DerivedMarketConte
     isLowVolumeChop,
     liquidationSignal,
     atr: computeAtr(candles),
-    sweepReclaim: detectSweepReclaim(candles, { pdh, pdl, pwh, pwl })
+    sweepReclaim: detectSweepReclaim(candles, {
+      pdh,
+      pdl,
+      pwh,
+      pwl,
+      sessionHigh,
+      sessionLow,
+      swingHigh: recentSwingHigh,
+      swingLow: recentSwingLow
+    })
   };
 }
 
@@ -1121,14 +1157,19 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   // RULE 1: Strict Premium / Discount Range & EMA Overextension Guard
   const ema50 = derived.independentContext?.ema50 ?? null;
   const isCrypto = /USDT|USDC|BUSD/i.test(snapshot.symbol);
-  const maxEmaOverextensionPct = isCrypto ? 1.5 : 0.6; // 1.5% for crypto, 0.6% for forex
+  const maxEmaOverextensionPct = isCrypto ? 0.9 : 0.6; // Tightened: 0.9% for crypto to prevent chasing vertical pumps
   const distEmaPct = (lastPrice !== null && ema50 !== null && ema50 > 0)
     ? ((lastPrice - ema50) / ema50) * 100
     : null;
 
+  const upperPremiumThreshold = isCrypto ? 74 : 80;
+  const deepPremiumThreshold = isCrypto ? 82 : 88;
+  const lowerDiscountThreshold = isCrypto ? 26 : 20;
+  const deepDiscountThreshold = isCrypto ? 18 : 12;
+
   // Long Filter in Premium:
-  if (rangePosPct !== null && rangePosPct >= 80 && !hasMajorSweepLong) {
-    if (rangePosPct >= 88) {
+  if (rangePosPct !== null && rangePosPct >= upperPremiumThreshold && !hasMajorSweepLong) {
+    if (rangePosPct >= deepPremiumThreshold) {
       denied.LONG = `Top chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range (Deep Premium); wait for pullback to Discount/EMA before buying.`;
     } else if (distEmaPct !== null && distEmaPct > maxEmaOverextensionPct) {
       denied.LONG = `Top chasing blocked: price at ${rangePosPct.toFixed(0)}% of range and +${distEmaPct.toFixed(2)}% stretched above 50 EMA; wait for mean-reversion retest.`;
@@ -1136,8 +1177,8 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   }
 
   // Short Filter in Discount:
-  if (rangePosPct !== null && rangePosPct <= 20 && !hasMajorSweepShort) {
-    if (rangePosPct <= 12) {
+  if (rangePosPct !== null && rangePosPct <= lowerDiscountThreshold && !hasMajorSweepShort) {
+    if (rangePosPct <= deepDiscountThreshold) {
       denied.SHORT = `Bottom chasing blocked: price already at ${rangePosPct.toFixed(0)}% of range (Deep Discount); wait for bounce before shorting.`;
     } else if (distEmaPct !== null && distEmaPct < -maxEmaOverextensionPct) {
       denied.SHORT = `Bottom chasing blocked: price at ${rangePosPct.toFixed(0)}% of range and ${distEmaPct.toFixed(2)}% stretched below 50 EMA; wait for mean-reversion bounce.`;
@@ -1152,11 +1193,13 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     const sSpan = sHigh - sLow;
     if (sSpan > 0) {
       const shortPosPct = ((lastPrice - sLow) / sSpan) * 100;
-      if (shortPosPct > 88 && !denied.LONG && !hasMajorSweepLong) {
-        denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback.`;
+      const shortPosLongLimit = isCrypto ? 78 : 84;
+      const shortPosShortLimit = isCrypto ? 22 : 16;
+      if (shortPosPct > shortPosLongLimit && !denied.LONG && !hasMajorSweepLong) {
+        denied.LONG = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m rally top; wait for pullback to value area.`;
       }
-      if (shortPosPct < 12 && !denied.SHORT && !hasMajorSweepShort && !macroBearish) {
-        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce.`;
+      if (shortPosPct < shortPosShortLimit && !denied.SHORT && !hasMajorSweepShort && !macroBearish) {
+        denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce to value area.`;
       }
     }
   }
@@ -1905,6 +1948,21 @@ export function sanitizePlan(value: CouncilPlan, reports: SpecialistReport[], sn
     (decision === 'SHORT' && Boolean(derivedSweep?.short));
 
   if (!liquidityAlreadyTaken) {
+    if (decision === 'LONG' && snapshot.derivedContext?.dealingRange?.zone === 'PREMIUM') {
+      return buildWaitPlan(
+        reports,
+        `WAIT: Dealing range is PREMIUM. Buying here risks distribution trap; wait for discount retracement or sweep-reclaim.`,
+        textList(value.reasons, 4)
+      );
+    }
+    if (decision === 'SHORT' && snapshot.derivedContext?.dealingRange?.zone === 'DISCOUNT') {
+      return buildWaitPlan(
+        reports,
+        `WAIT: Dealing range is DISCOUNT. Shorting here risks accumulation bounce; wait for premium retracement or sweep-reclaim.`,
+        textList(value.reasons, 4)
+      );
+    }
+
     const closedFps = snapshot.footprints.filter((b) => b.isClosed);
     const lastClosedFp = closedFps[closedFps.length - 1];
     if (lastClosedFp) {

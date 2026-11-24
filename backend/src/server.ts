@@ -1426,11 +1426,10 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
       }
     }
 
-    // 15m/5m Council trades need breathing room: 75m is too short for overnight/low-volatility sessions.
-    // Allow at least 240 bars (4 hours). Only trigger stagnant timeout if trade has spent 240+ bars
-    // AND is drifting in deep adverse territory (currentR < -0.40). Never exit prematurely if floating near entry or positive.
-    const maxAllowedBars = 240;
-    const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars && currentR < -0.40;
+    // 15m/5m Council trades need breathing room: allow up to 480 bars (8 hours).
+    // Never exit prematurely if floating near entry or positive. Only timeout if 8h elapsed AND near stop (currentR < -0.80).
+    const maxAllowedBars = 480;
+    const isStagnantTimeout = currentTrade.barsHeld >= maxAllowedBars && currentR < -0.80;
 
     if (outcome !== 'OPEN' || isStagnantTimeout) {
       const finalExitKind = exitKind ?? 'TIMEOUT';

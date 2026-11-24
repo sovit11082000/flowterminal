@@ -1031,11 +1031,13 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
 
   const caps: Record<Dir, Cap[]> = {
     LONG: [
+      { when: derived.dealingRange?.zone === 'PREMIUM' && !hasInstitutionalLong, cap: 1, concern: 'Long capped: Price is inside Premium zone; high risk of distribution exhaustion.' },
       { when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD' && latest.close < (syn.pocPrice * 0.9985), cap: 1, concern: 'Long capped: 5m high-volume POC is trapped overhead.' },
       { when: Boolean(syn) && syn!.delta < 0 && syn!.cvdTrend === 'FALLING', cap: 1, concern: 'Long capped: 5m footprint delta is negative and 5m CVD is falling.' },
       { when: is1m && latest.close < open(latest) && latest.delta < 0 && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 1m trigger candle closed bearish with negative delta.' }
     ],
     SHORT: [
+      { when: derived.dealingRange?.zone === 'DISCOUNT' && !hasInstitutionalShort, cap: 1, concern: 'Short capped: Price is inside Discount zone; high risk of accumulation bounce.' },
       { when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT' && latest.close > (syn.pocPrice * 1.0015), cap: 1, concern: 'Short capped: 5m high-volume POC is acting as support underfoot.' },
       { when: Boolean(syn) && syn!.delta > 0 && syn!.cvdTrend === 'RISING', cap: 1, concern: 'Short capped: 5m footprint delta is positive and 5m CVD is rising.' },
       { when: is1m && latest.close > open(latest) && latest.delta > 0 && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 1m trigger candle closed bullish with positive delta.' }
