@@ -18,6 +18,7 @@ interface Evidence {
 interface Cap { when: boolean; cap: number; concern: string }
 
 const f = (value: number): string => String(Number(value.toFixed(Math.abs(value) >= 1000 ? 1 : Math.abs(value) >= 10 ? 2 : 4)));
+const domSnapshotCache = new Map<string, { bidVol: number; askVol: number; ts: number }>();
 const open = (c: Candle): number => c.open ?? c.close;
 const emptyEvidence = (): Record<Dir, Evidence[]> => ({ LONG: [], SHORT: [] });
 const agentName = (id: AgentId): string => SPECIALIST_AGENTS.find((a) => a.id === id)?.name ?? id;
@@ -547,9 +548,49 @@ export function smcMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
   const missing: string[] = [];
   if (derived.pdh === null && derived.pdl === null) missing.push('Prior-day levels (PDH/PDL)');
 
+  // 6) Strong vs Weak High/Low (Protected Swing after Sweep)
+  const smcPivots = findPivots(candles.slice(-60), 2);
+  if (smcPivots.lows.length >= 2) {
+    const prevSwL = smcPivots.lows[smcPivots.lows.length - 2];
+    const lastSwL = smcPivots.lows[smcPivots.lows.length - 1];
+    if (lastSwL.price < prevSwL.price && last.close > prevSwL.price) {
+      evidence.LONG.push({ pts: 1, category: 'STRUCTURE', strategy: 'SMC07', text: `Strong Protected Low at ${f(lastSwL.price)} (swept prior low ${f(prevSwL.price)} and reclaimed).` });
+    }
+  }
+  if (smcPivots.highs.length >= 2) {
+    const prevSwH = smcPivots.highs[smcPivots.highs.length - 2];
+    const lastSwH = smcPivots.highs[smcPivots.highs.length - 1];
+    if (lastSwH.price > prevSwH.price && last.close < prevSwH.price) {
+      evidence.SHORT.push({ pts: 1, category: 'STRUCTURE', strategy: 'SMC08', text: `Strong Protected High at ${f(lastSwH.price)} (swept prior high ${f(prevSwH.price)} and rejected).` });
+    }
+  }
+
+  // 7) 1H Unmitigated Order Block Opposition Guard
+  const smcConcerns: string[] = structure === 'MIXED' ? ['Swing structure is mixed.'] : [];
+  const smcCaps: Record<Dir, Cap[]> = { LONG: [], SHORT: [] };
+  const h1Bars = aggregateCandles(candles, 3600);
+  if (h1Bars.length >= 4) {
+    for (let i = h1Bars.length - 2; i >= Math.max(0, h1Bars.length - 6); i--) {
+      const ob = h1Bars[i];
+      const next = h1Bars[i + 1];
+      if (!next) continue;
+      if (ob.close > open(ob) && next.close < ob.low && last.high >= ob.low && last.close <= ob.high) {
+        smcCaps.LONG.push({ when: true, cap: 1, concern: `1H Unmitigated Bearish OB (${f(ob.low)}-${f(ob.high)}) overhead.` });
+        smcConcerns.push(`1H Bearish OB resistance overhead at ${f(ob.low)}-${f(ob.high)}.`);
+        break;
+      }
+      if (ob.close < open(ob) && next.close > ob.high && last.low <= ob.high && last.close >= ob.low) {
+        smcCaps.SHORT.push({ when: true, cap: 1, concern: `1H Unmitigated Bullish OB (${f(ob.low)}-${f(ob.high)}) underfoot.` });
+        smcConcerns.push(`1H Bullish OB support underfoot at ${f(ob.low)}-${f(ob.high)}.`);
+        break;
+      }
+    }
+  }
+
   return finalize({
     agentId: 'smc', evidence, derived, missing,
-    concerns: structure === 'MIXED' ? ['Swing structure is mixed.'] : [],
+    concerns: smcConcerns,
+    caps: smcCaps,
     emptyNote: `No confirmed MTF liquidity sweep + 5m CHoCH + OB/FVG setup (structure ${structure}).`
   });
 }
@@ -653,6 +694,44 @@ export function ictMathReport(snapshot: AgentSnapshot, derived: DerivedMarketCon
     evidence.SHORT.push({ pts: 1, category: 'MOMENTUM', strategy: 'ICT18', text: `Expansion: bearish breakdown below prior lows.` });
   }
 
+  // 6.1) NY Midnight Open (00:00 EST / 05:00 UTC) True Day Open Filter
+  const midnightBar = [...candles].reverse().find((c) => {
+    const t = Number((c as { time?: number }).time ?? 0);
+    if (!Number.isFinite(t) || t <= 0) return false;
+    const ms = t > 1e12 ? t : t * 1000;
+    const d = new Date(ms);
+    return d.getUTCHours() === 5 && d.getUTCMinutes() < 15;
+  });
+  if (midnightBar) {
+    const midnightOpen = open(midnightBar);
+    if (lastClose < midnightOpen && range?.zone === 'DISCOUNT' && lastClose > open(last)) {
+      evidence.LONG.push({ pts: 1, category: 'POI', strategy: 'ICT11', text: `Below NY Midnight Open (${f(midnightOpen)}) in Discount; bullish PO3 accumulation-buy alignment.` });
+    }
+    if (lastClose > midnightOpen && range?.zone === 'PREMIUM' && lastClose < open(last)) {
+      evidence.SHORT.push({ pts: 1, category: 'POI', strategy: 'ICT12', text: `Above NY Midnight Open (${f(midnightOpen)}) in Premium; bearish PO3 distribution-sell alignment.` });
+    }
+  }
+
+  // 6.2) Consequent Encroachment (50% FVG Midpoint Reaction)
+  for (let i = n - 3; i >= Math.max(2, n - 18); i--) {
+    const c1 = candles[i - 2];
+    const c3 = candles[i];
+    if (c3.low > c1.high) {
+      const ce = (c3.low + c1.high) / 2;
+      if (last.low <= ce && last.close > ce && last.close > open(last)) {
+        evidence.LONG.push({ pts: 1, category: 'POI', strategy: 'ICT03', text: `Consequent Encroachment (50% Bullish FVG ${f(ce)}) tapped and holding.` });
+        break;
+      }
+    }
+    if (c3.high < c1.low) {
+      const ce = (c1.low + c3.high) / 2;
+      if (last.high >= ce && last.close < ce && last.close < open(last)) {
+        evidence.SHORT.push({ pts: 1, category: 'POI', strategy: 'ICT04', text: `Consequent Encroachment (50% Bearish FVG ${f(ce)}) tapped and rejecting.` });
+        break;
+      }
+    }
+  }
+
   // 7) Strict Silver Bullet Validation: Only award point when active window coincides with an actual raid/OTE/2022 setup
   const longPts = evidence.LONG.length;
   const shortPts = evidence.SHORT.length;
@@ -695,6 +774,15 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
   const askVolTop5 = isDomLive ? (snapshot.asks ?? []).slice(0, 5).reduce((s, [, qty]) => s + (Number(qty) || 0), 0) : 0;
   const domBidDominant = bidVolTop5 > 0 && askVolTop5 > 0 && bidVolTop5 >= askVolTop5 * 1.75;
   const domAskDominant = bidVolTop5 > 0 && askVolTop5 > 0 && askVolTop5 >= bidVolTop5 * 1.75;
+
+  // Track previous DOM top-5 snapshot per symbol to detect real-time liquidity pulls / spoofs
+  const prevDom = domSnapshotCache.get(snapshot.symbol);
+  const domRecent = prevDom && (Date.now() - prevDom.ts) <= 90_000;
+  const askWallPulled = Boolean(isDomLive && domRecent && prevDom!.askVol > 0 && askVolTop5 <= prevDom!.askVol * 0.45);
+  const bidWallPulled = Boolean(isDomLive && domRecent && prevDom!.bidVol > 0 && bidVolTop5 <= prevDom!.bidVol * 0.45);
+  if (isDomLive && (bidVolTop5 > 0 || askVolTop5 > 0)) {
+    domSnapshotCache.set(snapshot.symbol, { bidVol: bidVolTop5, askVol: askVolTop5, ts: Date.now() });
+  }
 
   // 1) Key-Level Institutional Absorption + Price Response Confirmation
   // nearKeyLevel proximity widened to 0.4% (was 0.25%) — matches BOS cap change.
@@ -817,6 +905,70 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
       category: 'FLOW',
       strategy: 'OF08',
       text: `${micro.stackedSellImbalances.length} stacked sell imbalances with bearish close${domAskDominant ? ' + strong DOM ask wall' : ''}.`
+    });
+  }
+
+  // 2.05) Candle-to-Candle POC Migration (Initiative Drive Confirmation)
+  const prevFpBar = closed[closed.length - 2];
+  if (prevFpBar && prevFpBar.pocPrice > 0 && latest.pocPrice > 0) {
+    if (latest.pocPrice > prevFpBar.pocPrice && latest.close > open(latest) && latest.delta > 0) {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'FLOW',
+        strategy: 'OF07',
+        text: `POC Migration Up: candle POC shifted ${f(prevFpBar.pocPrice)} -> ${f(latest.pocPrice)} with positive delta (+${f(latest.delta)}).`
+      });
+    }
+    if (latest.pocPrice < prevFpBar.pocPrice && latest.close < open(latest) && latest.delta < 0) {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'FLOW',
+        strategy: 'OF08',
+        text: `POC Migration Down: candle POC shifted ${f(prevFpBar.pocPrice)} -> ${f(latest.pocPrice)} with negative delta (${f(latest.delta)}).`
+      });
+    }
+  }
+
+  // 2.06) Finished vs Unfinished Auction at Candle Extreme (Trapped Traders)
+  if (latest.priceLevels && latest.priceLevels.length >= 3) {
+    const sortedLvls = [...latest.priceLevels].sort((a, b) => a.price - b.price);
+    const lowLvl = sortedLvls[0];
+    const highLvl = sortedLvls[sortedLvls.length - 1];
+    const finishedLow = lowLvl.askVolume <= Math.max(0.01, lowLvl.bidVolume * 0.02);
+    const finishedHigh = highLvl.bidVolume <= Math.max(0.01, highLvl.askVolume * 0.02);
+    if (finishedLow && latest.close > open(latest) && nearKeyLevel) {
+      evidence.LONG.push({
+        pts: 1,
+        category: 'LIQUIDITY',
+        strategy: 'OF01',
+        text: `Finished Auction at Low (${f(lowLvl.price)}): zero/minimal ask print at extreme; sellers exhausted and buyers reclaimed.`
+      });
+    }
+    if (finishedHigh && latest.close < open(latest) && nearKeyLevel) {
+      evidence.SHORT.push({
+        pts: 1,
+        category: 'LIQUIDITY',
+        strategy: 'OF02',
+        text: `Finished Auction at High (${f(highLvl.price)}): zero/minimal bid print at extreme; buyers exhausted and sellers took control.`
+      });
+    }
+  }
+
+  // 2.07) DOM Liquidity Pull / Spoof Clearance
+  if (askWallPulled && latest.close > open(latest)) {
+    evidence.LONG.push({
+      pts: 1,
+      category: 'FLOW',
+      strategy: 'OF21',
+      text: `DOM Ask Liquidity Pull: top-5 ask wall pulled (${f(prevDom!.askVol)} -> ${f(askVolTop5)}), clearing upside path.`
+    });
+  }
+  if (bidWallPulled && latest.close < open(latest)) {
+    evidence.SHORT.push({
+      pts: 1,
+      category: 'FLOW',
+      strategy: 'OF21',
+      text: `DOM Bid Liquidity Pull: top-5 bid wall pulled (${f(prevDom!.bidVol)} -> ${f(bidVolTop5)}), clearing downside path.`
     });
   }
 
