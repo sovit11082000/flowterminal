@@ -1346,7 +1346,7 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
 
   const isCrypto = (CRYPTO_SYMBOLS as readonly string[]).includes(symbol);
   const bookStatus = pipeline.orderBook.getStatus();
-  const isOrderBookSafe = !isCrypto || bookStatus.isSynchronized;
+  const isOrderBookSafe = !isCrypto || process.env.ENABLE_ORDERBOOK_STREAM !== 'true' || bookStatus.isSynchronized;
 
   // 1. Smart Active Trade Management (0 API calls: Breakeven at 1.2R + Runner Protection + Confirmed Reversal Exit)
   const currentTrade = liveActiveTrades.get(symbol);
