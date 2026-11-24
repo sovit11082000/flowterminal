@@ -507,6 +507,122 @@ export function detectSweepReclaim(
   return out;
 }
 
+export interface ChochConfirmation {
+  bullish: boolean;
+  bearish: boolean;
+  bullishDetail: string | null;
+  bearishDetail: string | null;
+  protectedSwingHigh: number | null;
+  protectedSwingLow: number | null;
+}
+
+function checkTfChoch(
+  bars: AgentSnapshot['candles'],
+  left: number,
+  right: number,
+  breakWindow: number,
+  tfLabel: string
+): ChochConfirmation {
+  const empty: ChochConfirmation = {
+    bullish: false,
+    bearish: false,
+    bullishDetail: null,
+    bearishDetail: null,
+    protectedSwingHigh: null,
+    protectedSwingLow: null
+  };
+  if (bars.length < left + right + 4) return empty;
+
+  const lastBar = bars[bars.length - 1];
+  const maxSwingIdx = bars.length - 1 - Math.max(right, 1);
+
+  let protectedSwingHigh: number | null = null;
+  let shIdx = -1;
+  for (let i = maxSwingIdx; i >= left; i--) {
+    const h = bars[i].high;
+    let isPivot = true;
+    for (let j = i - left; j <= i + right; j++) {
+      if (j !== i && bars[j].high > h) {
+        isPivot = false;
+        break;
+      }
+    }
+    if (isPivot) {
+      protectedSwingHigh = h;
+      shIdx = i;
+      break;
+    }
+  }
+
+  let protectedSwingLow: number | null = null;
+  let slIdx = -1;
+  for (let i = maxSwingIdx; i >= left; i--) {
+    const l = bars[i].low;
+    let isPivot = true;
+    for (let j = i - left; j <= i + right; j++) {
+      if (j !== i && bars[j].low < l) {
+        isPivot = false;
+        break;
+      }
+    }
+    if (isPivot) {
+      protectedSwingLow = l;
+      slIdx = i;
+      break;
+    }
+  }
+
+  let bullish = false;
+  let bullishDetail: string | null = null;
+  if (protectedSwingHigh !== null && shIdx >= 0) {
+    const startIdx = Math.max(shIdx + 1, bars.length - breakWindow);
+    const brokeUp = bars.slice(startIdx).some((b) => b.close > protectedSwingHigh!);
+    const minLowSince = Math.min(...bars.slice(shIdx).map((b) => b.low));
+    if (brokeUp && lastBar.close > minLowSince) {
+      bullish = true;
+      bullishDetail = `${tfLabel} Bullish CHoCH (closed > ${protectedSwingHigh.toFixed(2)})`;
+    }
+  }
+
+  let bearish = false;
+  let bearishDetail: string | null = null;
+  if (protectedSwingLow !== null && slIdx >= 0) {
+    const startIdx = Math.max(slIdx + 1, bars.length - breakWindow);
+    const brokeDown = bars.slice(startIdx).some((b) => b.close < protectedSwingLow!);
+    const maxHighSince = Math.max(...bars.slice(slIdx).map((b) => b.high));
+    if (brokeDown && lastBar.close < maxHighSince) {
+      bearish = true;
+      bearishDetail = `${tfLabel} Bearish CHoCH (closed < ${protectedSwingLow.toFixed(2)})`;
+    }
+  }
+
+  return { bullish, bearish, bullishDetail, bearishDetail, protectedSwingHigh, protectedSwingLow };
+}
+
+/**
+ * 1m / 5m CHoCH (Change of Character) Confirmation:
+ * Requires a closed candle break of the most recent protected fractal swing high (for LONG)
+ * or swing low (for SHORT) so OrderFlow entries only fire after structure actually shifts.
+ */
+export function detectChochConfirmation(
+  candles1m: AgentSnapshot['candles'],
+  candles5m?: AgentSnapshot['candles']
+): ChochConfirmation {
+  const c1m = checkTfChoch(candles1m.slice(-45), 2, 2, 8, '1m');
+  const c5m = candles5m && candles5m.length >= 8
+    ? checkTfChoch(candles5m.slice(-24), 2, 1, 3, '5m')
+    : { bullish: false, bearish: false, bullishDetail: null, bearishDetail: null, protectedSwingHigh: null, protectedSwingLow: null };
+
+  return {
+    bullish: c1m.bullish || c5m.bullish,
+    bearish: c1m.bearish || c5m.bearish,
+    bullishDetail: c5m.bullishDetail ?? c1m.bullishDetail,
+    bearishDetail: c5m.bearishDetail ?? c1m.bearishDetail,
+    protectedSwingHigh: c1m.protectedSwingHigh ?? c5m.protectedSwingHigh,
+    protectedSwingLow: c1m.protectedSwingLow ?? c5m.protectedSwingLow
+  };
+}
+
 export function detectSidewaysMarket(
   candles: AgentSnapshot['candles'],
   footprints: AgentSnapshot['footprints'],
@@ -1242,6 +1358,21 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
           denied.SHORT = `Late Entry Guard: price has already completed ${progressPct.toFixed(0)}% of the move to target (${originHigh.toFixed(1)} -> ${dolBear.toFixed(1)}). Wait for a deep premium retest.`;
         }
       }
+    }
+  }
+
+  // RULE 1D: 1m/5m CHoCH (Change of Character) Confirmation Gate
+  // OrderFlow absorption alone is not enough — require a closed 1m or 5m candle break of the
+  // most recent protected fractal swing low/high to confirm control has actually shifted.
+  if (snapshot.candles.length >= 15) {
+    const choch = detectChochConfirmation(snapshot.candles, snapshot.candles5m);
+    if (!choch.bearish && !denied.SHORT) {
+      const refLow = choch.protectedSwingLow !== null ? ` below swing low ${choch.protectedSwingLow.toFixed(2)}` : '';
+      denied.SHORT = `CHoCH Gate: waiting for 1m/5m Bearish CHoCH (candle close${refLow}) to confirm structure shift before shorting.`;
+    }
+    if (!choch.bullish && !denied.LONG) {
+      const refHigh = choch.protectedSwingHigh !== null ? ` above swing high ${choch.protectedSwingHigh.toFixed(2)}` : '';
+      denied.LONG = `CHoCH Gate: waiting for 1m/5m Bullish CHoCH (candle close${refHigh}) to confirm structure shift before longing.`;
     }
   }
 
