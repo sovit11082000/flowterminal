@@ -63,6 +63,13 @@ export interface LiveTradeJournalRecord {
   reasons: string[];
   summary: string;
   audited: boolean;
+  monthKey?: string;
+  triggerCandleTime?: string;
+  timeframeBreakdown?: {
+    htf15m?: string;
+    trigger5m?: string;
+    flow1m?: string;
+  };
 }
 
 export interface StrategyScorecardItem {
@@ -232,9 +239,10 @@ export class MongoHistoryStore {
   async saveLiveTradeJournal(entry: LiveTradeJournalRecord): Promise<void> {
     if (!this.db) return;
     try {
+      const monthKey = entry.monthKey || new Date(entry.resolvedAt || entry.enteredAt).toISOString().slice(0, 7);
       await this.collection('tradeJournal').replaceOne(
         { tradeId: entry.tradeId },
-        { ...entry, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60_000) },
+        { ...entry, monthKey },
         { upsert: true }
       );
     } catch (err) {

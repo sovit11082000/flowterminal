@@ -1616,6 +1616,16 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
         console.log(`\n[${checkIst}] 🚨 [A+ PAPER TRADE TRIGGERED]: [${generatedTradeId}] ${plan.decision} ${symbol} @ $${plan.entryPrice} (15m/5m Flow)`);
         console.log(`   SL: $${plan.stopPrice} | TP: $${plan.targetPrice} (${plan.targetR}R)${riskInfo}`);
 
+        const lastCandle = snapshot.candles5m?.[snapshot.candles5m.length - 1] ?? snapshot.candles[snapshot.candles.length - 1];
+        const candleTimeIst = lastCandle
+          ? new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(lastCandle.time * 1000)) + ' IST (5m Bar Close)'
+          : `${checkIst} (5m Bar Close)`;
+
+        const htfDesc = snapshot.derivedContext?.htfTrendDescription || `15m/5m Trend: ${snapshot.derivedContext?.htfTrend || 'NEUTRAL'}`;
+        const trigger5mDesc = `5m closed at $${plan.entryPrice} with ${plan.decision} alignment`;
+        const ofSummary = snapshot.derivedContext?.orderFlowSummary;
+        const flowDesc = `CVD ${ofSummary?.cvdTrend || 'NEUTRAL'}, Delta ${ofSummary?.latestBarDelta ?? 0}, Absorption: ${ofSummary?.absorptionSignal || 'NONE'}`;
+
         const newTrade: LiveActiveTrade = {
           tradeId: generatedTradeId,
           symbol,
@@ -1648,7 +1658,13 @@ async function handleLiveBarAutonomousTrading(symbol: string, bar: SerializedFoo
           targetR: plan.targetR || 2,
           reasons: plan.reasons,
           strategies: plan.strategyNames || [],
-          summary: `${plan.summary}${riskInfo}`
+          summary: `${plan.summary}${riskInfo}`,
+          triggerCandleTime: candleTimeIst,
+          timeframeBreakdown: {
+            htf15m: htfDesc,
+            trigger5m: trigger5mDesc,
+            flow1m: flowDesc
+          }
         }).catch((e) => console.warn('[Telegram Entry Alert Error]:', e instanceof Error ? e.message : e));
 
         if (mongoHistory.connected) {

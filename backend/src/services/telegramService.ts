@@ -9,6 +9,12 @@ export interface TelegramTradeAlert {
   reasons: string[];
   strategies: string[];
   summary: string;
+  triggerCandleTime?: string;
+  timeframeBreakdown?: {
+    htf15m?: string;
+    trigger5m?: string;
+    flow1m?: string;
+  };
 }
 
 export interface TelegramOutcomeAlert {
@@ -131,17 +137,26 @@ export async function sendTradeEntryAlert(trade: TelegramTradeAlert): Promise<vo
     : '• Multi-Agent Confluence';
 
   const reasonsList = trade.reasons.length
-    ? trade.reasons.slice(0, 2).map((r) => `• ${escapeHtml(r)}`).join('\n')
+    ? trade.reasons.slice(0, 3).map((r) => `• ${escapeHtml(r)}`).join('\n')
     : '• High confluence confirmation';
 
-  const message = `🚨 <b>NEW A+ TRADE ENTRY</b> | ${tradeTag}
+  const tfSection = trade.timeframeBreakdown
+    ? `\n⏱️ <b>TIMEFRAME ACTIVITY BREAKDOWN:</b>
+• <b>15m HTF:</b> ${escapeHtml(trade.timeframeBreakdown.htf15m || 'Intraday trend aligned')}
+• <b>5m Structure:</b> ${escapeHtml(trade.timeframeBreakdown.trigger5m || 'Confirmed bar close')}
+• <b>1m Footprint:</b> ${escapeHtml(trade.timeframeBreakdown.flow1m || 'Delta & tape absorption confirmed')}\n`
+    : '';
+
+  const candleInfo = trade.triggerCandleTime ? `📅 <b>Trigger Candle:</b> ${escapeHtml(trade.triggerCandleTime)}\n` : '';
+
+  const message = `🚨 <b>NEW A++++ TRADE ENTRY</b> | ${tradeTag}
 ━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>Direction:</b> ${icon} <b>${trade.decision} ${trade.symbol}</b>
 🏁 <b>Entry:</b> $${formatPrice(trade.symbol, trade.entryPrice)}
-🎯 <b>Target (TP):</b> $${formatPrice(trade.symbol, trade.targetPrice)} (<b>+${trade.targetR}R</b>)
+🎯 <b>Target (TP):</b> $${formatPrice(trade.symbol, trade.targetPrice)} (<b>+${trade.targetR}R Natural DOL</b>)
 🛑 <b>Stop Loss (SL):</b> $${formatPrice(trade.symbol, trade.stopPrice)} (<b>-1R</b>)
-📅 <b>Entry Time:</b> ${formattedTime}
-
+${candleInfo}📅 <b>Alert Time:</b> ${formattedTime}
+${tfSection}
 📊 <b>Confluence Strategies:</b>
 ${strategiesList}
 

@@ -1017,8 +1017,8 @@ export function councilConfig() {
     minAgreeing: 2,
     minLeadStrength: 2,
     opposeVetoStrength: 2,
-    minRR: num('COUNCIL_MIN_RR', 1.25),
-    maxRR: num('COUNCIL_MAX_RR', 2.2),
+    minRR: num('COUNCIL_MIN_RR', 1.80),
+    maxRR: num('COUNCIL_MAX_RR', 3.5),
     minRiskPct: num('COUNCIL_MIN_RISK_PCT', 0.15),
     maxRiskPct: num('COUNCIL_MAX_RISK_PCT', 0.45),
     maxEntryDriftPct: num('COUNCIL_MAX_ENTRY_DRIFT_PCT', 0.25),
@@ -1200,6 +1200,47 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
       }
       if (shortPosPct < shortPosShortLimit && !denied.SHORT && !hasMajorSweepShort && !macroBearish) {
         denied.SHORT = `Late entry blocked: price at ${shortPosPct.toFixed(0)}% of 30m dump bottom; wait for bounce to value area.`;
+      }
+    }
+  }
+
+  // RULE 1B: Strict Dynamic 50 EMA Trend Alignment (Never Short above 50 EMA in an uptrend, Never Long below in a downtrend)
+  if (distEmaPct !== null) {
+    if (distEmaPct > 0.04 && !hasMajorSweepShort && !denied.SHORT) {
+      denied.SHORT = `Dynamic Trend Guard: price is trading above 50 EMA (+${distEmaPct.toFixed(2)}%) in an active micro-uptrend; SHORT blocked without a confirmed 5m breakdown below 50 EMA.`;
+    }
+    if (distEmaPct < -0.04 && !hasMajorSweepLong && !denied.LONG) {
+      denied.LONG = `Dynamic Trend Guard: price is trading below 50 EMA (${distEmaPct.toFixed(2)}%) in an active micro-downtrend; LONG blocked without a confirmed 5m reclaim above 50 EMA.`;
+    }
+  }
+
+  // RULE 1C: Pre-Trade Move Maturity & Late Entry Guard (Quality A++++ over quantity)
+  // If price has already traversed > 55% of the total runway from origin swing to next major liquidity pool,
+  // the move is already mature; stand aside to avoid buying tops or selling bottoms.
+  const originLow = derived.recentSwingLow ?? null;
+  const originHigh = derived.recentSwingHigh ?? null;
+  const dolBull = derived.drawOnLiquidity?.nextBullishTarget ?? null;
+  const dolBear = derived.drawOnLiquidity?.nextBearishTarget ?? null;
+
+  if (lastPrice !== null) {
+    if (originLow !== null && dolBull !== null && dolBull > originLow && !denied.LONG && !hasMajorSweepLong) {
+      const totalRunway = dolBull - originLow;
+      const progress = lastPrice - originLow;
+      if (totalRunway > 0) {
+        const progressPct = (progress / totalRunway) * 100;
+        if (progressPct > 55) {
+          denied.LONG = `Late Entry Guard: price has already completed ${progressPct.toFixed(0)}% of the move to target (${originLow.toFixed(1)} -> ${dolBull.toFixed(1)}). Wait for a deep discount retest.`;
+        }
+      }
+    }
+    if (originHigh !== null && dolBear !== null && originHigh > dolBear && !denied.SHORT && !hasMajorSweepShort) {
+      const totalRunway = originHigh - dolBear;
+      const progress = originHigh - lastPrice;
+      if (totalRunway > 0) {
+        const progressPct = (progress / totalRunway) * 100;
+        if (progressPct > 55) {
+          denied.SHORT = `Late Entry Guard: price has already completed ${progressPct.toFixed(0)}% of the move to target (${originHigh.toFixed(1)} -> ${dolBear.toFixed(1)}). Wait for a deep premium retest.`;
+        }
       }
     }
   }
@@ -1485,31 +1526,29 @@ export function resolveTradeLevels(
   const validSide = (value: number | null): value is number => value !== null && (dir === 1 ? value > entry : value < entry);
   let target = positive(raw.target);
 
-  if (!validSide(target) || (target !== null && Math.abs(target - entry) / risk < cfg.minRR)) {
-    if (target !== null && !validSide(target)) notes.push('Target was on the wrong side of entry; ignored.');
-    const dolRaw = snapshot.derivedContext?.drawOnLiquidity;
-    const dol = positive(dir === 1 ? dolRaw?.nextBullishTarget : dolRaw?.nextBearishTarget);
+  const dolRaw = snapshot.derivedContext?.drawOnLiquidity;
+  const dol = positive(dir === 1 ? dolRaw?.nextBullishTarget : dolRaw?.nextBearishTarget);
 
-    if (validSide(dol) && Math.abs(dol - entry) / risk >= cfg.minRR) {
-      target = dol;
-      notes.push('Target taken from next draw on liquidity.');
-    } else {
-      return { ok: false, reason: `Nearest Draw on Liquidity is less than minimum ${cfg.minRR}R; skipping trade instead of forcing an artificial target.` };
-    }
+  // Natural Draw on Liquidity priority: Target must anchor to a real structural liquidity pool
+  const candidateTarget = validSide(dol) ? dol : target;
+  if (!validSide(candidateTarget)) {
+    return { ok: false, reason: 'No valid structural Draw on Liquidity found on the trade direction.' };
   }
 
-  let finalTarget = target as number;
-  let rr = Math.abs(finalTarget - entry) / risk;
-
-  if (rr < cfg.minRR) {
-    finalTarget = entry + dir * risk * cfg.minRR;
-    rr = cfg.minRR;
-    notes.push(`Target expanded to meet minimum ${cfg.minRR}R.`);
+  const naturalRR = Math.abs(candidateTarget - entry) / risk;
+  if (naturalRR < cfg.minRR) {
+    return {
+      ok: false,
+      reason: `Natural Draw on Liquidity offers only ${naturalRR.toFixed(2)}R (minimum ${cfg.minRR}R required). Skipping trade to prevent artificial/forced targets.`
+    };
   }
+
+  let finalTarget = candidateTarget;
+  let rr = naturalRR;
   if (rr > cfg.maxRR) {
     finalTarget = entry + dir * risk * cfg.maxRR;
     rr = cfg.maxRR;
-    notes.push(`Target capped at ${cfg.maxRR}R.`);
+    notes.push(`Target capped at structural limit of ${cfg.maxRR}R.`);
   }
 
   const round = (value: number): number => Number(value.toFixed(6));
