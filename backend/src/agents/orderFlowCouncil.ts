@@ -171,7 +171,7 @@ export interface AgentSnapshot {
   } | null;
 }
 
-type AiProvider = 'groq' | 'cloudflare' | 'agentrouter';
+type AiProvider = 'groq' | 'cloudflare' | 'agentrouter' | 'vyceai';
 type AgentRole = 'smc' | 'ict' | 'orderflow' | 'manager';
 interface ProviderConfig { provider: AiProvider; model: string; key: string; baseUrl?: string; quotaScope?: string; }
 
@@ -1979,6 +1979,21 @@ function getProviderConfigs(role: AgentRole): ProviderConfig[] {
       baseUrl: (process.env.AGENT_ROUTER_BASE_URL?.trim() || 'https://agentrouter.org/v1').replace(/\/+$/, ''),
       quotaScope: 'agent-router-live-manager'
     });
+  }
+
+  if (role === 'manager' && process.env.VYCEAI_API_KEY?.trim()) {
+    const vyceKey = process.env.VYCEAI_API_KEY.trim();
+    const vyceBase = (process.env.VYCEAI_BASE_URL?.trim() || 'https://vyceai.com/v1').replace(/\/+$/, '');
+    const vyceModels = (process.env.VYCEAI_MODEL?.trim() || 'wave').split(',').map((m) => m.trim()).filter(Boolean);
+    for (const model of vyceModels) {
+      configured.push({
+        provider: 'vyceai',
+        key: vyceKey,
+        model,
+        baseUrl: vyceBase,
+        quotaScope: `vyceai-${model}`
+      });
+    }
   }
 
   configured.push(...parseRoleCredentialList(process.env[`GROQ_${roleName}_API_KEY`], roleName));
