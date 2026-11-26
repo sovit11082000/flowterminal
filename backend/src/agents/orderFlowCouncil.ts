@@ -1320,59 +1320,47 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
     }
   }
 
-  // RULE 1B: Strict Dynamic 50 EMA Trend Alignment (Never Short above 50 EMA in an uptrend, Never Long below in a downtrend)
+  // RULE 1B: Strict Dynamic 50 EMA Trend Alignment (Never Short far above 50 EMA in an uptrend, Never Long far below in a downtrend)
   if (distEmaPct !== null) {
-    if (distEmaPct > 0.04 && !hasMajorSweepShort && !denied.SHORT) {
+    if (distEmaPct > 0.18 && !hasMajorSweepShort && !denied.SHORT) {
       denied.SHORT = `Dynamic Trend Guard: price is trading above 50 EMA (+${distEmaPct.toFixed(2)}%) in an active micro-uptrend; SHORT blocked without a confirmed 5m breakdown below 50 EMA.`;
     }
-    if (distEmaPct < -0.04 && !hasMajorSweepLong && !denied.LONG) {
+    if (distEmaPct < -0.18 && !hasMajorSweepLong && !denied.LONG) {
       denied.LONG = `Dynamic Trend Guard: price is trading below 50 EMA (${distEmaPct.toFixed(2)}%) in an active micro-downtrend; LONG blocked without a confirmed 5m reclaim above 50 EMA.`;
     }
   }
 
-  // RULE 1C: Pre-Trade Move Maturity & Late Entry Guard (Quality A++++ over quantity)
-  // If price has already traversed > 55% of the total runway from origin swing to next major liquidity pool,
-  // the move is already mature; stand aside to avoid buying tops or selling bottoms.
-  const originLow = derived.recentSwingLow ?? null;
-  const originHigh = derived.recentSwingHigh ?? null;
-  const dolBull = derived.drawOnLiquidity?.nextBullishTarget ?? null;
-  const dolBear = derived.drawOnLiquidity?.nextBearishTarget ?? null;
-
-  if (lastPrice !== null) {
-    if (originLow !== null && dolBull !== null && dolBull > originLow && !denied.LONG && !hasMajorSweepLong) {
-      const totalRunway = dolBull - originLow;
-      const progress = lastPrice - originLow;
-      if (totalRunway > 0) {
-        const progressPct = (progress / totalRunway) * 100;
-        if (progressPct > 55) {
-          denied.LONG = `Late Entry Guard: price has already completed ${progressPct.toFixed(0)}% of the move to target (${originLow.toFixed(1)} -> ${dolBull.toFixed(1)}). Wait for a deep discount retest.`;
-        }
+  // RULE 1C: Anti-Spike Chase Guard (Replaces macro-swing Late Entry Guard)
+  // Allow clean pullbacks even in mature trends, but block chasing vertical 5m spike candles (>= 2.2x avg range).
+  const spikeCheckBars = (snapshot.candles5m && snapshot.candles5m.length >= 10)
+    ? snapshot.candles5m.slice(-10)
+    : snapshot.candles.slice(-20);
+  if (spikeCheckBars.length >= 6) {
+    const prior = spikeCheckBars.slice(0, -1);
+    const avgRange = prior.reduce((s, c) => s + (c.high - c.low), 0) / prior.length;
+    const latestBar = spikeCheckBars[spikeCheckBars.length - 1];
+    const latestRange = latestBar.high - latestBar.low;
+    const latestOpen = latestBar.open ?? latestBar.close;
+    if (avgRange > 0 && latestRange >= avgRange * 2.2) {
+      if (latestBar.close > latestOpen && !hasMajorSweepLong && !denied.LONG) {
+        denied.LONG = `Anti-Spike Guard: latest candle is ${(latestRange / avgRange).toFixed(1)}x avg range (vertical pump); wait for pullback before longing.`;
       }
-    }
-    if (originHigh !== null && dolBear !== null && originHigh > dolBear && !denied.SHORT && !hasMajorSweepShort) {
-      const totalRunway = originHigh - dolBear;
-      const progress = originHigh - lastPrice;
-      if (totalRunway > 0) {
-        const progressPct = (progress / totalRunway) * 100;
-        if (progressPct > 55) {
-          denied.SHORT = `Late Entry Guard: price has already completed ${progressPct.toFixed(0)}% of the move to target (${originHigh.toFixed(1)} -> ${dolBear.toFixed(1)}). Wait for a deep premium retest.`;
-        }
+      if (latestBar.close < latestOpen && !hasMajorSweepShort && !denied.SHORT) {
+        denied.SHORT = `Anti-Spike Guard: latest candle is ${(latestRange / avgRange).toFixed(1)}x avg range (vertical dump); wait for pullback before shorting.`;
       }
     }
   }
 
   // RULE 1D: 1m/5m CHoCH (Change of Character) Confirmation Gate
   // OrderFlow absorption alone is not enough — require a closed 1m or 5m candle break of the
-  // most recent protected fractal swing low/high to confirm control has actually shifted.
+  // most recent protected fractal swing low/high (when present) to confirm control has actually shifted.
   if (snapshot.candles.length >= 15) {
     const choch = detectChochConfirmation(snapshot.candles, snapshot.candles5m);
-    if (!choch.bearish && !denied.SHORT) {
-      const refLow = choch.protectedSwingLow !== null ? ` below swing low ${choch.protectedSwingLow.toFixed(2)}` : '';
-      denied.SHORT = `CHoCH Gate: waiting for 1m/5m Bearish CHoCH (candle close${refLow}) to confirm structure shift before shorting.`;
+    if (choch.protectedSwingLow !== null && !choch.bearish && !denied.SHORT) {
+      denied.SHORT = `CHoCH Gate: waiting for 1m/5m Bearish CHoCH (candle close below swing low ${choch.protectedSwingLow.toFixed(2)}) to confirm structure shift before shorting.`;
     }
-    if (!choch.bullish && !denied.LONG) {
-      const refHigh = choch.protectedSwingHigh !== null ? ` above swing high ${choch.protectedSwingHigh.toFixed(2)}` : '';
-      denied.LONG = `CHoCH Gate: waiting for 1m/5m Bullish CHoCH (candle close${refHigh}) to confirm structure shift before longing.`;
+    if (choch.protectedSwingHigh !== null && !choch.bullish && !denied.LONG) {
+      denied.LONG = `CHoCH Gate: waiting for 1m/5m Bullish CHoCH (candle close above swing high ${choch.protectedSwingHigh.toFixed(2)}) to confirm structure shift before longing.`;
     }
   }
 
