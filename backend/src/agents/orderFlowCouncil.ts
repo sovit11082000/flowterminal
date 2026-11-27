@@ -1816,7 +1816,7 @@ async function generateJson<T>(config: ProviderConfig, system: string, input: un
       : {
           model: config.model,
           temperature: options.temperature ?? 0.1,
-          max_tokens: options.maxTokens,
+          max_tokens: config.provider === 'hcnsec' ? Math.max(options.maxTokens, 3000) : options.maxTokens,
           ...(!/gpt-oss/i.test(config.model) ? { response_format: { type: 'json_object' } } : {}),
           messages: [
             { role: 'system', content: `${system}\n\nRespond with ONE valid JSON object only (no markdown, no preamble), shaped exactly like:\n${template}` },
@@ -1833,7 +1833,7 @@ async function generateJson<T>(config: ProviderConfig, system: string, input: un
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const controller = new AbortController();
-    const timeoutMs = config.provider === 'agentrouter' ? 120_000 : 35_000;
+    const timeoutMs = config.provider === 'agentrouter' ? 120_000 : config.provider === 'hcnsec' ? 55_000 : 35_000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
     try {

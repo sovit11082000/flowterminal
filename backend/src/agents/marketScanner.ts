@@ -141,7 +141,7 @@ export function scanMarketActivity(snapshot: AgentSnapshot): MarketActivityScan 
 
   let regime: MarketActivityScan['regime'] = 'ACCUMULATION_RANGE';
   if (dominantFlow === 'BEARISH') {
-    if (range4hPositionPct !== null && range4hPositionPct < 5 && rangeSpanPct > 2.5) {
+    if (range4hPositionPct !== null && range4hPositionPct < 5 && (rangeSpanPct > 5.0 || cumDelta15m > 0)) {
       regime = 'EXHAUSTED_MOVE';
     } else if (structure15m === 'BOUNCE_IN_DOWNTREND' || cumDelta15m > 0) {
       regime = 'BEARISH_PULLBACK';
@@ -149,7 +149,7 @@ export function scanMarketActivity(snapshot: AgentSnapshot): MarketActivityScan 
       regime = 'STRONG_DOWNTREND';
     }
   } else if (dominantFlow === 'BULLISH') {
-    if (range4hPositionPct !== null && range4hPositionPct > 95 && rangeSpanPct > 2.5) {
+    if (range4hPositionPct !== null && range4hPositionPct > 95 && (rangeSpanPct > 5.0 || cumDelta15m < 0)) {
       regime = 'EXHAUSTED_MOVE';
     } else if (structure15m === 'DIP_IN_UPTREND' || cumDelta15m < 0) {
       regime = 'BULLISH_PULLBACK';
