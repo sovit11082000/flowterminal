@@ -848,26 +848,41 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
     }
   }
 
-  // 1.2) Deribit Options Gamma (GEX) Institutional Confluence
+  // 1.2) Deribit Options Gamma (GEX) Institutional Confluence + CVD Wall-Reaction Rules
+  // GEX tells WHERE to look; the tape (CVD + Price response) tells WHO wins.
   const gamma = snapshot.gammaContext;
+  let gexLongBlockReason: string | null = null;
+  let gexShortBlockReason: string | null = null;
   if (gamma && latest.close > 0) {
     if (gamma.putWall !== null && Math.abs(latest.close - gamma.putWall) / latest.close <= 0.005) {
-      if (latest.close > open(latest) || (micro.latestBarDelta > 0 && micro.cvdTrend === 'RISING')) {
+      const priceStuckOrHolding = latest.close >= gamma.putWall * 0.999 && latest.close >= ref.close * 0.999;
+      const priceFollowingDown = latest.close < gamma.putWall && latest.close < open(latest);
+      if (micro.cvdTrend === 'RISING' && latest.close <= ref.close * 1.0005 && latest.close <= open(latest)) {
+        gexLongBlockReason = `GEX+CVD Trap at Put Wall ($${gamma.putWall}): CVD climbing while price stuck — buyers absorbed; stay out.`;
+      } else if (micro.cvdTrend === 'FALLING' && priceFollowingDown) {
+        gexLongBlockReason = `GEX+CVD Breakdown at Put Wall ($${gamma.putWall}): CVD dumping and price following — no defender; don't catch.`;
+      } else if ((micro.cvdTrend === 'FALLING' && priceStuckOrHolding) || (micro.absorptionSignal === 'BULLISH_ABSORPTION' && latest.close > open(latest))) {
         evidence.LONG.push({
           pts: 2,
           category: 'POI',
           strategy: 'OF10',
-          text: `Deribit Put Wall Support bounce ($${gamma.putWall}): institutional options floor defended with buying response.`
+          text: `Deribit Put Wall Defended ($${gamma.putWall}): sellers absorbed (CVD ${micro.cvdTrend}, price held) — A+ options floor support.`
         });
       }
     }
     if (gamma.callWall !== null && Math.abs(latest.close - gamma.callWall) / latest.close <= 0.005) {
-      if (latest.close < open(latest) || (micro.latestBarDelta < 0 && micro.cvdTrend === 'FALLING')) {
+      const priceStuckOrRejected = latest.close <= gamma.callWall * 1.001 && latest.close <= ref.close * 1.001;
+      const priceFollowingUp = latest.close > gamma.callWall && latest.close > open(latest);
+      if (micro.cvdTrend === 'FALLING' && latest.close >= ref.close * 0.9995 && latest.close >= open(latest)) {
+        gexShortBlockReason = `GEX+CVD Trap at Call Wall ($${gamma.callWall}): CVD dumping while price stuck — sellers absorbed; stay out.`;
+      } else if (micro.cvdTrend === 'RISING' && priceFollowingUp) {
+        gexShortBlockReason = `GEX+CVD Breakout at Call Wall ($${gamma.callWall}): CVD climbing and price following — no defender; don't fade.`;
+      } else if ((micro.cvdTrend === 'RISING' && priceStuckOrRejected) || (micro.absorptionSignal === 'BEARISH_ABSORPTION' && latest.close < open(latest))) {
         evidence.SHORT.push({
           pts: 2,
           category: 'POI',
           strategy: 'OF11',
-          text: `Deribit Call Wall Resistance rejection ($${gamma.callWall}): institutional options ceiling pinned/rejected with selling response.`
+          text: `Deribit Call Wall Defended ($${gamma.callWall}): buyers absorbed (CVD ${micro.cvdTrend}, price stalled) — A+ options ceiling rejection.`
         });
       }
     }
@@ -1186,13 +1201,15 @@ export function orderFlowMathReport(snapshot: AgentSnapshot, derived: DerivedMar
       { when: derived.dealingRange?.zone === 'PREMIUM' && !hasInstitutionalLong, cap: 1, concern: 'Long capped: Price is inside Premium zone; high risk of distribution exhaustion.' },
       { when: syn?.pocPosition === 'POC_TRAPPED_OVERHEAD' && latest.close < (syn.pocPrice * 0.9985), cap: 1, concern: 'Long capped: 5m high-volume POC is trapped overhead.' },
       { when: Boolean(syn) && syn!.delta < 0 && syn!.cvdTrend === 'FALLING', cap: 1, concern: 'Long capped: 5m footprint delta is negative and 5m CVD is falling.' },
-      { when: is1m && latest.close < open(latest) && latest.delta < 0 && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 1m trigger candle closed bearish with negative delta.' }
+      { when: is1m && latest.close < open(latest) && latest.delta < 0 && !hasInstitutionalLong, cap: 1, concern: 'Long capped: 1m trigger candle closed bearish with negative delta.' },
+      { when: gexLongBlockReason !== null, cap: 1, concern: gexLongBlockReason ?? '' }
     ],
     SHORT: [
       { when: derived.dealingRange?.zone === 'DISCOUNT' && !hasInstitutionalShort, cap: 1, concern: 'Short capped: Price is inside Discount zone; high risk of accumulation bounce.' },
       { when: syn?.pocPosition === 'POC_SUPPORT_UNDERFOOT' && latest.close > (syn.pocPrice * 1.0015), cap: 1, concern: 'Short capped: 5m high-volume POC is acting as support underfoot.' },
       { when: Boolean(syn) && syn!.delta > 0 && syn!.cvdTrend === 'RISING', cap: 1, concern: 'Short capped: 5m footprint delta is positive and 5m CVD is rising.' },
-      { when: is1m && latest.close > open(latest) && latest.delta > 0 && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 1m trigger candle closed bullish with positive delta.' }
+      { when: is1m && latest.close > open(latest) && latest.delta > 0 && !hasInstitutionalShort, cap: 1, concern: 'Short capped: 1m trigger candle closed bullish with positive delta.' },
+      { when: gexShortBlockReason !== null, cap: 1, concern: gexShortBlockReason ?? '' }
     ]
   };
 
