@@ -1352,14 +1352,14 @@ export function evaluateGates(snapshot: AgentSnapshot): GateResult {
   }
 
   // RULE 1D: 1m/5m CHoCH (Change of Character) Confirmation Gate
-  // OrderFlow absorption alone is not enough — require a closed 1m or 5m candle break of the
-  // most recent protected fractal swing low/high (when present) to confirm control has actually shifted.
+  // Only require CHoCH when NOT already aligned with the 15m trend (counter-trend / neutral reversals),
+  // so valid trend-continuation pullbacks are not blocked waiting for a new high/low break.
   if (snapshot.candles.length >= 15) {
     const choch = detectChochConfirmation(snapshot.candles, snapshot.candles5m);
-    if (choch.protectedSwingLow !== null && !choch.bearish && !denied.SHORT) {
+    if (!macroBearish && choch.protectedSwingLow !== null && !choch.bearish && !denied.SHORT) {
       denied.SHORT = `CHoCH Gate: waiting for 1m/5m Bearish CHoCH (candle close below swing low ${choch.protectedSwingLow.toFixed(2)}) to confirm structure shift before shorting.`;
     }
-    if (choch.protectedSwingHigh !== null && !choch.bullish && !denied.LONG) {
+    if (!macroBullish && choch.protectedSwingHigh !== null && !choch.bullish && !denied.LONG) {
       denied.LONG = `CHoCH Gate: waiting for 1m/5m Bullish CHoCH (candle close above swing high ${choch.protectedSwingHigh.toFixed(2)}) to confirm structure shift before longing.`;
     }
   }
