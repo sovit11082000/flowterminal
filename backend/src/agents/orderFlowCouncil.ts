@@ -171,7 +171,7 @@ export interface AgentSnapshot {
   } | null;
 }
 
-type AiProvider = 'groq' | 'cloudflare' | 'agentrouter' | 'vyceai';
+type AiProvider = 'groq' | 'cloudflare' | 'agentrouter' | 'vyceai' | 'hcnsec';
 type AgentRole = 'smc' | 'ict' | 'orderflow' | 'manager';
 interface ProviderConfig { provider: AiProvider; model: string; key: string; baseUrl?: string; quotaScope?: string; }
 
@@ -1967,6 +1967,22 @@ function getProviderConfigs(role: AgentRole): ProviderConfig[] {
       baseUrl: (process.env.AGENT_ROUTER_BASE_URL?.trim() || 'https://agentrouter.org/v1').replace(/\/+$/, ''),
       quotaScope: 'agent-router-live-manager'
     });
+  }
+
+  if (role === 'manager' && process.env.HCNSEC_API_KEY?.trim()) {
+    const hcnKey = process.env.HCNSEC_API_KEY.trim();
+    const hcnBase = (process.env.HCNSEC_BASE_URL?.trim() || 'https://api.hcnsec.cn/v1').replace(/\/+$/, '');
+    const hcnModels = (process.env.HCNSEC_MODEL?.trim() || 'hy4,spark-x2.5,MiniMax-M3.1-Flash')
+      .split(',').map((m) => m.trim()).filter(Boolean);
+    for (const model of hcnModels) {
+      configured.push({
+        provider: 'hcnsec',
+        key: hcnKey,
+        model,
+        baseUrl: hcnBase,
+        quotaScope: `hcnsec-${model}`
+      });
+    }
   }
 
   if (role === 'manager' && process.env.VYCEAI_API_KEY?.trim()) {
